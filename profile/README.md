@@ -15,9 +15,9 @@ This organization hosts BIDS-formatted datasets that cannot be hosted on public 
 
 | Dataset | ID | DOI | Size | Modality | Description |
 |---------|----|----|------|----------|-------------|
-| [emg2qwerty](https://github.com/nemarDatasets/nm000104) | nm000104 | [10.5281/zenodo.xxxxx](https://doi.org/10.5281/zenodo.xxxxx) | 3.5 GB | EMG | Typing task sEMG dataset |
-| [discrete_gestures](https://github.com/nemarDatasets/nm000105) | nm000105 | [10.5281/zenodo.xxxxx](https://doi.org/10.5281/zenodo.xxxxx) | 14 GB | EMG | Hand gesture recognition |
-| [handwriting](https://github.com/nemarDatasets/nm000106) | nm000106 | [10.5281/zenodo.xxxxx](https://doi.org/10.5281/zenodo.xxxxx) | 30 GB | EMG | Handwriting sEMG dataset |
+| [emg2qwerty](https://github.com/nemarDatasets/nm000104) | nm000104 | [10.5281/zenodo.17287904](https://doi.org/10.5281/zenodo.17287904) | 149 GB | EMG | Typing task sEMG dataset |
+| [discrete_gestures](https://github.com/nemarDatasets/nm000105) | nm000105 | [10.5281/zenodo.17283594](https://doi.org/10.5281/zenodo.17283594) | 14 GB | EMG | Hand gesture recognition |
+| [handwriting](https://github.com/nemarDatasets/nm000106) | nm000106 | [10.5281/zenodo.17283866](https://doi.org/10.5281/zenodo.17283866) | 30 GB | EMG | Handwriting sEMG dataset |
 | [wrist](https://github.com/nemarDatasets/nm000107) | nm000107 | [10.5281/zenodo.17282508](https://doi.org/10.5281/zenodo.17282508) | 1.9 GB | EMG | Wrist control sEMG dataset |
 
 ## Downloading Datasets
