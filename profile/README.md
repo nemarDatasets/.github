@@ -1,15 +1,18 @@
 # NEMAR Datasets
 
-Research datasets in [Brain Imaging Data Structure (BIDS)](https://bids.neuroimaging.io/) format, hosted on GitHub + AWS S3 infrastructure.
+**NeuroElectroMagnetic Data Archive and Tools Resource**
 
-## Purpose
+NEMAR goes beyond traditional data archives. Every dataset here is a living, citable research object with deep metadata integration, automated quality assessment, and infrastructure designed to make neuroscience data truly FAIR (Findable, Accessible, Interoperable, Reusable) across disciplines.
 
-This organization hosts BIDS-formatted datasets that cannot be hosted on public repositories (OpenNeuro, Zenodo, etc.) due to **restrictive licenses**, while remaining **freely available for research use**.
+## What Makes NEMAR Different
 
-**Hosting criteria:**
-- BIDS-compliant format
-- Freely available for academic/research use
-- Restrictive license preventing hosting on public repositories (e.g., non-commercial, research-only)
+- **Rich, structured metadata** -- Every dataset is enriched with DataCite-compliant scholarly metadata: validated MeSH keywords, author ORCIDs, funding sources, related publications, and machine-readable descriptions
+- **Persistent, versioned DOIs** -- Each dataset and version gets its own DOI (prefix `10.82901/NEMAR`), registered with DataCite for global discoverability and citation tracking
+- **BIDS-native** -- All datasets follow the [Brain Imaging Data Structure](https://bids.neuroimaging.io/) standard with automated validation on every change
+- **Git-based version control** -- Full provenance tracking through DataLad/git-annex, with immutable data blobs on S3 and metadata history on GitHub
+- **Public S3 access** -- No accounts, no rate limits, no paywalls for research use
+
+**Coming soon:** Data quality cards, citation tracking, and integration into ML pipelines, making NEMAR a resource for researchers across neuroscience, biomedical engineering, and machine learning.
 
 ## Browse Datasets
 
@@ -19,94 +22,60 @@ This organization hosts BIDS-formatted datasets that cannot be hosted on public 
 
 ## Downloading Datasets
 
-### Using DataLad (recommended)
-
-[DataLad](https://www.datalad.org/) enables efficient access to large datasets stored across GitHub (metadata) and S3 (data files).
-
-```bash
-# Install DataLad (macOS)
-brew install datalad
-
-# Clone dataset (lightweight - only downloads metadata)
-datalad clone https://github.com/nemarDatasets/<dataset-id>.git
-cd <dataset-id>
-
-# Download specific files
-datalad get sub-01/emg/sub-01_task-wrist_emg.edf
-
-# Download all data
-datalad get .
-
-# Remove data files (keep metadata)
-datalad drop .
-```
-
 ### Using NEMAR CLI
 
 ```bash
-# Install
 npm install -g @nemarorg/nemar-cli
 
-# Clone dataset (metadata only)
+# Clone dataset (metadata only, lightweight)
 nemar dataset clone <dataset-id>
 
 # Download data files
 nemar dataset get <dataset-id>
 ```
 
-### Direct S3 Access
+### Using DataLad
 
-Large binary files are stored on S3 with public read access:
+[DataLad](https://www.datalad.org/) provides efficient, selective access to large datasets stored across GitHub (metadata) and S3 (data files).
 
 ```bash
-# List dataset files
-aws s3 ls s3://nemar/<dataset-id>/ --recursive --no-sign-request
+# Clone (metadata only)
+datalad clone https://github.com/nemarDatasets/<dataset-id>.git
+cd <dataset-id>
 
-# Download specific file
+# Download specific files or everything
+datalad get sub-01/emg/sub-01_task-wrist_emg.edf
+datalad get .
+
+# Free local copies when done
+datalad drop .
+```
+
+### Direct S3 Access
+
+```bash
+aws s3 ls s3://nemar/<dataset-id>/ --recursive --no-sign-request
 aws s3 cp s3://nemar/<dataset-id>/path/to/file.edf . --no-sign-request
 ```
 
 ## Contributing
 
-### Reporting Issues
+**Reporting issues:** Open an issue on the dataset repository with the file path, expected vs actual behavior, and BIDS validator output if applicable.
 
-Found incorrect metadata, missing files, or BIDS compliance issues?
+**Proposing changes:** Fork the repository, make metadata corrections (JSON, TSV, README), and open a Pull Request. Data files are immutable; corrections are released as new versions.
 
-1. Go to the dataset repository (e.g., `nm000107`)
-2. Click **Issues** > **New Issue**
-3. Describe the problem with file path, expected vs actual behavior, and BIDS validator output if applicable
-
-### Proposing Changes
-
-**For metadata corrections** (JSON, TSV, README):
-
-1. Fork the dataset repository
-2. Make changes to metadata files
-3. Open a Pull Request with description of changes
-
-**For data file issues**: File Issues only (data files are immutable annexes). Corrections will be released as new dataset versions.
-
-### Dataset Versioning
-
-Datasets use semantic versioning (`v1.0.0`, `v1.1.0`, etc.). Each version gets a git tag, GitHub release, and DOI.
+**Versioning:** Datasets use semantic versioning. Each version gets a git tag, GitHub release, and DOI.
 
 ## License
 
-Each dataset has its own license specified in `dataset_description.json` and root `LICENSE` file. **Always check the dataset's license before use.**
-
-## Technical Details
-
-- **GitHub**: Metadata (JSON, TSV, README) + DataLad/git-annex pointers
-- **AWS S3**: Binary data files (EEG/EMG recordings)
-- **EZID/DataCite**: DOI registration (prefix `10.82901/NEMAR`)
-- **BIDS Validation**: Automated CI on each repository
+Each dataset specifies its own license in `dataset_description.json`. Always check the license before use.
 
 ## Contact
 
-- **Issues**: Use repository-specific issue trackers
-- **General questions**: Open discussion in `.github` repository
-- **New dataset submissions**: Visit [nemar.org](https://nemar.org)
+- **Issues**: Repository-specific issue trackers
+- **General questions**: [.github discussions](https://github.com/nemarDatasets/.github/discussions)
+- **New submissions**: Visit [nemar.org](https://nemar.org)
 
 ---
 
-*Hosted by [NEMAR](https://nemar.org) (NeuroElectroMagnetic Data Archive and Tools Resource)*
+*[NEMAR](https://nemar.org) -- NeuroElectroMagnetic Data Archive and Tools Resource*
