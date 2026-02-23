@@ -17,7 +17,7 @@ NEMAR goes beyond traditional data archives. Every dataset here is a living, cit
 ## Browse Datasets
 
 - **NEMAR Portal**: [nemar.org/dataexplorer](https://nemar.org/dataexplorer)
-- **DataCite**: [Search NEMAR DOIs](https://commons.datacite.org/doi.org?query=10.82901%2Fnemar)
+- **EZID/DataCite**: [Search NEMAR DOIs](https://ezid.cdlib.org/search?filtered=t&keywords=10.82901%2Fnemar.&identifier=&title=&creator=&publisher=&pubyear_from=&pubyear_to=&object_type=&id_type=)
 - **This org**: Each `nm*` repository is a dataset
 
 ## Downloading Datasets
