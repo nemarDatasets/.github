@@ -1,7 +1,12 @@
 # OpenNeuro Dataset Onboarding
 #
-# This workflow imports OpenNeuro datasets into NEMAR.
+# This workflow imports OpenNeuro datasets into NEMAR (metadata only).
 # Deploy to: nemarDatasets/.github/workflows/onboard-openneuro.yml
+#
+# Creates the NEMAR dataset record, GitHub repo, clones OpenNeuro metadata,
+# seeds .nemar/metadata.json, and pushes to nemarDatasets.
+#
+# Data copy (S3) is handled separately via scripts due to CI memory limits.
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
 # Each dataset is processed in parallel via matrix strategy.
@@ -15,11 +20,6 @@ on:
         description: "Comma-separated OpenNeuro dataset IDs (e.g., ds007262,ds007263)"
         required: true
         type: string
-      skip_data:
-        description: "Skip S3 data copy (metadata only)"
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   parse-ids:
@@ -51,9 +51,6 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.parse-ids.outputs.matrix) }}
       fail-fast: false
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     steps:
       - name: Install git-annex
         run: sudo apt-get update && sudo apt-get install -y git-annex
@@ -74,13 +71,7 @@ jobs:
           NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
         run: nemar auth login --key "$NEMAR_API_KEY"
 
-      - name: Import dataset
+      - name: Import dataset (metadata only)
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
-          SKIP_DATA: ${{ inputs.skip_data }}
-        run: |
-          ARGS="$DATASET_ID"
-          if [ "$SKIP_DATA" = "true" ]; then
-            ARGS="$ARGS --skip-data"
-          fi
-          nemar admin import-openneuro $ARGS
+        run: nemar admin import-openneuro "$DATASET_ID" --skip-data
