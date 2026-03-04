@@ -67,7 +67,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Install nemar CLI
-        run: npm install -g nemar-cli
+        run: bun install -g nemar-cli
 
       - name: Authenticate nemar CLI
         env:
