@@ -9,6 +9,7 @@
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
 # Each dataset is processed in parallel via matrix strategy.
+# gh workflow run onboard-openneuro.yml --repo nemarDatasets/.github -f openneuro_ids="ds00xxxx,ds000yyyy"
 
 name: Onboard OpenNeuro Dataset
 
