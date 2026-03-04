@@ -3,9 +3,9 @@
 # This workflow imports OpenNeuro datasets into NEMAR.
 # Deploy to: nemarDatasets/.github/workflows/onboard-openneuro.yml
 #
-# Creates the NEMAR dataset record, GitHub repo, clones OpenNeuro data,
-# copies annexed data to NEMAR S3, seeds .nemar/metadata.json, and pushes
-# to nemarDatasets.
+# Creates the NEMAR dataset record, GitHub repo, copies annexed data
+# directly from OpenNeuro S3 to NEMAR S3 (no local download), seeds
+# .nemar/metadata.json, and pushes to nemarDatasets.
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
 # Each dataset is processed in parallel via matrix strategy.
@@ -74,4 +74,6 @@ jobs:
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: nemar admin import-openneuro "$DATASET_ID"
