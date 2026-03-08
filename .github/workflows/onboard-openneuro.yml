@@ -9,7 +9,6 @@
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
 # Each dataset is processed in parallel via matrix strategy.
-# gh workflow run onboard-openneuro.yml --repo nemarDatasets/.github -f openneuro_ids="ds00xxxx,ds000yyyy"
 
 name: Onboard OpenNeuro Dataset
 
@@ -64,7 +63,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Install nemar CLI
-        run: bun install -g nemar-cli@latest
+        run: bun install -g nemar-cli
 
       - name: Authenticate nemar CLI
         env:
@@ -77,4 +76,4 @@ jobs:
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: nemar admin import-openneuro "$DATASET_ID"
+        run: nemar admin import-openneuro "$DATASET_ID" --local
