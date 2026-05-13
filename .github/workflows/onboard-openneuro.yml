@@ -76,4 +76,12 @@ jobs:
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: nemar admin import-openneuro "$DATASET_ID" --local
+        # --local: run import in-process. --trust-upstream: skip_ci_check
+        # fallback at publication time when the bounded poll observes the
+        # CI was deployed but no validation workflow_run registered within
+        # the window. Safe for OpenNeuro because data is already BIDS-
+        # validated upstream. The flag does NOT bypass:
+        #   - CI deploy failure (still aborts; missing workflows == no safety net)
+        #   - persistent polling errors (still aborts; never observed state)
+        # See nemarOrg/nemar-cli#431 for the design rationale.
+        run: nemar admin import-openneuro "$DATASET_ID" --local --trust-upstream
