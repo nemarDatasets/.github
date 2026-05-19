@@ -1,0 +1,309 @@
+name: Generate Manifest
+
+# Central manifest generator for NEMAR dataset versions.
+#
+# Replaces the in-Worker generateManifest() path (one GitHub API call per
+# annex pointer, exhausts the App's 12.5k/hr quota on large datasets) with
+# a git-tree walk on a managed runner. Reads the symlink-target blob via
+# `git cat-file` to extract annex keys without ever fetching annex content.
+#
+# This workflow lives at nemarDatasets/.github so its Actions minutes bill
+# against the GitHub Team allowance, not nemarOrg's constrained quota.
+# The Worker-side dispatcher (nemarOrg/nemar-cli :: triggerManifestGeneration)
+# POSTs repository_dispatch at this repo. Issue #564.
+#
+# Triggered by:
+#   - repository_dispatch[generate-manifest] from the Worker (production path)
+#   - workflow_dispatch                       (manual recovery / re-run)
+#
+# Artifacts uploaded:
+#   s3://nemar/<id>/version/v<X.Y.Z>.json          (manifest.json)
+#   s3://nemar/<id>/version/v<X.Y.Z>-summary.json  (summary.json)
+#
+# On success the workflow POSTs the callback contract documented in
+# nemarOrg/nemar-cli :: .context/epic_central_manifest_state.md. On failure
+# it best-effort POSTs to /webhooks/manifest-failed.
+
+on:
+  repository_dispatch:
+    types: [generate-manifest]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      version:
+        description: "Version (X.Y.Z, no leading v)"
+        required: true
+        type: string
+      doi:
+        description: "Version DOI (optional)"
+        required: false
+        type: string
+        default: ""
+      concept_doi:
+        description: "Concept DOI (optional)"
+        required: false
+        type: string
+        default: ""
+      callback_url:
+        description: "Callback URL (defaults to api.nemar.org)"
+        required: false
+        type: string
+        default: "https://api.nemar.org/webhooks/manifest-ready"
+      skip_canary:
+        description: "Skip raw.githubusercontent.com canary (for private repos)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  manifest:
+    name: Generate Manifest
+    runs-on: ubuntu-latest
+    # Cap total runtime. GitHub-hosted runners default to 360 min which is
+    # far too generous: clone+walk+upload for a 250 GB dataset is well
+    # under 10 min, and the only failure mode that could legitimately
+    # eat hours is a hung curl callback (see --max-time on those steps).
+    timeout-minutes: 30
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      DOI: ${{ github.event.client_payload.doi || inputs.doi }}
+      CONCEPT_DOI: ${{ github.event.client_payload.concept_doi || inputs.concept_doi }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/manifest-ready' }}
+      CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+      SKIP_CANARY: ${{ github.event.client_payload.skip_canary || inputs.skip_canary || 'false' }}
+      AWS_DEFAULT_REGION: us-east-2
+      S3_BUCKET: nemar
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::Missing version"
+            exit 1
+          fi
+          # Strip a stray leading v if the caller passed one; the script
+          # accepts either form, but downstream S3 keys are constructed
+          # from the bare version so normalise here.
+          VERSION="${VERSION#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=v${VERSION}" >> "$GITHUB_ENV"
+          echo "Inputs OK: dataset_id=${DATASET_ID} version=${VERSION}"
+
+      - name: Checkout nemar-cli (for scripts/emit_manifest.py)
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Mint GH App installation token for dataset repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Shallow-clone dataset repo at tag
+        id: clone
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/repo
+          git clone --depth 1 --branch "$TAG" --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/nemarDatasets/${DATASET_ID}.git" \
+            /tmp/repo
+          echo "Cloned ${DATASET_ID}@${TAG} into /tmp/repo"
+
+      - name: Emit manifest.json + summary.json
+        id: emit
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          CANARY_FLAG="--verify-canary"
+          if [ "$SKIP_CANARY" = "true" ]; then
+            CANARY_FLAG="--no-verify-canary"
+            echo "::warning::Canary verification disabled (skip_canary=true); private repos cannot HEAD-check raw.githubusercontent.com"
+          fi
+          python scripts/emit_manifest.py \
+            --dataset-id "$DATASET_ID" \
+            --version "$VERSION" \
+            --doi "$DOI" \
+            --concept-doi "$CONCEPT_DOI" \
+            --repo-dir /tmp/repo \
+            --out-dir /tmp/out \
+            $CANARY_FLAG
+
+      - name: Configure AWS credentials
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Upload artifacts to S3
+        id: upload
+        run: |
+          set -euo pipefail
+          MANIFEST_KEY="${DATASET_ID}/version/${TAG}.json"
+          SUMMARY_KEY="${DATASET_ID}/version/${TAG}-summary.json"
+
+          aws s3 cp /tmp/out/manifest.json "s3://${S3_BUCKET}/${MANIFEST_KEY}" \
+            --content-type application/json \
+            --region us-east-2
+          aws s3 cp /tmp/out/summary.json "s3://${S3_BUCKET}/${SUMMARY_KEY}" \
+            --content-type application/json \
+            --region us-east-2
+
+          echo "MANIFEST_URL=https://${S3_BUCKET}.s3.us-east-2.amazonaws.com/${MANIFEST_KEY}" >> "$GITHUB_ENV"
+          echo "SUMMARY_URL=https://${S3_BUCKET}.s3.us-east-2.amazonaws.com/${SUMMARY_KEY}" >> "$GITHUB_ENV"
+
+      - name: Build callback body
+        id: build-body
+        if: success()
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Normalise SKIP_CANARY to the literal "true"/"false" strings the
+          # helper expects. The env value is sourced from either the
+          # repository_dispatch payload (Stream B) or workflow_dispatch
+          # input; both pass booleans as their string form.
+          CANARY_SKIPPED_FLAG="false"
+          if [ "$SKIP_CANARY" = "true" ]; then
+            CANARY_SKIPPED_FLAG="true"
+          fi
+          python scripts/build_callback_body.py \
+            --dataset-id "$DATASET_ID" \
+            --version "$VERSION" \
+            --manifest-url "$MANIFEST_URL" \
+            --summary-url "$SUMMARY_URL" \
+            --totals-path /tmp/out/totals.json \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --canary-skipped "$CANARY_SKIPPED_FLAG" \
+            --out /tmp/out/callback.json
+
+      - name: POST callback (manifest-ready)
+        id: post-success
+        if: success()
+        run: |
+          set -euo pipefail
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "No callback URL configured; skipping callback POST"
+            exit 0
+          fi
+          # callback_token absence is expected for manual workflow_dispatch
+          # runs; let the Worker decide whether to accept an unsigned call.
+          # --connect-timeout caps DNS+TCP handshake; --max-time caps the
+          # entire request including TLS + Worker response. Without these
+          # a hung Worker could pin a runner for hours.
+          #
+          # On non-2xx we explicitly capture the body + status so the
+          # failure mode is unambiguous: the manifest IS on S3, but the
+          # Worker refused the callback (auth, schema mismatch, replay).
+          # The follow-on "Identify failed step" / failure-callback runs
+          # see this step's failure outcome and route the manifest-failed
+          # payload accordingly. Without this distinct annotation, an
+          # operator triaging the failure-callback couldn't tell whether
+          # the artifact upload itself had failed.
+          HTTP_STATUS=$(curl -sS -o /tmp/out/callback-response.txt \
+            -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/out/callback.json) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "::error title=Callback rejected by Worker::Manifest artifacts uploaded to S3 successfully but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS. This is NOT a manifest-generation failure; the S3 artifacts are valid. Likely causes: token mismatch, replay-guard hit, or schema drift. Response body follows."
+            echo "--- callback response body ---"
+            cat /tmp/out/callback-response.txt || true
+            echo
+            echo "--- end callback response body ---"
+            exit 1
+          fi
+          echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS)"
+
+      - name: Identify failed step
+        id: failed-step
+        if: failure()
+        # Walk the substantive steps in order and emit the first one whose
+        # outcome is "failure". GitHub Actions doesn't expose the failing
+        # step name in any built-in context, so we read each prior step's
+        # outcome via `steps.<id>.outcome` and write the result to
+        # $GITHUB_ENV for the failure-callback body. Defaults to "unknown"
+        # if none of the tracked steps registered a failure (e.g. job
+        # timeout-minutes tripped between steps).
+        env:
+          OUTCOME_VALIDATE: ${{ steps.validate.outcome }}
+          OUTCOME_CHECKOUT: ${{ steps.checkout.outcome }}
+          OUTCOME_SETUP_PYTHON: ${{ steps.setup-python.outcome }}
+          OUTCOME_APP_TOKEN: ${{ steps.app-token.outcome }}
+          OUTCOME_CLONE: ${{ steps.clone.outcome }}
+          OUTCOME_EMIT: ${{ steps.emit.outcome }}
+          OUTCOME_AWS_CREDS: ${{ steps.aws-creds.outcome }}
+          OUTCOME_UPLOAD: ${{ steps.upload.outcome }}
+          OUTCOME_BUILD_BODY: ${{ steps.build-body.outcome }}
+          OUTCOME_POST_SUCCESS: ${{ steps.post-success.outcome }}
+        run: |
+          set -euo pipefail
+          FAILED_STEP="unknown"
+          for pair in \
+            "validate:$OUTCOME_VALIDATE" \
+            "checkout:$OUTCOME_CHECKOUT" \
+            "setup-python:$OUTCOME_SETUP_PYTHON" \
+            "app-token:$OUTCOME_APP_TOKEN" \
+            "clone:$OUTCOME_CLONE" \
+            "emit:$OUTCOME_EMIT" \
+            "aws-creds:$OUTCOME_AWS_CREDS" \
+            "upload:$OUTCOME_UPLOAD" \
+            "build-body:$OUTCOME_BUILD_BODY" \
+            "post-success:$OUTCOME_POST_SUCCESS"; do
+            name="${pair%%:*}"
+            outcome="${pair##*:}"
+            if [ "$outcome" = "failure" ]; then
+              FAILED_STEP="$name"
+              break
+            fi
+          done
+          echo "Identified failed step: $FAILED_STEP"
+          echo "FAILED_STEP=$FAILED_STEP" >> "$GITHUB_ENV"
+
+      - name: POST failure callback (best-effort)
+        if: failure()
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Best-effort signal to the Worker. Endpoint lands with Stream B;
+          # 404 is tolerated in the interim, hence `|| true`.
+          FAIL_URL="${CALLBACK_URL%/manifest-ready}/manifest-failed"
+          # The failed step name is threaded via $GITHUB_ENV from the
+          # "Identify failed step" step above; defaults to "unknown" if no
+          # tracked step registered a failure outcome.
+          python scripts/build_failure_body.py \
+            --dataset-id "$DATASET_ID" \
+            --version "$VERSION" \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-url "$WORKFLOW_RUN_URL" \
+            --failed-step "${FAILED_STEP:-unknown}" \
+            --out /tmp/fail.json
+          curl -fsS --connect-timeout 10 --max-time 30 -X POST "$FAIL_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/fail.json || true
+          echo "Failure callback attempted at $FAIL_URL (failed_step=${FAILED_STEP:-unknown})"

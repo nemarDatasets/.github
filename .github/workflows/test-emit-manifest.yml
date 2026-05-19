@@ -1,0 +1,29 @@
+name: Test emit_manifest
+
+# Runs scripts/test_emit_manifest.py on PRs touching scripts/.
+# 33 real-git assertions (no mocks): annex symlinks, regular blobs,
+# subject/modality/README derivation, callback body round-trip.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-emit-manifest.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-emit-manifest.yml"
+  workflow_dispatch:
+
+jobs:
+  python-unit-test:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run scripts tests
+        run: python scripts/test_emit_manifest.py
