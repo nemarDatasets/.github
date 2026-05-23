@@ -210,7 +210,13 @@ jobs:
 
           git config user.name "nemar-publish-bot"
           git config user.email "nemar-publish-bot@users.noreply.github.com"
-          git add "$METADATA_PATH" .bidsignore
+          # -f overrides .gitignore: dataset repos often list `.nemar/` in
+          # their .gitignore so local development doesn't show the managed
+          # metadata folder in `git status`, but the workflow IS the
+          # authoritative writer of this file and must be allowed to track
+          # it. Surfaced by the first smoke test of this workflow against
+          # nm099999.
+          git add -f "$METADATA_PATH" .bidsignore
 
           if git diff --cached --quiet; then
             echo "Metadata already up-to-date; nothing to commit."
