@@ -1,0 +1,295 @@
+name: Run Generate Archive
+
+# Central archive-generation workflow for NEMAR datasets.
+#
+# Replaces the per-repo `.github/workflows/generate-archive.yml` that
+# previously shipped to every dataset repo via `deployWorkflows()` in
+# nemarOrg/nemar-cli. Phase 3 of nemarOrg/nemar-cli#601 (sub-issue #608).
+# Sibling to `run-enrichment.yml` (Phase 1) and `run-version-doi.yml`
+# (Phase 2).
+#
+# The legacy template was already `repository_dispatch`-driven, so this
+# move is the lowest-friction of the centralization phases: the Worker
+# helper `triggerArchiveGeneration` just retargets its POST URL from
+# `repos/nemarDatasets/<dataset_id>/dispatches` to
+# `repos/nemarDatasets/.github/dispatches` and adds `dataset_id` to the
+# payload alongside the existing `version` field.
+#
+# Behavior is functionally identical to the legacy template — stream
+# annex content directly from S3 into a zip and upload to
+# `nemar/<dataset_id>/archives/v<X.Y.Z>.zip` via multipart upload, so
+# disk usage stays constant regardless of dataset size.
+
+on:
+  repository_dispatch:
+    types: [generate-archive]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      version:
+        description: "Version (X.Y.Z, no leading v)"
+        required: true
+        type: string
+
+jobs:
+  archive:
+    name: Generate Dataset Archive
+    runs-on: ubuntu-latest
+    # Streaming archive completes in single-digit minutes for typical
+    # datasets; even a 250 GB upload finishes well under 30. Cap at 60
+    # so a hung S3 multipart can't pin the runner indefinitely.
+    timeout-minutes: 60
+    # Defense-in-depth — every authenticated call goes through the
+    # per-repo App token or the AWS credentials. The default
+    # GITHUB_TOKEN is never used.
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ github.event.client_payload.version || inputs.version }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *)
+              echo "::error::Invalid dataset_id shape: $DATASET_ID (expected nm/on/xx + 6 digits)"
+              exit 1
+              ;;
+          esac
+          if [ -z "$VERSION" ]; then
+            echo "::error::Missing version"
+            exit 1
+          fi
+          # Reject a leading v (the S3 key is constructed as v<bare> below);
+          # callers must pass the bare X.Y.Z form, matching the legacy
+          # per-repo workflow's expectation and the Worker's
+          # triggerArchiveGeneration contract.
+          case "$VERSION" in
+            v*)
+              echo "::error::Pass version without leading v (got $VERSION)"
+              exit 1
+              ;;
+          esac
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Checkout target dataset repo at version tag
+        uses: actions/checkout@v4
+        with:
+          repository: nemarDatasets/${{ env.DATASET_ID }}
+          ref: v${{ env.VERSION }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install streaming dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/archive-deps
+          cd /tmp/archive-deps
+          npm init -y > /dev/null
+          # Pin to v7: v8+ is ESM-only, require() no longer returns the factory.
+          npm install --no-save 'archiver@^7.0.1' @aws-sdk/client-s3 @aws-sdk/lib-storage
+
+      - name: Write archive script
+        run: |
+          cat > /tmp/stream-archive.js << 'ARCHIVE_SCRIPT'
+          var fs = require("fs");
+          var path = require("path");
+          var S3Client = require("@aws-sdk/client-s3").S3Client;
+          var Upload = require("@aws-sdk/lib-storage").Upload;
+          var archiver = require("archiver");
+          var PassThrough = require("stream").PassThrough;
+          var https = require("https");
+          var http = require("http");
+
+          var DATASET_ID = process.env.DATASET_ID;
+          var VERSION = process.env.VERSION;
+          var BUCKET = "nemar";
+          var REGION = process.env.AWS_DEFAULT_REGION || "us-east-2";
+          var S3_BASE = "https://" + BUCKET + ".s3." + REGION + ".amazonaws.com";
+
+          function resolveAnnexKey(filePath) {
+            try {
+              var stat = fs.lstatSync(filePath);
+              if (stat.isSymbolicLink()) {
+                var target = fs.readlinkSync(filePath);
+                var m = target.match(/([^\/]+)\/\1$/);
+                if (m) return m[1];
+                var m2 = target.match(/\/annex\/objects\/(.+)$/);
+                if (m2) return m2[1];
+              } else if (stat.isFile() && stat.size < 500 && stat.size > 20) {
+                var content = fs.readFileSync(filePath, "utf8").trim();
+                var m3 = content.match(/^\/annex\/objects\/(.+)$/);
+                if (m3) return m3[1];
+              }
+            } catch (e) {
+              console.warn("  resolveAnnexKey failed for " + filePath + ": " + e.message);
+            }
+            return null;
+          }
+
+          function fetchUrl(url) {
+            return new Promise(function (resolve, reject) {
+              var mod = url.indexOf("https") === 0 ? https : http;
+              mod
+                .get(url, function (res) {
+                  if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    fetchUrl(res.headers.location).then(resolve).catch(reject);
+                    return;
+                  }
+                  if (res.statusCode !== 200) {
+                    res.resume();
+                    reject(new Error("HTTP " + res.statusCode + " for " + url));
+                    return;
+                  }
+                  resolve(res);
+                })
+                .on("error", reject);
+            });
+          }
+
+          function walkDir(dir, base) {
+            base = base || "";
+            var result = [];
+            var entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (var i = 0; i < entries.length; i++) {
+              var entry = entries[i];
+              if (entry.name === ".git" || entry.name === ".github" || entry.name === "node_modules") continue;
+              var rel = base ? base + "/" + entry.name : entry.name;
+              var full = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                result = result.concat(walkDir(full, rel));
+              } else {
+                result.push({ rel: rel, full: full });
+              }
+            }
+            return result;
+          }
+
+          async function main() {
+            console.log("Streaming archive for " + DATASET_ID + " v" + VERSION);
+
+            var archive = archiver("zip", { zlib: { level: 1 } });
+            var passThrough = new PassThrough();
+            archive.pipe(passThrough);
+
+            archive.on("warning", function (err) {
+              console.warn("Archive warning:", err.message);
+            });
+            archive.on("error", function (err) {
+              console.error("Archive error:", err.message);
+              process.exitCode = 1;
+            });
+            passThrough.on("error", function (err) {
+              console.error("Stream error:", err.message);
+              process.exitCode = 1;
+            });
+
+            var s3 = new S3Client({ region: REGION });
+            var s3Key = DATASET_ID + "/archives/v" + VERSION + ".zip";
+
+            var upload = new Upload({
+              client: s3,
+              params: {
+                Bucket: BUCKET,
+                Key: s3Key,
+                Body: passThrough,
+                ContentType: "application/zip",
+              },
+              queueSize: 4,
+              partSize: 100 * 1024 * 1024,
+            });
+
+            var uploadDone = upload.done().catch(function (err) {
+              console.error("S3 Upload error:", err.message);
+              process.exitCode = 1;
+              throw err;
+            });
+
+            var files = walkDir(".");
+            console.log("Found " + files.length + " files");
+
+            var annexed = 0;
+            var regular = 0;
+            var skipped = 0;
+
+            for (var i = 0; i < files.length; i++) {
+              var rel = files[i].rel;
+              var full = files[i].full;
+              var annexKey = resolveAnnexKey(full);
+
+              try {
+                var entryDone = new Promise(function (resolve, reject) {
+                  archive.once("entry", resolve);
+                  archive.once("error", reject);
+                });
+                if (annexKey) {
+                  var url = S3_BASE + "/" + DATASET_ID + "/objects/" + encodeURIComponent(annexKey);
+                  var stream = await fetchUrl(url);
+                  archive.append(stream, { name: rel });
+                } else {
+                  archive.append(fs.createReadStream(full), { name: rel });
+                }
+                await entryDone;
+                if (annexKey) annexed++;
+                else regular++;
+              } catch (err) {
+                skipped++;
+                if (skipped <= 10) {
+                  console.warn("  Skipping " + rel + ": " + err.message);
+                } else if (skipped === 11) {
+                  console.warn("  (suppressing further skip warnings)");
+                }
+              }
+
+              if ((annexed + regular + skipped) % 100 === 0) {
+                console.log("  Progress: " + (annexed + regular + skipped) + "/" + files.length);
+              }
+            }
+
+            await archive.finalize();
+            await uploadDone;
+
+            console.log("Archive complete: " + annexed + " annexed + " + regular + " regular + " + skipped + " skipped");
+            console.log("Uploaded to s3://" + BUCKET + "/" + s3Key);
+            if (skipped > 0) {
+              console.warn("WARNING: " + skipped + " annexed files were not found in S3");
+            }
+          }
+
+          process.on("unhandledRejection", function (err) {
+            console.error("Unhandled rejection:", err);
+            process.exitCode = 1;
+          });
+
+          main().catch(function (err) {
+            console.error("Fatal:", err);
+            process.exitCode = 1;
+          });
+          ARCHIVE_SCRIPT
+
+      - name: Stream archive to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+          NODE_PATH: /tmp/archive-deps/node_modules
+        run: node /tmp/stream-archive.js
