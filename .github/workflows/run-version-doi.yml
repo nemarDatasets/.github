@@ -116,18 +116,22 @@ jobs:
               --title "$TAG" --notes "Release $TAG"
 
       - name: Refresh enrichment from tag (defensive)
+        # continue-on-error makes the step itself non-blocking — the job
+        # proceeds to the DOI mint regardless of refresh outcome. The
+        # script below uses `exit 1` on real failures so the step shows
+        # red in the Actions UI (operator signal) without affecting job
+        # exit. Matches the discipline of run-enrichment.yml's retry loop.
+        # Code-review #8.
         continue-on-error: true
         run: |
           set -euo pipefail
           # Belt-and-suspenders: refresh D1 enrichment_json from the tag's
           # snapshot before the DOI is minted. Covers cases where run-
           # enrichment.yml didn't fire on the release branch (manual tags,
-          # legacy repos). Non-fatal: on failure we still publish the DOI
-          # from whatever metadata is currently in the tag.
-          # client_commits=true tells the Worker to return the payload
-          # without attempting a commit — tags are immutable and a commit
-          # against an immutable ref would fail downstream. The D1 cache
-          # update happens regardless of the commit attempt.
+          # legacy repos). client_commits=true tells the Worker to return
+          # the payload without attempting a commit — tags are immutable
+          # and a commit against an immutable ref would fail downstream.
+          # The D1 cache update happens regardless of the commit attempt.
           if [ -z "$NEMAR_WEBHOOK_TOKEN" ]; then
             echo "NEMAR_WEBHOOK_TOKEN not configured, skipping enrichment refresh"
             exit 0
@@ -150,8 +154,8 @@ jobs:
           echo
 
           if [ "$HTTP_CODE" -ge 400 ] || [ "$HTTP_CODE" = "0" ]; then
-            echo "::warning::Pre-DOI enrichment refresh failed (HTTP $HTTP_CODE) - continuing with existing metadata"
-            exit 0
+            echo "::warning::Pre-DOI enrichment refresh failed (HTTP $HTTP_CODE) - DOI mint will proceed with whatever metadata is already in D1"
+            exit 1
           fi
 
           # Surface embedded sub-errors as warnings so a green checkmark
@@ -177,21 +181,47 @@ jobs:
             exit 0
           fi
 
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            --connect-timeout 10 --max-time 60 \
-            -X POST "https://api.nemar.org/webhooks/publish-version-doi" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
-            -d "{
-              \"dataset_id\": \"$DATASET_ID\",
-              \"version\": \"$VERSION\",
-              \"release_url\": \"$RELEASE_URL\"
-            }")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
-
-          echo "Response: $BODY"
+          # 2 attempts with a brief backoff. The DOI mint is fatal-on-failure
+          # (unlike the enrichment refresh which is best-effort), so a
+          # transient 5xx from EZID/Zenodo or Worker cold-start would
+          # otherwise red the job permanently and require operator rerun.
+          # 4xx remains terminal — that's a config error, not a hiccup.
+          # The Worker's /webhooks/publish-version-doi is idempotent on
+          # duplicate dispatches (EZID catches "already exists";
+          # handleZenodoVersionDoi short-circuits if dataset_versions
+          # already records the DOI — both fixed in nemarOrg/nemar-cli#607),
+          # so retrying after a success-then-network-blip is safe.
+          # Code-review #8.
+          HTTP_CODE=0
+          BODY=""
+          for attempt in 1 2; do
+            RESPONSE=$(curl -sS -w "\n%{http_code}" \
+              --connect-timeout 10 --max-time 60 \
+              -X POST "https://api.nemar.org/webhooks/publish-version-doi" \
+              -H "Content-Type: application/json" \
+              -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
+              -d "{
+                \"dataset_id\": \"$DATASET_ID\",
+                \"version\": \"$VERSION\",
+                \"release_url\": \"$RELEASE_URL\"
+              }") || RESPONSE=$'\n0'
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "attempt $attempt: HTTP $HTTP_CODE"
+            echo "Response: $BODY"
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              break
+            fi
+            # 4xx is terminal — no retry. 5xx and curl-level failures get
+            # one retry after a 10s pause.
+            if [ "$HTTP_CODE" -ge 400 ] && [ "$HTTP_CODE" -lt 500 ]; then
+              break
+            fi
+            if [ "$attempt" -lt 2 ]; then
+              echo "::warning::attempt $attempt: HTTP $HTTP_CODE (transient); retrying in 10s"
+              sleep 10
+            fi
+          done
 
           if [ "$HTTP_CODE" -ge 400 ]; then
             if echo "$BODY" | jq -e '.skipped == true' > /dev/null 2>&1; then
@@ -199,6 +229,10 @@ jobs:
               exit 0
             fi
             echo "::error::Failed to publish DOI (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          if [ "$HTTP_CODE" -lt 200 ]; then
+            echo "::error::Failed to publish DOI after 2 attempts (HTTP $HTTP_CODE)"
             exit 1
           fi
 
