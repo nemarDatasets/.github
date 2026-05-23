@@ -99,14 +99,25 @@ jobs:
         with:
           node-version: "20"
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Install streaming dependencies
         run: |
           set -euo pipefail
+          # The project policy (nemarOrg/nemar-cli CLAUDE.md) is bun for
+          # all JS/TS work; ubuntu-latest doesn't ship bun, hence the
+          # setup-bun step above. The archive script itself still runs
+          # under Node 20 because the legacy CommonJS streaming script
+          # targets it — bun is used only as the package installer here,
+          # then NODE_PATH points `node` at the resulting node_modules.
+          # Code-review #10.
           mkdir -p /tmp/archive-deps
           cd /tmp/archive-deps
-          npm init -y > /dev/null
+          bun init -y > /dev/null
           # Pin to v7: v8+ is ESM-only, require() no longer returns the factory.
-          npm install --no-save 'archiver@^7.0.1' @aws-sdk/client-s3 @aws-sdk/lib-storage
+          bun add 'archiver@^7.0.1' '@aws-sdk/client-s3' '@aws-sdk/lib-storage'
 
       - name: Write archive script
         run: |
@@ -271,7 +282,17 @@ jobs:
             console.log("Archive complete: " + annexed + " annexed + " + regular + " regular + " + skipped + " skipped");
             console.log("Uploaded to s3://" + BUCKET + "/" + s3Key);
             if (skipped > 0) {
-              console.warn("WARNING: " + skipped + " annexed files were not found in S3");
+              // A partial archive shouldn't silently become the
+              // downloadable artifact for a published dataset version.
+              // The fire-and-forget dispatch pattern means no callback
+              // validates archive completeness — exit non-zero so the
+              // Actions UI flags the run red and an operator investigates.
+              // The S3 upload itself already finalized above (the
+              // multipart Upload.done() returned), so the partial zip
+              // IS on S3; the operator can choose to keep it or rerun
+              // after fixing the missing annex objects. Code-review #10.
+              console.error("::error::" + skipped + " annexed files were not found in S3; archive is incomplete");
+              process.exitCode = 1;
             }
           }
 
