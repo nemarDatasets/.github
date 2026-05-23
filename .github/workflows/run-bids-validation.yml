@@ -41,10 +41,9 @@ on:
         type: string
         default: ""
       validator_version:
-        description: "BIDS validator version (matches nemar-cli's validator-version.json pin)"
-        required: false
+        description: "BIDS validator version (must match nemar-cli's validator-version.json pin). REQUIRED for manual dispatch — the per-repo shim sets it automatically for repository_dispatch."
+        required: true
         type: string
-        default: "2.4.1"
 
 jobs:
   validate:
@@ -57,14 +56,15 @@ jobs:
       REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
       HEAD_SHA: ${{ github.event.client_payload.head_sha || inputs.head_sha }}
       PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number || '' }}
-      # The shim on each dataset repo populates this from the CLI's
-      # validator-version.json pin at template-deploy time. The
-      # workflow_dispatch fallback default (`2.4.1`) tracks the current
-      # pin; bumping the CLI pin re-renders the shim payload to the new
-      # value on the next `nemar admin ci sync`, but a manual dispatch
-      # without an input falls back to the default here. Keep this
-      # default in lockstep with `nemarOrg/nemar-cli/validator-version.json`.
-      VALIDATOR_VERSION: ${{ github.event.client_payload.validator_version || inputs.validator_version || '2.4.1' }}
+      # The shim on each dataset repo populates client_payload.validator_version
+      # from the CLI's `validator-version.json` pin at template-deploy
+      # time (Phase 4 of #601). For manual `workflow_dispatch` runs the
+      # operator must supply `validator_version` explicitly — there's
+      # deliberately no hardcoded fallback so a future bump of the CLI
+      # pin can't silently leave this workflow running an old version.
+      # The "Validate inputs" step below errors loudly if the resolved
+      # value is empty. Code-review #13.
+      VALIDATOR_VERSION: ${{ github.event.client_payload.validator_version || inputs.validator_version || '' }}
     steps:
       - name: Validate inputs
         run: |
@@ -84,6 +84,20 @@ jobs:
             echo "::error::Missing head_sha — the check-run needs a commit to attach to"
             exit 1
           fi
+          if [ -z "$VALIDATOR_VERSION" ]; then
+            echo "::error::Missing validator_version. The per-repo shim populates this from nemar-cli's validator-version.json pin via repository_dispatch. For a manual workflow_dispatch, pass it explicitly: gh workflow run run-bids-validation.yml -f validator_version=2.4.1 ..."
+            exit 1
+          fi
+          # Sanity-check semver shape so a typo'd value can't make it
+          # to `deno run jsr:@bids/validator@...` where the failure mode
+          # is a 30-second download attempt that times out.
+          case "$VALIDATOR_VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::Invalid validator_version shape: $VALIDATOR_VERSION (expected X.Y.Z)"
+              exit 1
+              ;;
+          esac
 
       - name: Mint per-repo App token
         id: app-token
