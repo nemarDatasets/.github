@@ -51,6 +51,11 @@ jobs:
     # plus a small Action-side commit; 20 min is generous, but a hung
     # OpenRouter call could otherwise pin a runner for hours.
     timeout-minutes: 20
+    # Defense-in-depth: zero out the default GITHUB_TOKEN scope. The
+    # push happens with a per-repo App installation token (minted in
+    # the step below); the default token is never used and shouldn't
+    # carry implicit write permission. Code-review #5.
+    permissions: {}
     env:
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
       REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
@@ -123,8 +128,16 @@ jobs:
           BODY_FILE=$(mktemp)
           HTTP_CODE=0
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" -X POST \
-              "https://api.nemar.org/webhooks/llm-enrich" \
+            # --connect-timeout caps DNS+TCP+TLS handshake (matches the
+            # generate-manifest workflow's 10s cap). --max-time covers the
+            # entire LLM round-trip including Stage-2 OpenRouter wait; the
+            # Worker has its own internal LLM timeout below this, so 180s
+            # is generous margin without letting a hung TLS handshake or
+            # silent Worker stall pin the runner for the full
+            # timeout-minutes budget. Code-review #5.
+            HTTP_CODE=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 180 \
+              -X POST "https://api.nemar.org/webhooks/llm-enrich" \
               -H "Content-Type: application/json" \
               -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
               -d "{\"dataset_id\": \"$REPO_NAME\", \"force\": $FORCE, \"client_commits\": true, \"ref\": \"$BRANCH_REF\"}") || HTTP_CODE=0
