@@ -1,0 +1,133 @@
+name: Run PR Merge
+
+# Central PR-merge release-cutting workflow for NEMAR datasets.
+#
+# Phase 4 of nemarOrg/nemar-cli#601 (sub-issue #610). Sibling to
+# run-bids-validation.yml.
+#
+# `pull_request_target` events fire only on the dataset repo where the
+# PR lives, so the dataset repos each carry a thin shim that fires
+# `repository_dispatch[run-pr-merge]` here. The shim's `cleanup-staging`
+# job stays inline on the dataset repo because it's AWS-only with no
+# GitHub coupling (and centralizing the AWS calls would just add a
+# network hop without consolidating logic).
+#
+# This workflow does the release-cutting half: reads Version from
+# dataset_description.json on main, creates the v$VERSION tag and the
+# matching GitHub release on the dataset repo. The tag push then fires
+# the existing tag-push handler (Phase 2) which dispatches the
+# version-doi mint.
+
+on:
+  repository_dispatch:
+    types: [run-pr-merge]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number for release notes (optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number || '' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *)
+              echo "::error::Invalid dataset_id shape: $DATASET_ID (expected nm/on/xx + 6 digits)"
+              exit 1
+              ;;
+          esac
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Checkout target dataset repo at main
+        uses: actions/checkout@v4
+        with:
+          repository: nemarDatasets/${{ env.DATASET_ID }}
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.Version // "1.0.0"' dataset_description.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::dataset_description.json has no Version field"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          set -euo pipefail
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag if missing
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "nemar-publish-bot"
+          git config user.email "nemar-publish-bot@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+          echo "Created and pushed tag v$VERSION"
+
+      - name: Create release if missing
+        # Idempotent against a prior run that pushed the tag but failed
+        # before creating the release (network blip between `git push`
+        # and `gh release create`, or a rerun after the tag already
+        # exists on origin). Without this, a half-completed prior run
+        # would leave a tag without a release — and since version-doi
+        # (Phase 2) fires on tag push, the DOI mint would proceed against
+        # a release-less tag. Code-review #12.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES="Release v$VERSION"
+          if [ -n "$PR_NUMBER" ]; then
+            NOTES="$NOTES from PR #$PR_NUMBER"
+          fi
+          gh release view "v$VERSION" --repo "nemarDatasets/$DATASET_ID" > /dev/null 2>&1 || \
+            gh release create "v$VERSION" --repo "nemarDatasets/$DATASET_ID" \
+              --title "v$VERSION" --notes "$NOTES"
+          echo "Release v$VERSION present on nemarDatasets/$DATASET_ID"

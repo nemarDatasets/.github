@@ -1,0 +1,229 @@
+name: Run BIDS Validation
+
+# Central BIDS validation workflow for NEMAR datasets.
+#
+# Phase 4 of nemarOrg/nemar-cli#601 (sub-issue #610). Sibling to
+# run-enrichment.yml, run-version-doi.yml, and run-generate-archive.yml.
+#
+# Unlike Phases 1-3, the PR-triggered workflows can't be relocated
+# directly because GitHub's pull_request events fire only in the repo
+# where the PR lives. The dataset repos each carry a thin shim that
+# fires `repository_dispatch[run-bids-validation]` here; this workflow
+# does the real work and posts the result back as a check-run on the
+# dataset repo's PR via the GitHub Checks API.
+#
+# Operator-facing UX: the PR sees the shim's quick green check (just
+# the dispatch call) plus a separate `Run BIDS Validation` check-run
+# whose conclusion mirrors the validator output. The two-check pattern
+# matches how composite GitHub Apps typically report results.
+
+on:
+  repository_dispatch:
+    types: [run-bids-validation]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      ref:
+        description: "Branch or ref the validation runs against"
+        required: false
+        type: string
+        default: "main"
+      head_sha:
+        description: "Commit SHA to validate; required to attach the check-run to the right commit"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number for log/summary linkback (optional)"
+        required: false
+        type: string
+        default: ""
+      validator_version:
+        description: "BIDS validator version (matches nemar-cli's validator-version.json pin)"
+        required: false
+        type: string
+        default: "2.4.1"
+
+jobs:
+  validate:
+    name: BIDS Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+      HEAD_SHA: ${{ github.event.client_payload.head_sha || inputs.head_sha }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number || '' }}
+      # The shim on each dataset repo populates this from the CLI's
+      # validator-version.json pin at template-deploy time. The
+      # workflow_dispatch fallback default (`2.4.1`) tracks the current
+      # pin; bumping the CLI pin re-renders the shim payload to the new
+      # value on the next `nemar admin ci sync`, but a manual dispatch
+      # without an input falls back to the default here. Keep this
+      # default in lockstep with `nemarOrg/nemar-cli/validator-version.json`.
+      VALIDATOR_VERSION: ${{ github.event.client_payload.validator_version || inputs.validator_version || '2.4.1' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *)
+              echo "::error::Invalid dataset_id shape: $DATASET_ID (expected nm/on/xx + 6 digits)"
+              exit 1
+              ;;
+          esac
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::Missing head_sha — the check-run needs a commit to attach to"
+            exit 1
+          fi
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Create in-progress check-run on the dataset repo
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Make the PR show a pending check immediately, so the
+          # reviewer sees that validation is running. We complete this
+          # check-run from the final step regardless of success/failure.
+          DETAILS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PR_HINT=""
+          if [ -n "$PR_NUMBER" ]; then
+            PR_HINT=" (PR #$PR_NUMBER)"
+          fi
+          CHECK_ID=$(gh api -X POST "repos/nemarDatasets/$DATASET_ID/check-runs" \
+            -f name='Run BIDS Validation' \
+            -f head_sha="$HEAD_SHA" \
+            -f status=in_progress \
+            -f "output[title]=BIDS validation in progress$PR_HINT" \
+            -f "output[summary]=Running deno BIDS validator on $HEAD_SHA. See [run logs]($DETAILS_URL) for live output." \
+            --jq '.id')
+          echo "check_id=$CHECK_ID" >> "$GITHUB_OUTPUT"
+          echo "Created check-run $CHECK_ID for $DATASET_ID@$HEAD_SHA"
+
+      - name: Checkout target dataset repo at head_sha
+        uses: actions/checkout@v4
+        with:
+          repository: nemarDatasets/${{ env.DATASET_ID }}
+          ref: ${{ env.HEAD_SHA }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Run BIDS validator
+        id: validator
+        run: |
+          set -euo pipefail
+          mkdir -p .nemar
+          grep -qxF '.nemar/' .bidsignore 2>/dev/null || echo '.nemar/' >> .bidsignore
+          # VALIDATOR_VERSION is wired via env (job-level), populated by
+          # client_payload from the shim (which interpolates the CLI's
+          # validator-version.json pin at template-deploy time). Manual
+          # workflow_dispatch can override via the validator_version input.
+          echo "Running BIDS validator @${VALIDATOR_VERSION}"
+          deno run -A "jsr:@bids/validator@${VALIDATOR_VERSION}" . --json > .nemar/validation.json || true
+          cat .nemar/validation.json
+
+      - name: Collect git-annex pointer files
+        run: |
+          set -euo pipefail
+          find . -type l -not -path './.git/*' -printf '/%P\n' > /tmp/annex-files.txt 2>/dev/null || true
+          find . -type f -not -path './.git/*' -size -1k -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' >> /tmp/annex-files.txt || true
+          sort -u /tmp/annex-files.txt -o /tmp/annex-files.txt
+          ANNEX_COUNT=$(wc -l < /tmp/annex-files.txt | tr -d ' ')
+          if [ "$ANNEX_COUNT" -gt 0 ]; then
+            echo "Found $ANNEX_COUNT git-annex pointer file(s) (errors from these will be filtered)"
+          fi
+
+      - name: Check validation result
+        id: result
+        run: |
+          set -euo pipefail
+          if [ ! -f .nemar/validation.json ] || ! jq empty .nemar/validation.json 2>/dev/null; then
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            echo "summary=BIDS validator failed to produce valid output" >> "$GITHUB_OUTPUT"
+            echo "::error::BIDS validator failed to produce valid output"
+            exit 0
+          fi
+
+          if [ -s /tmp/annex-files.txt ]; then
+            jq -R -s 'split("\n") | map(select(length > 0))' /tmp/annex-files.txt > /tmp/annex-files.json
+          else
+            echo '[]' > /tmp/annex-files.json
+          fi
+
+          REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json \
+            '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | not)] | length' \
+            .nemar/validation.json)
+          ANNEX_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json \
+            '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | . != null)] | length' \
+            .nemar/validation.json)
+          WARNINGS=$(jq '[.issues.issues[] | select(.severity == "warning")] | length' .nemar/validation.json)
+
+          echo "real_errors=$REAL_ERRORS" >> "$GITHUB_OUTPUT"
+          echo "annex_errors=$ANNEX_ERRORS" >> "$GITHUB_OUTPUT"
+          echo "warnings=$WARNINGS" >> "$GITHUB_OUTPUT"
+
+          if [ "$REAL_ERRORS" -gt 0 ]; then
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) (skipped $ANNEX_ERRORS annex-pointer error(s))." >> "$GITHUB_OUTPUT"
+            echo "::error::BIDS validation found $REAL_ERRORS error(s)"
+            jq --slurpfile annexed /tmp/annex-files.json \
+              '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | not)][]' \
+              .nemar/validation.json
+            exit 0
+          fi
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+          echo "summary=BIDS validation passed: $WARNINGS warning(s), $ANNEX_ERRORS annex-pointer error(s) intentionally skipped." >> "$GITHUB_OUTPUT"
+          echo "BIDS validation passed ($WARNINGS warning(s), $ANNEX_ERRORS annex pointer error(s) skipped)"
+
+      - name: Finalize check-run on the dataset repo
+        if: always() && steps.check.outputs.check_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHECK_ID: ${{ steps.check.outputs.check_id }}
+          OUTCOME: ${{ steps.result.outputs.outcome }}
+          SUMMARY: ${{ steps.result.outputs.summary }}
+        run: |
+          set -euo pipefail
+          # Map our internal outcome to the GitHub check-run conclusion
+          # enum. If outcome is empty (early failure before the validator
+          # step ran), report failure with a generic message.
+          if [ -z "$OUTCOME" ]; then
+            CONCLUSION="failure"
+            TITLE="BIDS validation could not complete"
+            SUMMARY="${SUMMARY:-The validation step did not produce a result; see the central workflow run for details.}"
+          elif [ "$OUTCOME" = "success" ]; then
+            CONCLUSION="success"
+            TITLE="BIDS validation passed"
+          else
+            CONCLUSION="failure"
+            TITLE="BIDS validation failed"
+          fi
+          DETAILS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh api -X PATCH "repos/nemarDatasets/$DATASET_ID/check-runs/$CHECK_ID" \
+            -f status=completed \
+            -f conclusion="$CONCLUSION" \
+            -f "output[title]=$TITLE" \
+            -f "output[summary]=$SUMMARY"$'\n\n'"[View central run logs]($DETAILS_URL)"
+          echo "Finalized check-run $CHECK_ID -> $CONCLUSION"
