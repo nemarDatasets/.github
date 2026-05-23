@@ -251,30 +251,35 @@ jobs:
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
       VERSION: ${{ needs.publish-doi.outputs.version }}
     steps:
-      - name: Mint per-repo App token
+      - name: Mint App token scoped to .github
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.NEMAR_APP_ID }}
           private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
           owner: nemarDatasets
-          repositories: ${{ env.DATASET_ID }}
+          # The dispatch in the next step targets the .github repo (Phase 3
+          # of #601 centralizes the archive workflow there). The token must
+          # have actions:write on .github, not on the dataset repo. The
+          # central run-generate-archive workflow itself mints a separate
+          # per-dataset token internally for the checkout step.
+          repositories: .github
 
       - name: Dispatch archive generation
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          # Target the dataset repo explicitly (not the implicit
-          # ${{ github.repository }} which is .github, the wrong target).
-          # When generate-archive.yml itself centralizes in Phase 3, this
-          # dispatch will move to "nemarDatasets/.github" with a different
-          # event_type. For now the legacy per-repo generate-archive.yml on
-          # the dataset repo receives this dispatch — same wire shape as
-          # the pre-centralization world.
+          # Phase 3 (#10): the archive workflow now lives on
+          # nemarDatasets/.github. The dispatch retargets here at the
+          # same time as the central workflow lands, so the dataset_id
+          # payload field is what tells the receiver which dataset to
+          # archive. The legacy per-repo generate-archive.yml is stripped
+          # via scripts/strip-per-repo-workflow.ts --workflow
+          # generate-archive.yml in the same cutover.
           echo "Triggering archive generation for $DATASET_ID v$VERSION"
 
-          gh api "repos/nemarDatasets/$DATASET_ID/dispatches" \
+          gh api "repos/nemarDatasets/.github/dispatches" \
             -f event_type=generate-archive \
             -f "client_payload[dataset_id]=$DATASET_ID" \
             -f "client_payload[version]=$VERSION"
