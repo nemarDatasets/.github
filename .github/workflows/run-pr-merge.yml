@@ -93,12 +93,11 @@ jobs:
           set -euo pipefail
           if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag v${{ steps.version.outputs.version }} already exists; skipping release creation"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create tag and release
+      - name: Create tag if missing
         if: steps.check_tag.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -109,10 +108,26 @@ jobs:
           git config user.email "nemar-publish-bot@users.noreply.github.com"
           git tag -a "v$VERSION" -m "Release v$VERSION"
           git push origin "v$VERSION"
+          echo "Created and pushed tag v$VERSION"
+
+      - name: Create release if missing
+        # Idempotent against a prior run that pushed the tag but failed
+        # before creating the release (network blip between `git push`
+        # and `gh release create`, or a rerun after the tag already
+        # exists on origin). Without this, a half-completed prior run
+        # would leave a tag without a release — and since version-doi
+        # (Phase 2) fires on tag push, the DOI mint would proceed against
+        # a release-less tag. Code-review #12.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
           NOTES="Release v$VERSION"
           if [ -n "$PR_NUMBER" ]; then
             NOTES="$NOTES from PR #$PR_NUMBER"
           fi
-          gh release create "v$VERSION" --repo "nemarDatasets/$DATASET_ID" \
-            --title "v$VERSION" --notes "$NOTES"
-          echo "Created release v$VERSION on nemarDatasets/$DATASET_ID"
+          gh release view "v$VERSION" --repo "nemarDatasets/$DATASET_ID" > /dev/null 2>&1 || \
+            gh release create "v$VERSION" --repo "nemarDatasets/$DATASET_ID" \
+              --title "v$VERSION" --notes "$NOTES"
+          echo "Release v$VERSION present on nemarDatasets/$DATASET_ID"

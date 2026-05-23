@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: ""
+      validator_version:
+        description: "BIDS validator version (matches nemar-cli's validator-version.json pin)"
+        required: false
+        type: string
+        default: "2.4.1"
 
 jobs:
   validate:
@@ -52,6 +57,14 @@ jobs:
       REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
       HEAD_SHA: ${{ github.event.client_payload.head_sha || inputs.head_sha }}
       PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number || '' }}
+      # The shim on each dataset repo populates this from the CLI's
+      # validator-version.json pin at template-deploy time. The
+      # workflow_dispatch fallback default (`2.4.1`) tracks the current
+      # pin; bumping the CLI pin re-renders the shim payload to the new
+      # value on the next `nemar admin ci sync`, but a manual dispatch
+      # without an input falls back to the default here. Keep this
+      # default in lockstep with `nemarOrg/nemar-cli/validator-version.json`.
+      VALIDATOR_VERSION: ${{ github.event.client_payload.validator_version || inputs.validator_version || '2.4.1' }}
     steps:
       - name: Validate inputs
         run: |
@@ -123,15 +136,11 @@ jobs:
           set -euo pipefail
           mkdir -p .nemar
           grep -qxF '.nemar/' .bidsignore 2>/dev/null || echo '.nemar/' >> .bidsignore
-          # The validator-version pin is sourced from the dataset repo's
-          # own validator-version.json if present, otherwise from the
-          # historic default. We keep this loose because the dataset
-          # repos don't all carry the pin file yet; the per-repo
-          # bids-validation template's pin was injected at deploy time
-          # via template-version substitution, but the shim no longer
-          # ships the validator version. Fall back to a known-good
-          # version so the central workflow stays self-contained.
-          VALIDATOR_VERSION="${VALIDATOR_VERSION:-2.0.0}"
+          # VALIDATOR_VERSION is wired via env (job-level), populated by
+          # client_payload from the shim (which interpolates the CLI's
+          # validator-version.json pin at template-deploy time). Manual
+          # workflow_dispatch can override via the validator_version input.
+          echo "Running BIDS validator @${VALIDATOR_VERSION}"
           deno run -A "jsr:@bids/validator@${VALIDATOR_VERSION}" . --json > .nemar/validation.json || true
           cat .nemar/validation.json
 
