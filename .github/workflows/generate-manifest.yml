@@ -57,6 +57,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_callback:
+        description: "Skip the post-success callback POST. Use for manual backfills where the Worker has no in-flight manifest_jobs row to validate against."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   manifest:
@@ -75,6 +80,7 @@ jobs:
       CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/manifest-ready' }}
       CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
       SKIP_CANARY: ${{ github.event.client_payload.skip_canary || inputs.skip_canary || 'false' }}
+      SKIP_CALLBACK: ${{ github.event.client_payload.skip_callback || inputs.skip_callback || 'false' }}
       AWS_DEFAULT_REGION: us-east-2
       S3_BUCKET: nemar
     steps:
@@ -202,6 +208,15 @@ jobs:
         if: success()
         run: |
           set -euo pipefail
+          # Manual backfill mode: artifacts are uploaded but there's no
+          # in-flight manifest_jobs row to validate against, so any callback
+          # would 401 and turn the run red. `skip_callback=true` opts out
+          # cleanly; the production publish path always passes false so
+          # nothing changes for repository_dispatch traffic. Issue #2.
+          if [ "$SKIP_CALLBACK" = "true" ]; then
+            echo "skip_callback=true; artifacts are on S3, exiting without POST"
+            exit 0
+          fi
           if [ -z "$CALLBACK_URL" ]; then
             echo "No callback URL configured; skipping callback POST"
             exit 0
