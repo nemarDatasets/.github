@@ -1,0 +1,280 @@
+name: Run Version DOI
+
+# Central version-DOI workflow for NEMAR datasets.
+#
+# Replaces the per-repo `.github/workflows/version-doi.yml` that previously
+# shipped to every dataset repo via `deployWorkflows()` in nemarOrg/nemar-cli.
+# Phase 2 of nemarOrg/nemar-cli#601 (sub-issue #606). Sibling to
+# `run-enrichment.yml` (Phase 1).
+#
+# Triggered by:
+#   - repository_dispatch[run-version-doi] from api.nemar.org/webhooks/github
+#     when a v* tag is pushed to a dataset repo. The Worker's tag-push
+#     decision function filters refs to a strict `^refs/tags/v\d+\.\d+\.\d+
+#     (?:-(?:rc|alpha|beta)\d*)?$` pattern and dispatches with the dataset_id
+#     and bare tag in client_payload.
+#   - workflow_dispatch (manual recovery / smoke-test).
+#
+# Operator-facing semantics match the legacy per-repo workflow: create
+# release if missing, refresh enrichment from the tag snapshot (defensive,
+# non-fatal), publish the version DOI via /webhooks/publish-version-doi,
+# then dispatch generate-archive on the target dataset repo. The
+# generate-archive dispatch will move to the central .github repo in Phase
+# 3; until then this workflow targets the target dataset repo by name so
+# the legacy per-repo generate-archive.yml continues to receive it.
+
+on:
+  repository_dispatch:
+    types: [run-version-doi]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      tag:
+        description: "Version tag including the v prefix (e.g. v1.0.0)"
+        required: true
+        type: string
+
+jobs:
+  publish-doi:
+    name: Publish Version DOI
+    runs-on: ubuntu-latest
+    # Cap total runtime. The DOI mint is sub-second; the enrichment refresh
+    # is the bottleneck (one LLM call) but it's continue-on-error. 15 min is
+    # generous margin without letting a hung TLS handshake pin a runner.
+    timeout-minutes: 15
+    # Defense-in-depth: zero out the default GITHUB_TOKEN scope. Both
+    # gh-cli steps below authenticate via the per-repo App token; the
+    # default token is never used and shouldn't carry implicit write.
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+      NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *)
+              echo "::error::Invalid dataset_id shape: $DATASET_ID (expected nm/on/xx + 6 digits)"
+              exit 1
+              ;;
+          esac
+          if [ -z "$TAG" ]; then
+            echo "::error::Missing tag"
+            exit 1
+          fi
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::Invalid tag shape: $TAG (expected leading v + version digits, e.g. v1.0.0 or v1.0.0-rc1)"
+              exit 1
+              ;;
+          esac
+          echo "Inputs OK: dataset_id=$DATASET_ID tag=$TAG"
+
+      - name: Derive version
+        id: derive
+        run: |
+          # Strip the leading v so downstream callers (Worker's
+          # publish-version-doi, archive dispatch) get the bare X.Y.Z.
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The release may already exist if pr-merge.yml created it as part
+          # of the merge that produced this tag. Check first; only create if
+          # missing (manual-tag and legacy-repo paths). Use --repo to target
+          # the dataset repo explicitly — this workflow runs in .github.
+          gh release view "$TAG" --repo "nemarDatasets/$DATASET_ID" > /dev/null 2>&1 || \
+            gh release create "$TAG" --repo "nemarDatasets/$DATASET_ID" \
+              --title "$TAG" --notes "Release $TAG"
+
+      - name: Refresh enrichment from tag (defensive)
+        # continue-on-error makes the step itself non-blocking — the job
+        # proceeds to the DOI mint regardless of refresh outcome. The
+        # script below uses `exit 1` on real failures so the step shows
+        # red in the Actions UI (operator signal) without affecting job
+        # exit. Matches the discipline of run-enrichment.yml's retry loop.
+        # Code-review #8.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Belt-and-suspenders: refresh D1 enrichment_json from the tag's
+          # snapshot before the DOI is minted. Covers cases where run-
+          # enrichment.yml didn't fire on the release branch (manual tags,
+          # legacy repos). client_commits=true tells the Worker to return
+          # the payload without attempting a commit — tags are immutable
+          # and a commit against an immutable ref would fail downstream.
+          # The D1 cache update happens regardless of the commit attempt.
+          if [ -z "$NEMAR_WEBHOOK_TOKEN" ]; then
+            echo "NEMAR_WEBHOOK_TOKEN not configured, skipping enrichment refresh"
+            exit 0
+          fi
+
+          echo "Refreshing enrichment for $DATASET_ID from tag $TAG"
+
+          # --connect-timeout 10 and --max-time 180 match the hardening
+          # applied to run-enrichment.yml in #6 — a hung TLS handshake
+          # could otherwise pin the runner for the full timeout-minutes.
+          HTTP_CODE=$(curl -sS -o /tmp/llm-enrich-refresh.json -w "%{http_code}" \
+            --connect-timeout 10 --max-time 180 \
+            -X POST "https://api.nemar.org/webhooks/llm-enrich" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
+            -d "{\"dataset_id\": \"$DATASET_ID\", \"force\": true, \"client_commits\": true, \"ref\": \"$TAG\"}") || HTTP_CODE=0
+
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/llm-enrich-refresh.json 2>/dev/null || true
+          echo
+
+          if [ "$HTTP_CODE" -ge 400 ] || [ "$HTTP_CODE" = "0" ]; then
+            echo "::warning::Pre-DOI enrichment refresh failed (HTTP $HTTP_CODE) - DOI mint will proceed with whatever metadata is already in D1"
+            exit 1
+          fi
+
+          # Surface embedded sub-errors as warnings so a green checkmark
+          # doesn't mask a silently stale enrichment cycle. Field list
+          # mirrors ENRICHMENT_SUBERROR_FIELDS in services/dataset-reindex.ts
+          # and EnrichmentSuccessBody in services/enrich-dataset.ts.
+          for field in commit_error doi_sync_error cache_error bidsignore_error metadata_columns_error issue_creation_error; do
+            err=$(jq -r --arg f "$field" '.[$f] // empty' /tmp/llm-enrich-refresh.json 2>/dev/null)
+            if [ -n "$err" ]; then
+              echo "::warning::Enrichment refresh reported $field: $err"
+            fi
+          done
+
+      - name: Publish version DOI
+        run: |
+          set -euo pipefail
+          RELEASE_URL="https://github.com/nemarDatasets/$DATASET_ID/releases/tag/$TAG"
+
+          echo "Publishing DOI for $DATASET_ID version $VERSION"
+
+          if [ -z "$NEMAR_WEBHOOK_TOKEN" ]; then
+            echo "NEMAR_WEBHOOK_TOKEN not configured, skipping DOI publish"
+            exit 0
+          fi
+
+          # 2 attempts with a brief backoff. The DOI mint is fatal-on-failure
+          # (unlike the enrichment refresh which is best-effort), so a
+          # transient 5xx from EZID/Zenodo or Worker cold-start would
+          # otherwise red the job permanently and require operator rerun.
+          # 4xx remains terminal — that's a config error, not a hiccup.
+          # The Worker's /webhooks/publish-version-doi is idempotent on
+          # duplicate dispatches (EZID catches "already exists";
+          # handleZenodoVersionDoi short-circuits if dataset_versions
+          # already records the DOI — both fixed in nemarOrg/nemar-cli#607),
+          # so retrying after a success-then-network-blip is safe.
+          # Code-review #8.
+          HTTP_CODE=0
+          BODY=""
+          for attempt in 1 2; do
+            RESPONSE=$(curl -sS -w "\n%{http_code}" \
+              --connect-timeout 10 --max-time 60 \
+              -X POST "https://api.nemar.org/webhooks/publish-version-doi" \
+              -H "Content-Type: application/json" \
+              -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
+              -d "{
+                \"dataset_id\": \"$DATASET_ID\",
+                \"version\": \"$VERSION\",
+                \"release_url\": \"$RELEASE_URL\"
+              }") || RESPONSE=$'\n0'
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "attempt $attempt: HTTP $HTTP_CODE"
+            echo "Response: $BODY"
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              break
+            fi
+            # 4xx is terminal — no retry. 5xx and curl-level failures get
+            # one retry after a 10s pause.
+            if [ "$HTTP_CODE" -ge 400 ] && [ "$HTTP_CODE" -lt 500 ]; then
+              break
+            fi
+            if [ "$attempt" -lt 2 ]; then
+              echo "::warning::attempt $attempt: HTTP $HTTP_CODE (transient); retrying in 10s"
+              sleep 10
+            fi
+          done
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            if echo "$BODY" | jq -e '.skipped == true' > /dev/null 2>&1; then
+              echo "Skipped: $(echo "$BODY" | jq -r '.reason // "No concept DOI exists for this dataset"')"
+              exit 0
+            fi
+            echo "::error::Failed to publish DOI (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          if [ "$HTTP_CODE" -lt 200 ]; then
+            echo "::error::Failed to publish DOI after 2 attempts (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          DOI=$(echo "$BODY" | jq -r '.version_doi // empty')
+          if [ -n "$DOI" ]; then
+            echo "Version DOI published: $DOI"
+          fi
+
+  trigger-archive:
+    name: Trigger Archive Generation
+    needs: publish-doi
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ needs.publish-doi.outputs.version }}
+    steps:
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Dispatch archive generation
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Target the dataset repo explicitly (not the implicit
+          # ${{ github.repository }} which is .github, the wrong target).
+          # When generate-archive.yml itself centralizes in Phase 3, this
+          # dispatch will move to "nemarDatasets/.github" with a different
+          # event_type. For now the legacy per-repo generate-archive.yml on
+          # the dataset repo receives this dispatch — same wire shape as
+          # the pre-centralization world.
+          echo "Triggering archive generation for $DATASET_ID v$VERSION"
+
+          gh api "repos/nemarDatasets/$DATASET_ID/dispatches" \
+            -f event_type=generate-archive \
+            -f "client_payload[dataset_id]=$DATASET_ID" \
+            -f "client_payload[version]=$VERSION"
