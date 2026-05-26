@@ -181,7 +181,12 @@ class EmitManifestRealGitTests(unittest.TestCase):
     # ---- summary shape ------------------------------------------------------
 
     def test_summary_schema_version(self):
-        self.assertEqual(self.summary["schema_version"], "1.0")
+        # Schema 1.1 (epic #618 / issue #619): readme now embeds inline content.
+        # Bumped from "1.0". Consumers that read `readme["path"]` keep working;
+        # consumers that did strict-equality on the whole readme dict (the
+        # old 1-key {path} shape) will see a shape difference and must
+        # branch on schema_version.
+        self.assertEqual(self.summary["schema_version"], "1.1")
 
     def test_summary_totals_files_match_manifest(self):
         self.assertEqual(
@@ -207,7 +212,25 @@ class EmitManifestRealGitTests(unittest.TestCase):
         self.assertIn("eeg", self.summary["modalities"])
 
     def test_summary_readme_path(self):
-        self.assertEqual(self.summary["readme"], {"path": "README.md"})
+        # Schema 1.1: readme is now a 5-key object, not the old 1-key {path}.
+        self.assertEqual(self.summary["readme"]["path"], "README.md")
+
+    def test_summary_readme_content_inline(self):
+        """Schema 1.1: a small git-keyed README is embedded verbatim under
+        readme.content as a UTF-8 string."""
+        readme = self.summary["readme"]
+        self.assertEqual(readme["content"], "# Test dataset\n\nA real test dataset.\n")
+        self.assertFalse(readme["truncated"])
+
+    def test_summary_readme_metadata(self):
+        """content_bytes matches the raw blob size and sha256 is the
+        hex-encoded SHA-256 of the same bytes."""
+        import hashlib  # local to keep top-of-file imports unchanged
+
+        readme = self.summary["readme"]
+        expected_bytes = b"# Test dataset\n\nA real test dataset.\n"
+        self.assertEqual(readme["content_bytes"], len(expected_bytes))
+        self.assertEqual(readme["sha256"], hashlib.sha256(expected_bytes).hexdigest())
 
     def test_summary_doi_passthrough(self):
         self.assertEqual(self.summary["doi"], self.manifest["doi"])
@@ -368,7 +391,12 @@ class ReadmePriorityTests(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_readme_priority_picks_plain_README(self):
-        self.assertEqual(self.summary["readme"], {"path": "README"})
+        # README (priority 0) wins over README.md (priority 1). Content
+        # embedded inline must come from README, not README.md, proving the
+        # selection happens before content extraction.
+        self.assertEqual(self.summary["readme"]["path"], "README")
+        self.assertEqual(self.summary["readme"]["content"], "plain README\n")
+        self.assertFalse(self.summary["readme"]["truncated"])
 
 
 class VersionVPrefixTests(unittest.TestCase):
@@ -655,6 +683,296 @@ class FailureBodyRoundTripTests(unittest.TestCase):
         # actual point of failure, not the unhelpful "unknown error"
         # sentinel.
         self.assertEqual(self.body["error_message"], "failed at step: clone")
+
+
+class ReadmeOversizeTruncatedTests(unittest.TestCase):
+    """A README larger than README_INLINE_MAX_BYTES (256 KB) must NOT be
+    embedded inline. The summary still records path + content_bytes so the
+    website can render a length indicator, and sets truncated=True so the
+    consumer falls back to the on-demand fetch."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-readme-oversize-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+
+        cls.repo.mkdir(parents=True, exist_ok=True)
+        git(cls.repo, "init", "-q", "-b", "main")
+        git(cls.repo, "config", "user.email", "test@nemar.local")
+        git(cls.repo, "config", "user.name", "Test")
+        git(cls.repo, "config", "commit.gpgsign", "false")
+        (cls.repo / "dataset_description.json").write_text(
+            json.dumps({"Name": "BigReadme", "BIDSVersion": "1.8.0", "DatasetType": "raw"})
+        )
+        # 300 KB README — over the 256 KB cap. Mix multibyte characters so a
+        # future refactor that confuses `len(str)` (codepoints) with
+        # `len(bytes)` would visibly diverge from `content_bytes`.
+        big = "# Big README ✓\n" + ("αβγδε" * (60 * 1024))
+        (cls.repo / "README.md").write_text(big, encoding="utf-8")
+        cls.big_bytes = len(big.encode("utf-8"))
+
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "Oversize README fixture"],
+            env=env,
+        )
+        git(cls.repo, "tag", "v0.0.0")
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.summary = json.loads((cls.out / "summary.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_oversize_readme_marked_truncated(self):
+        readme = self.summary["readme"]
+        self.assertEqual(readme["path"], "README.md")
+        self.assertIsNone(readme["content"])
+        self.assertTrue(readme["truncated"])
+        self.assertEqual(readme["content_bytes"], self.big_bytes)
+        # sha256 left null when content was never read (cap hit before cat-file).
+        self.assertIsNone(readme["sha256"])
+
+    def test_oversize_run_still_succeeded(self):
+        # The oversize-README path must NOT fail the workflow; it degrades
+        # gracefully so a giant README doesn't block a publish.
+        self.assertEqual(self.proc.returncode, 0, self.proc.stderr)
+
+
+class ReadmeAnnexedTruncatedTests(unittest.TestCase):
+    """An annexed README (rare in BIDS but possible) must ship truncated=True
+    with content=null. We don't have IAM here to dereference annex keys to S3,
+    so the website must fall back to its own fetch path."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-readme-annex-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+
+        cls.repo.mkdir(parents=True, exist_ok=True)
+        git(cls.repo, "init", "-q", "-b", "main")
+        git(cls.repo, "config", "user.email", "test@nemar.local")
+        git(cls.repo, "config", "user.name", "Test")
+        git(cls.repo, "config", "commit.gpgsign", "false")
+        (cls.repo / "dataset_description.json").write_text(
+            json.dumps({"Name": "AnnexReadme", "BIDSVersion": "1.8.0", "DatasetType": "raw"})
+        )
+        # Make README.md a real annex-style symlink instead of plain blob.
+        annex_key = "SHA256E-s4096--deadbeefdeadbeef.md"
+        annex_target = f"../../.git/annex/objects/aa/bb/{annex_key}/{annex_key}"
+        os.symlink(annex_target, cls.repo / "README.md")
+        cls.expected_size = 4096  # encoded in the annex key
+
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "Annex README fixture"],
+            env=env,
+        )
+        git(cls.repo, "tag", "v0.0.0")
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.summary = json.loads((cls.out / "summary.json").read_text())
+        cls.manifest = json.loads((cls.out / "manifest.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_readme_is_annex_keyed_in_manifest(self):
+        # Sanity check the fixture: the README should be annex-keyed, not
+        # git-keyed. If this fails the test below is meaningless.
+        key = self.manifest["files"]["README.md"]["key"]
+        self.assertFalse(key.startswith("git:"), f"expected annex key, got {key!r}")
+
+    def test_annexed_readme_truncated(self):
+        readme = self.summary["readme"]
+        self.assertEqual(readme["path"], "README.md")
+        self.assertIsNone(readme["content"])
+        self.assertTrue(readme["truncated"])
+        self.assertEqual(readme["content_bytes"], self.expected_size)
+        self.assertIsNone(readme["sha256"])
+
+
+class ReadmeBinaryTruncatedTests(unittest.TestCase):
+    """A non-UTF-8 README blob (binary or mis-encoded) must ship
+    truncated=True with content=None, but **keep sha256 populated** because
+    the bytes were actually read. This is the only path where sha256 is
+    set while content is None — pin the unique 4-tuple so a refactor that
+    swaps the decode/hash order would break visibly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-readme-binary-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+
+        cls.repo.mkdir(parents=True, exist_ok=True)
+        git(cls.repo, "init", "-q", "-b", "main")
+        git(cls.repo, "config", "user.email", "test@nemar.local")
+        git(cls.repo, "config", "user.name", "Test")
+        git(cls.repo, "config", "commit.gpgsign", "false")
+        (cls.repo / "dataset_description.json").write_text(
+            json.dumps({"Name": "BinReadme", "BIDSVersion": "1.8.0", "DatasetType": "raw"})
+        )
+        # Bytes that are not valid UTF-8: lone continuation byte, then
+        # incomplete multibyte start. write_bytes since the BIDS spec
+        # requires UTF-8 README — this fixture deliberately breaks the spec
+        # to exercise the encoding fallback.
+        #
+        # NOTE: the payload must be > 512 bytes so build_manifest's
+        # unlocked-mode annex-pointer probe (which calls `cat-file blob`
+        # in text mode) skips it. The probe would otherwise raise
+        # UnicodeDecodeError before our derive_readme code is reached.
+        # That's a pre-existing latent bug tracked separately; sidestep
+        # here by oversizing the fixture.
+        import hashlib
+        cls.binary_payload = b"\xff\xfe\x00\x01binary garbage \xc3\x28 not utf-8 " * 32
+        (cls.repo / "README.md").write_bytes(cls.binary_payload)
+        cls.expected_sha = hashlib.sha256(cls.binary_payload).hexdigest()
+
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "Binary README fixture"],
+            env=env,
+        )
+        git(cls.repo, "tag", "v0.0.0")
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.summary = json.loads((cls.out / "summary.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_binary_readme_truncated_with_sha(self):
+        readme = self.summary["readme"]
+        self.assertEqual(readme["path"], "README.md")
+        self.assertIsNone(readme["content"])
+        self.assertTrue(readme["truncated"])
+        self.assertEqual(readme["content_bytes"], len(self.binary_payload))
+        # sha256 IS set (bytes were read) — distinguishes this branch from
+        # oversize/annexed/cat-file-failure where sha256 is None.
+        self.assertEqual(readme["sha256"], self.expected_sha)
+
+    def test_binary_run_still_succeeded(self):
+        # Spec-violating READMEs warn (see stderr) but don't fail the publish.
+        self.assertEqual(self.proc.returncode, 0, self.proc.stderr)
+
+    def test_binary_emits_non_utf8_warning(self):
+        # Structured stderr line so ops can grep for it post-publish.
+        self.assertIn("readme_truncated", self.proc.stderr)
+        self.assertIn("reason=non_utf8", self.proc.stderr)
+
+
+class ReadmeCatFileFailureTests(unittest.TestCase):
+    """If `git cat-file blob <sha>` fails for the README (corruption,
+    stale manifest, wrong repo_dir) we must NOT crash the publish. The
+    summary records the path with `content=None, content_bytes=None,
+    sha256=None, truncated=True` so the website knows to fall back.
+
+    Reproduced by mutating an existing summary's expected behaviour via
+    a fixture where we substitute a nonexistent git sha into the manifest
+    before re-running `build_summary` directly. Because the script as a
+    whole derives the manifest from a real tree (and a real tree can't
+    contain a nonexistent sha), we exercise this via a direct unit call
+    rather than the subprocess pathway."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(HERE))
+        import emit_manifest  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+        self.derive_readme = emit_manifest.derive_readme
+
+    def test_cat_file_failure_marks_truncated(self):
+        # Real but empty git repo so cat-file invocations have a working
+        # GIT_DIR but the bogus sha doesn't resolve.
+        with tempfile.TemporaryDirectory(prefix="emit-cat-fail-") as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.check_call(["git", "-C", str(repo), "init", "-q", "-b", "main"])
+
+            bogus_sha = "0" * 40
+            files = {
+                "README.md": {
+                    "key": f"git:{bogus_sha}",
+                    "size": 1234,
+                    "checksum": f"git:{bogus_sha}",
+                }
+            }
+            paths = {"README.md"}
+
+            result = self.derive_readme(
+                paths=paths,
+                files=files,
+                repo_dir=str(repo),
+                dataset_id="nm099999",
+                version="0.0.0",
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["path"], "README.md")
+            self.assertIsNone(result["content"])
+            self.assertTrue(result["truncated"])
+            # content_bytes=None signals "we never opened the blob"; the
+            # 1234 from the manifest is NOT echoed back, because it would
+            # be misleading (no bytes were ever read).
+            self.assertIsNone(result["content_bytes"])
+            self.assertIsNone(result["sha256"])
+
+
+class ReadmeNoneSchema11Tests(unittest.TestCase):
+    """When no README exists at the BIDS root, schema 1.1 still emits
+    `readme: null` (not an empty dict). Forward-compatible with 1.0
+    consumers that only checked `readme is None` for absence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-no-readme-11-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+
+        cls.repo.mkdir(parents=True, exist_ok=True)
+        git(cls.repo, "init", "-q", "-b", "main")
+        git(cls.repo, "config", "user.email", "test@nemar.local")
+        git(cls.repo, "config", "user.name", "Test")
+        git(cls.repo, "config", "commit.gpgsign", "false")
+        (cls.repo / "dataset_description.json").write_text(
+            json.dumps({"Name": "NoReadme11", "BIDSVersion": "1.8.0", "DatasetType": "raw"})
+        )
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "No README schema-1.1 fixture"],
+            env=env,
+        )
+        git(cls.repo, "tag", "v0.0.0")
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.summary = json.loads((cls.out / "summary.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_readme_is_null(self):
+        self.assertIsNone(self.summary["readme"])
+
+    def test_schema_version_still_11(self):
+        self.assertEqual(self.summary["schema_version"], "1.1")
 
 
 if __name__ == "__main__":
