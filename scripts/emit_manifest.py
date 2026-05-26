@@ -284,30 +284,48 @@ def derive_modalities(paths: list[str]) -> list[str]:
     return sorted(found)
 
 
-def _read_readme_blob(repo_dir: str, sha: str) -> bytes | None:
-    """Return the raw bytes of a git blob, or None if cat-file fails."""
+def _read_readme_blob(repo_dir: str, sha: str, *, dataset_id: str, version: str, candidate: str) -> bytes | None:
+    """Return the raw bytes of a git blob, or None if cat-file fails.
+
+    cat-file failure here means the manifest references a blob the repo
+    can't produce — corruption, wrong repo_dir, or the manifest is stale.
+    None of those are normal; emit a structured stderr line so ops sees it.
+    """
     try:
         return subprocess.check_output(
             ["git", "-C", repo_dir, "cat-file", "blob", sha]
         )
     except subprocess.CalledProcessError as e:
         print(
-            f"[emit_manifest] warning: git cat-file blob {sha} failed: {e}",
+            f"[emit_manifest] readme_extract_failed dataset={dataset_id} "
+            f"version={version} candidate={candidate} sha={sha} "
+            f"reason=cat_file_error error={e}",
             file=sys.stderr,
             flush=True,
         )
         return None
 
 
-def derive_readme(*, paths: set[str], files: dict, repo_dir: str) -> dict | None:
+def derive_readme(*, paths: set[str], files: dict, repo_dir: str, dataset_id: str, version: str) -> dict | None:
     """Find the BIDS-root README and embed its content into the summary.
 
-    Schema 1.1 contract:
-      - present + readable: {path, content (utf-8 str), content_bytes, sha256, truncated=False}
-      - present but oversize / annexed / binary / unreadable:
-        {path, content=None, content_bytes, sha256, truncated=True}
-        (sha256 may be None when content was never read)
-      - absent: None
+    Schema 1.1 contract — four output shapes:
+      1. Absent (no README at root): None
+      2. Present, readable, fits cap (git-keyed, UTF-8, <= 256 KB):
+         {path, content=<str>, content_bytes=<int>, sha256=<hex>, truncated=False}
+      3. Present, oversize or annexed (no read attempted):
+         {path, content=None, content_bytes=<int from key/git>, sha256=None, truncated=True}
+      4. Present, read attempted but unusable (cat-file failed or binary):
+         {path, content=None, content_bytes=<None or actual bytes>, sha256=<hex or None>, truncated=True}
+
+    `content_bytes` reports the **actual byte length of content read** when a
+    read happened; it is None on cat-file failure (no bytes ever seen) and
+    equal to the manifest/annex `size` field for oversize/annexed branches
+    (where we deliberately skipped the read). Consumers can rely on
+    `content_bytes is None` as the "we never opened the blob" signal.
+
+    Every truncated branch emits a structured stderr warning (`reason=…`)
+    so ops sees that the inline-content fast path didn't fire.
     """
     for candidate in README_CANDIDATES:
         if candidate not in paths:
@@ -320,6 +338,12 @@ def derive_readme(*, paths: set[str], files: dict, repo_dir: str) -> dict | None
         # here because the worker has IAM, not this script. Mark truncated so
         # the website knows to fall back without retrying.
         if not key.startswith("git:"):
+            print(
+                f"[emit_manifest] readme_truncated dataset={dataset_id} "
+                f"version={version} candidate={candidate} reason=annexed size={size}",
+                file=sys.stderr,
+                flush=True,
+            )
             return {
                 "path": candidate,
                 "content": None,
@@ -331,6 +355,13 @@ def derive_readme(*, paths: set[str], files: dict, repo_dir: str) -> dict | None
         # Git-keyed: cat-file the blob. Size cap avoids pulling unbounded
         # blobs into memory — generous since typical READMEs are < 20 KB.
         if size > README_INLINE_MAX_BYTES:
+            print(
+                f"[emit_manifest] readme_truncated dataset={dataset_id} "
+                f"version={version} candidate={candidate} reason=oversize "
+                f"size={size} cap={README_INLINE_MAX_BYTES}",
+                file=sys.stderr,
+                flush=True,
+            )
             return {
                 "path": candidate,
                 "content": None,
@@ -340,12 +371,17 @@ def derive_readme(*, paths: set[str], files: dict, repo_dir: str) -> dict | None
             }
 
         sha = key[len("git:") :]
-        blob = _read_readme_blob(repo_dir, sha)
+        blob = _read_readme_blob(
+            repo_dir, sha, dataset_id=dataset_id, version=version, candidate=candidate
+        )
         if blob is None:
             return {
                 "path": candidate,
                 "content": None,
-                "content_bytes": size,
+                # content_bytes=None signals "we never read the blob"; the
+                # caller can't tell git's reported size apart from the actual
+                # bytes here, so don't pretend.
+                "content_bytes": None,
                 "sha256": None,
                 "truncated": True,
             }
@@ -354,9 +390,18 @@ def derive_readme(*, paths: set[str], files: dict, repo_dir: str) -> dict | None
         try:
             content = blob.decode("utf-8")
         except UnicodeDecodeError:
-            # Binary README is essentially unheard-of in BIDS. Preserve hash
-            # so callers can detect changes; truncated=True so consumers
-            # know not to render `content`.
+            # BIDS spec requires UTF-8 README. A non-UTF-8 blob means an
+            # upstream encoding error in the dataset; warn loudly so the
+            # owner can fix it, but don't fail the publish (the manifest
+            # is still valid and downloads still work). The truncated flag
+            # tells the website to fall back instead of rendering garbage.
+            print(
+                f"[emit_manifest] readme_truncated dataset={dataset_id} "
+                f"version={version} candidate={candidate} reason=non_utf8 "
+                f"size={len(blob)} sha256={sha256}",
+                file=sys.stderr,
+                flush=True,
+            )
             return {
                 "path": candidate,
                 "content": None,
@@ -389,7 +434,13 @@ def build_summary(*, manifest: dict, repo_dir: str) -> dict:
     total_bytes = sum(int(meta.get("size") or 0) for meta in files.values())
     subjects = derive_subjects(paths_sorted)
     modalities = derive_modalities(paths_sorted)
-    readme = derive_readme(paths=paths_set, files=files, repo_dir=repo_dir)
+    readme = derive_readme(
+        paths=paths_set,
+        files=files,
+        repo_dir=repo_dir,
+        dataset_id=manifest["dataset_id"],
+        version=manifest["version"],
+    )
 
     return {
         "schema_version": "1.1",
