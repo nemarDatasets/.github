@@ -11,7 +11,7 @@ name: Run Pre-screen
 #   3. runs `claude -p --model haiku` to judge the publisher minimum
 #      (real data present, README says what/how, Name + Authors present),
 #   4. on a block verdict, opens/updates a GitHub issue on the dataset repo
-#      (as nemarAdmin via NEMAR_ADMIN_TOKEN),
+#      (via the NEMAR_GITHUB_PAT, Issues:write),
 #   5. POSTs the verdict to the Worker (/webhooks/prescreen-result) with the
 #      one-shot HMAC callback token. The Worker independently re-checks S3
 #      object presence (it has the AWS creds), then blocks + emails the
@@ -24,7 +24,7 @@ name: Run Pre-screen
 # Required secrets on nemarDatasets/.github:
 #   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY  - per-repo checkout token
 #   CLAUDE_CODE_OAUTH_TOKEN              - Claude Code auth for `claude -p`
-#   NEMAR_ADMIN_TOKEN                    - PAT that opens issues as nemarAdmin
+#   NEMAR_GITHUB_PAT                     - PAT with Issues:write that opens the issue
 
 on:
   repository_dispatch:
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Zero default GITHUB_TOKEN scope. Checkout uses a per-repo App token;
-    # the issue is opened with NEMAR_ADMIN_TOKEN; the callback is HMAC-auth'd.
+    # the issue is opened with NEMAR_GITHUB_PAT; the callback is HMAC-auth'd.
     permissions: {}
     env:
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
@@ -178,7 +178,7 @@ jobs:
         id: issue
         if: steps.screen.outputs.verdict == 'block'
         env:
-          GH_TOKEN: ${{ secrets.NEMAR_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
         run: |
           set -euo pipefail
           # Sanitize the model-supplied title: strip control chars/newlines and
