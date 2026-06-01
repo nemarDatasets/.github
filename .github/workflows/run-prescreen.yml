@@ -1,0 +1,258 @@
+name: Run Pre-screen
+
+# Automated publication pre-screen for NEMAR datasets (nemarOrg/nemar-cli#666).
+#
+# NEMAR is a data PUBLISHER, not a peer reviewer. When a user requests
+# publication and the dataset passes BIDS-validation readiness, the Worker
+# fires repository_dispatch[run-prescreen] here. This workflow:
+#   1. mints a per-repo App token and checks out the dataset metadata,
+#   2. builds a screening context (README, dataset_description.json, declared
+#      data size from git-annex pointer keys, file-type/subject summary),
+#   3. runs `claude -p --model haiku` to judge the publisher minimum
+#      (real data present, README says what/how, Name + Authors present),
+#   4. on a block verdict, opens/updates a GitHub issue on the dataset repo
+#      (via the NEMAR_GITHUB_PAT, Issues:write),
+#   5. POSTs the verdict to the Worker (/webhooks/prescreen-result) with the
+#      one-shot HMAC callback token. The Worker independently re-checks S3
+#      object presence (it has the AWS creds), then blocks + emails the
+#      requester or marks the screen passed.
+#
+# Lives on nemarDatasets/.github so its Actions minutes bill against the
+# dataset org's Team allowance (same accounting as the enrichment/manifest
+# workflows).
+#
+# Required secrets on nemarDatasets/.github:
+#   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY  - per-repo checkout token
+#   CLAUDE_CODE_OAUTH_TOKEN              - Claude Code auth for `claude -p`
+#   NEMAR_GITHUB_PAT                     - PAT with Issues:write that opens the issue
+
+on:
+  repository_dispatch:
+    types: [run-prescreen]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to screen (branch or tag)"
+        required: false
+        type: string
+        default: "main"
+      request_id:
+        description: "publication_requests.id (0 = manual run, no callback)"
+        required: false
+        type: string
+        default: "0"
+
+jobs:
+  prescreen:
+    name: Run Pre-screen
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Zero default GITHUB_TOKEN scope. Checkout uses a per-repo App token;
+    # the issue is opened with NEMAR_GITHUB_PAT; the callback is HMAC-auth'd.
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+      REQUEST_ID: ${{ github.event.client_payload.request_id || inputs.request_id || '0' }}
+      CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "${DATASET_ID:-}" ]; then echo "::error::Missing dataset_id"; exit 1; fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::Invalid dataset_id shape: $DATASET_ID"; exit 1 ;;
+          esac
+          if [ -z "${REF:-}" ]; then echo "REF=main" >> "$GITHUB_ENV"; fi
+          echo "Inputs OK: dataset_id=$DATASET_ID ref=$REF request_id=$REQUEST_ID"
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Checkout dataset metadata
+        uses: actions/checkout@v4
+        with:
+          repository: nemarDatasets/${{ env.DATASET_ID }}
+          ref: ${{ env.REF }}
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
+          path: dataset
+
+      - name: Install Claude Code (bun)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          "$HOME/.bun/bin/bun" install -g @anthropic-ai/claude-code >/dev/null 2>&1
+          "$HOME/.bun/bin/bun" pm -g bin >> "$GITHUB_PATH"
+
+      - name: Build context and run pre-screen
+        id: screen
+        run: |
+          set -euo pipefail
+          # Everything stays in one shell: the context values (RFILE, EXTS, ...)
+          # are plain shell variables consumed directly below. We deliberately do
+          # NOT round-trip them through a sourced env file -- a multi-word value
+          # like EXTS="edf:5 json:10" or RFILE=<none> would be mis-parsed by
+          # `source` and abort the run (code review #666).
+          cd dataset
+          # README (first ~6 KB is plenty to judge what/how)
+          RFILE=""
+          for c in README.md README README.txt README.rst; do [ -f "$c" ] && { RFILE="$c"; break; }; done
+          if [ -n "$RFILE" ]; then head -c 6000 "$RFILE" > /tmp/readme.txt; else : > /tmp/readme.txt; fi
+          # dataset_description.json (capped; or empty object if missing)
+          if [ -f dataset_description.json ]; then head -c 4096 dataset_description.json > /tmp/desc.json; else echo '{}' > /tmp/desc.json; fi
+          # Declared data size from git-annex pointer keys (format-agnostic:
+          # every annexed file embeds its byte size as SHA256E-s<bytes>--...).
+          BYTES=$(grep -rhoE 'SHA256E-s[0-9]+' . 2>/dev/null | sed 's/SHA256E-s//' | awk '{s+=$1} END{print s+0}')
+          NPTR=$(grep -rloE 'SHA256E-s[0-9]+' . 2>/dev/null | wc -l | tr -d ' ')
+          NSUB=$(find . -maxdepth 1 -type d -name 'sub-*' | wc -l | tr -d ' ')
+          EXTS=$(find . -type f ! -path './.git/*' | sed -E 's/.*\.//' | sort | uniq -c | sort -rn | head -12 | awk '{printf "%s:%s ",$2,$1}')
+          MB=$(awk "BEGIN{printf \"%.1f\", ${BYTES:-0}/1048576}")
+          cd ..
+          # Build the prompt by concatenation. Static instructions come from a
+          # QUOTED heredoc (no expansion); the dynamic context is appended with
+          # controlled `echo`s and raw `cat`s so an arbitrary README (which may
+          # contain backticks, $(...), etc.) can never be shell-interpreted.
+          {
+            cat <<'EOF'
+          You are screening a BIDS neuroimaging dataset for NEMAR, a data PUBLISHER (not a peer reviewer). Do NOT judge scientific merit. Only verify the publisher minimum so others can find, understand, and reuse the data.
+
+          Return verdict "block" if ANY of these hold; otherwise "pass":
+          1. No real data: declared data is ~0 or implausibly small for the subject count (e.g. a few KB total, or 1 file for many subjects).
+          2. README is missing/empty, OR contains only citations/boilerplate with no description of WHAT the data is and HOW to use it.
+          3. dataset_description.json is missing "Name", OR missing/empty "Authors".
+          A missing data paper / primary citation is NOT a block - note it in reasons if absent, but still "pass".
+
+          Output ONLY a single minified JSON object (no markdown, no code fence) with keys:
+            "verdict": "pass" or "block",
+            "reasons": array of short human-readable strings (the gaps; [] if a clean pass),
+            "issue_title": short GitHub issue title (only used when blocking),
+            "issue_body": GitHub-markdown body explaining the gaps and how to fix them (only used when blocking).
+
+          === Dataset context ===
+          EOF
+            echo "dataset_id: $DATASET_ID"
+            echo "subjects (sub-* dirs): ${NSUB:-0}"
+            echo "declared data: ${MB:-0} MB across ${NPTR:-0} annexed files"
+            echo "file extensions (ext:count): ${EXTS:-none}"
+            echo "README file: ${RFILE:-<none>}"
+            echo
+            echo "=== dataset_description.json ==="
+            cat /tmp/desc.json
+            echo
+            echo "=== README contents ==="
+            cat /tmp/readme.txt
+          } > /tmp/prompt.txt
+          # No tools needed (all context is inlined), so disallow tool use for
+          # a deterministic, pure-generation run. Prompt via stdin avoids argv
+          # limits and quoting hazards entirely.
+          if ! OUT=$(claude -p --model haiku --output-format json \
+              --disallowedTools "Bash,Read,Edit,Write,WebFetch,WebSearch" < /tmp/prompt.txt 2>/tmp/claude.err); then
+            echo "::error::claude invocation failed"; cat /tmp/claude.err; exit 1
+          fi
+          RESULT=$(echo "$OUT" | jq -r '.result // empty')
+          # Strip accidental ```json fences if the model added them.
+          RESULT=$(printf '%s' "$RESULT" | sed -E 's/^```[a-zA-Z]*[[:space:]]*//; s/[[:space:]]*```$//')
+          printf '%s' "$RESULT" > /tmp/verdict.json
+          if ! jq -e '.verdict == "pass" or .verdict == "block"' /tmp/verdict.json >/dev/null 2>&1; then
+            echo "::error::model did not return a valid verdict JSON"; cat /tmp/verdict.json; exit 1
+          fi
+          echo "verdict=$(jq -r '.verdict' /tmp/verdict.json)" >> "$GITHUB_OUTPUT"
+          echo "Verdict: $(jq -rc '{verdict,reasons}' /tmp/verdict.json)"
+
+      - name: Open / update issue on block
+        id: issue
+        if: steps.screen.outputs.verdict == 'block'
+        env:
+          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
+        run: |
+          set -euo pipefail
+          # Sanitize the model-supplied title: strip control chars/newlines and
+          # cap length. (Passing it as a quoted "$TITLE" argv to gh is already
+          # safe from command substitution -- bash does not re-evaluate $() that
+          # lives in a variable's value -- but this keeps the title tidy.)
+          TITLE=$(jq -r '.issue_title // "Publication on hold: missing essentials"' /tmp/verdict.json | tr -d '\000-\037' | head -c 180)
+          [ -n "$TITLE" ] || TITLE="Publication on hold: missing essentials"
+          jq -r '.issue_body // "The automated pre-screen found missing publication essentials."' /tmp/verdict.json > /tmp/issue_body.md
+          # Idempotent: reuse an existing open pre-screen issue rather than
+          # spamming a new one on every re-request.
+          EXISTING=$(gh issue list --repo "nemarDatasets/$DATASET_ID" --state open \
+            --search 'Publication on hold in:title' --json number,url --jq '.[0].url // empty' || true)
+          if [ -n "$EXISTING" ]; then
+            {
+              echo "Re-screened $(date -u +%FT%TZ): still blocked."
+              echo
+              jq -r '.reasons[]? | "- \(.)"' /tmp/verdict.json
+            } > /tmp/comment.md
+            gh issue comment "$EXISTING" --body-file /tmp/comment.md
+            URL="$EXISTING"
+          else
+            URL=$(gh issue create --repo "nemarDatasets/$DATASET_ID" --title "$TITLE" --body-file /tmp/issue_body.md)
+          fi
+          echo "issue_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Issue: $URL"
+
+      - name: Post verdict callback
+        if: always() && steps.screen.outputs.verdict != ''
+        run: |
+          set -euo pipefail
+          if [ -z "${CALLBACK_URL:-}" ]; then echo "No callback_url (manual run); skipping callback."; exit 0; fi
+          if [ -z "${CALLBACK_TOKEN:-}" ]; then echo "::error::callback_url set but callback_token missing"; exit 1; fi
+          VERDICT=$(jq -r '.verdict' /tmp/verdict.json)
+          REASONS=$(jq -c '.reasons // []' /tmp/verdict.json)
+          ISSUE_URL="${{ steps.issue.outputs.issue_url }}"
+          BODY=$(jq -nc \
+            --arg d "$DATASET_ID" --argjson rid "${REQUEST_ID:-0}" --arg v "$VERDICT" \
+            --argjson reasons "$REASONS" --arg iu "$ISSUE_URL" --arg run "${GITHUB_RUN_ID}" \
+            '{dataset_id:$d, request_id:$rid, verdict:$v, reasons:$reasons,
+              issue_url:(if $iu=="" then null else $iu end), workflow_run_id:$run}')
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /tmp/cb.out -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+              -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+              -H "X-Webhook-Token: $CALLBACK_TOKEN" -d "$BODY") || CODE=0
+            echo "callback attempt $attempt: HTTP $CODE"; cat /tmp/cb.out; echo
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then exit 0; fi
+            # 4xx is terminal (bad token / no in-flight request / malformed body)
+            # except 401 which can be a token-rotation race across Worker instances.
+            if [ "$CODE" -ge 400 ] && [ "$CODE" -lt 500 ] && [ "$CODE" -ne 401 ]; then
+              echo "::error::callback returned $CODE (4xx terminal)"; exit 1
+            fi
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+          done
+          echo "::error::callback failed after 3 attempts"; exit 1
+
+      - name: Report failure callback
+        # Fires only when the screen step never produced a verdict (install
+        # flake, claude error, malformed output) AND this was a real dispatch.
+        # Posts verdict="error" so the Worker resets prescreen_status to NULL
+        # and the request falls back to normal admin review instead of being
+        # stranded in 'pending' forever (code review #666).
+        if: always() && steps.screen.outputs.verdict == '' && env.CALLBACK_URL != ''
+        run: |
+          set -euo pipefail
+          if [ -z "${CALLBACK_TOKEN:-}" ]; then echo "callback_url set but no token; cannot report failure"; exit 0; fi
+          BODY=$(jq -nc \
+            --arg d "$DATASET_ID" --argjson rid "${REQUEST_ID:-0}" --arg run "${GITHUB_RUN_ID}" \
+            '{dataset_id:$d, request_id:$rid, verdict:"error",
+              reasons:["The automated pre-screen could not complete; falling back to manual admin review."],
+              workflow_run_id:$run}')
+          # Best-effort: do not fail the job if the report itself cannot be
+          # delivered (the Worker also has a staleness sweep as a backstop).
+          curl -sS -o /tmp/cb.out -w 'failure-report HTTP %{http_code}\n' --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: $CALLBACK_TOKEN" -d "$BODY" || true
+          cat /tmp/cb.out 2>/dev/null || true
