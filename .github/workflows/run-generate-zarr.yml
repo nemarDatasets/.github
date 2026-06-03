@@ -143,14 +143,16 @@ jobs:
           set -euo pipefail
           FULL_FLAG=""
           if [ "$FULL" = "true" ]; then
-            FULL_FLAG="--full"
+            FULL_FLAG="1"
           fi
+          # ${FULL_FLAG:+--full} expands to the single token --full when set,
+          # else to nothing -- no unquoted-empty word-splitting under set -u.
           python scripts/zarr/generate_zarr.py \
             --dataset-id "$DATASET_ID" \
             --repo-dir /tmp/repo \
             --bucket "$S3_BUCKET" \
             --region "$AWS_DEFAULT_REGION" \
-            $FULL_FLAG \
+            ${FULL_FLAG:+--full} \
             --callback-out /tmp/zarr-callback.json
 
       - name: POST callback (zarr-ready)
@@ -193,7 +195,11 @@ jobs:
           python -c "import json,sys; d=json.load(open('/tmp/zarr-callback.json')); n=d.get('errors',0); print(f'{n} recording(s) failed'); sys.exit(1 if n else 0)"
 
       - name: POST failure callback (best-effort)
-        if: failure()
+        # Only on a HARD failure (clone/install/driver crash, or the success
+        # callback POST itself failing) -- NOT when flag-partial reds the run
+        # after a successful partial callback, which would clobber a valid
+        # 'ready' in D1 with 'failed'.
+        if: failure() && steps.post-success.outcome != 'success'
         env:
           CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
         run: |

@@ -25,6 +25,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     is_primary,
     merge_index,
     parse_annex_key,
+    safe_store_prefix,
     store_rel_for,
 )
 
@@ -212,6 +213,27 @@ class TestMergeIndex(unittest.TestCase):
         converted = [{"zarr": "b.zarr"}, {"zarr": "a.zarr"}]
         index = merge_index(None, "nm000104", "sha", converted, [], "2026-06-02T00:00:00Z")
         self.assertEqual([s["zarr"] for s in index["stores"]], ["a.zarr", "b.zarr"])
+
+
+class TestSafeStorePrefix(unittest.TestCase):
+    def test_valid_store_path(self):
+        self.assertEqual(
+            safe_store_prefix("nemar", "nm000104", "sub-01/eeg/sub-01_task-x_eeg.zarr"),
+            "s3://nemar/nm000104/zarr/sub-01/eeg/sub-01_task-x_eeg.zarr/",
+        )
+
+    def test_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            safe_store_prefix("nemar", "nm000104", "")
+
+    def test_rejects_non_zarr(self):
+        with self.assertRaises(ValueError):
+            safe_store_prefix("nemar", "nm000104", "sub-01/eeg/sub-01_eeg.set")
+
+    def test_rejects_traversal(self):
+        for bad in ("../escape.zarr", "sub-01/../../x.zarr", "/abs/x.zarr", "a//b.zarr"):
+            with self.assertRaises(ValueError):
+                safe_store_prefix("nemar", "nm000104", bad)
 
 
 class TestParseAnnexKey(unittest.TestCase):

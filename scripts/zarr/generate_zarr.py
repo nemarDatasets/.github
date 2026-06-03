@@ -240,12 +240,51 @@ def git_diff_name_status(repo_dir: str, base: str, head: str) -> list[tuple[str,
 
 
 def is_ancestor(repo_dir: str, maybe_ancestor: str, head: str) -> bool:
-    return (
-        subprocess.run(
-            ["git", "-C", repo_dir, "merge-base", "--is-ancestor", maybe_ancestor, head]
-        ).returncode
-        == 0
+    """True iff `maybe_ancestor` is an ancestor of `head`.
+
+    `merge-base --is-ancestor` exits 0 (yes), 1 (no), or other (git error, e.g.
+    an unknown commit after a history rewrite). A git error is treated as "not
+    an ancestor" (so the run falls back to a full rebuild, which is correct for
+    a rewritten prior commit) but is logged so it isn't mistaken for a clean no.
+    """
+    res = subprocess.run(
+        ["git", "-C", repo_dir, "merge-base", "--is-ancestor", maybe_ancestor, head],
+        capture_output=True,
+        text=True,
     )
+    if res.returncode not in (0, 1):
+        print(
+            f"::warning::merge-base --is-ancestor {maybe_ancestor[:8]}..{head[:8]} "
+            f"exited {res.returncode}: {res.stderr.strip()}; treating as non-ancestor",
+            flush=True,
+        )
+    return res.returncode == 0
+
+
+def safe_store_prefix(bucket: str, dataset_id: str, rel_store: str) -> str:
+    """Build the S3 prefix for a store, validating `rel_store` first.
+
+    This prefix feeds `aws s3 sync --delete` and `aws s3 rm --recursive`, so an
+    empty or path-traversal value could wipe an unintended prefix (e.g. the
+    whole `<id>/zarr/`). Reject anything that isn't a clean `*.zarr` rel-path.
+    """
+    if not rel_store or not rel_store.endswith(".zarr"):
+        raise ValueError(f"unsafe store rel-path {rel_store!r}: empty or not a .zarr")
+    parts = rel_store.split("/")
+    if rel_store.startswith("/") or "" in parts or ".." in parts:
+        raise ValueError(f"unsafe store rel-path {rel_store!r}: traversal or empty segment")
+    return f"s3://{bucket}/{dataset_id}/zarr/{rel_store}/"
+
+
+def validate_store(store_local: str) -> None:
+    """Raise if biosigIO produced an empty/partial store.
+
+    Guards the `aws s3 sync --delete` below: syncing an empty local directory to
+    a populated destination would DELETE a previously-valid store. A biosigIO
+    Zarr v3 store always has a root `zarr.json`.
+    """
+    if not os.path.isdir(store_local) or not os.path.exists(os.path.join(store_local, "zarr.json")):
+        raise RuntimeError(f"biosigIO wrote no zarr.json at {store_local}; store is empty/partial")
 
 
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
@@ -253,19 +292,31 @@ def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
 
 
 def s3_read_json(bucket: str, key: str) -> dict | None:
-    """Read a JSON object from S3, or None if it doesn't exist."""
+    """Read a JSON object from S3.
+
+    Returns None ONLY for a genuine 404 (NoSuchKey) -- the legitimate first-run
+    case. Any other non-zero exit (credentials, network, wrong bucket) RAISES:
+    silently treating it as "no prior index" would send the run full AND drop
+    every prior store from the rewritten index. A corrupt body raises for the
+    same reason (absent != corrupt).
+    """
     res = subprocess.run(
         ["aws", "s3", "cp", f"s3://{bucket}/{key}", "-"],
         capture_output=True,
         text=True,
     )
     if res.returncode != 0:
-        return None
+        err = res.stderr.lower()
+        if "nosuchkey" in err or "404" in err or "not found" in err:
+            return None
+        raise RuntimeError(
+            f"s3_read_json: aws s3 cp s3://{bucket}/{key} exited {res.returncode}: "
+            f"{res.stderr.strip()}"
+        )
     try:
         return json.loads(res.stdout)
-    except json.JSONDecodeError:
-        print(f"::warning::corrupt JSON at s3://{bucket}/{key}; treating as absent", flush=True)
-        return None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"corrupt JSON at s3://{bucket}/{key}: {exc}") from exc
 
 
 def materialize_recording(
@@ -274,6 +325,7 @@ def materialize_recording(
     dataset_id: str,
     primary_path: str,
     head_files: set[str],
+    head: str,
     work_dir: str,
 ) -> tuple[str, str | None, str | None]:
     """Reconstruct a recording's file set into `work_dir`.
@@ -299,8 +351,16 @@ def materialize_recording(
     for path in wanted:
         local = os.path.join(work_dir, os.path.basename(path))
         # mode tells symlink (120000) vs regular blob; sha addresses the blob.
-        meta = _run(["git", "-C", repo_dir, "ls-tree", "HEAD", "--", path]).strip()
+        # Read against the pinned `head` SHA (not the symbolic ref) so this sees
+        # the same tree git_ls_files/compute_worklist were built from.
+        meta = _run(["git", "-C", repo_dir, "ls-tree", head, "--", path]).strip()
         if not meta:
+            if path == primary_path:
+                raise RuntimeError(
+                    f"primary {path!r} in the worklist but absent from ls-tree {head[:8]} "
+                    "(possible pack corruption or path-encoding issue)"
+                )
+            print(f"::warning::companion {path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
             continue
         mode, _, rest = meta.split(" ", 2)
         sha = rest.split("\t", 1)[0].strip()
@@ -417,17 +477,22 @@ def main() -> int:
             os.makedirs(os.path.dirname(store_local), exist_ok=True)
             try:
                 primary_local, events_local, primary_key = materialize_recording(
-                    repo, bucket, dataset_id, primary, head_set, work
+                    repo, bucket, dataset_id, primary, head_set, head, work
                 )
                 convert_recording(primary_local, events_local, store_local)
+                # Guard the --delete sync below: an empty/partial store would
+                # otherwise wipe a previously-valid one. zarr.json => v3 root.
+                validate_store(store_local)
                 meta = store_metadata(store_local)
+                if not meta.get("groups"):
+                    raise RuntimeError(f"store has no channel groups: {store_local}")
                 # Latest-only: --delete drops stale chunk objects a smaller new
                 # store no longer needs. Long origin TTL; the Cloudflare cache
                 # rule shortens zarr.json/index.json and the callback purges them.
                 subprocess.run(
                     [
                         "aws", "s3", "sync", store_local,
-                        f"s3://{bucket}/{dataset_id}/zarr/{rel_store}/",
+                        safe_store_prefix(bucket, dataset_id, rel_store),
                         "--delete", "--cache-control", "public, max-age=86400",
                     ],
                     check=True,
@@ -448,12 +513,25 @@ def main() -> int:
 
     for rel_store in remove:
         subprocess.run(
-            ["aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/{rel_store}/", "--recursive"],
+            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store), "--recursive"],
             check=True,
         )
         print(f"[zarr] removed store {rel_store}", flush=True)
 
-    index = merge_index(prior, dataset_id, head, converted_entries, remove, updated)
+    # Hard fail: every attempted conversion errored and nothing was removed. Do
+    # NOT advance the checkpoint or rewrite the index (that would strand the
+    # failed recordings); return non-zero so the workflow's failure callback
+    # flips zarr_status to 'failed' and the prior index is left intact.
+    if convert and not converted_entries and not remove:
+        print(f"::error::all {len(convert)} conversion(s) failed; index left untouched", flush=True)
+        return 1
+
+    # Advance source_commit to HEAD only on a fully clean run. With any failure,
+    # keep the prior commit ("" when there is no prior -> next run goes full) so
+    # the failed recordings are re-diffed and retried on the next run rather than
+    # being skipped by an advanced checkpoint.
+    index_commit = head if not failures else (prior_commit or "")
+    index = merge_index(prior, dataset_id, index_commit, converted_entries, remove, updated)
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(index, fh, separators=(",", ":"))
         index_local = fh.name
