@@ -57,6 +57,24 @@ INDEX_FORMAT_VERSION = 1
 # NEMAR caps are visible/auditable here rather than implied by the library.
 MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
 
+# The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
+# by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
+# EOG/REF/trigger channels ride along; biosigIO's EEGLAB importer can only see an
+# empty chanlocs `type` and would otherwise fall back to OTHER -> MISC, yielding a
+# `misc_1024hz` group (no cap) instead of the intended `eeg_250hz`. We force every
+# channel's modality from the suffix so the whole recording lands in one coherent
+# group at the modality's MODALITY_RATES cap.
+_SUFFIX_MODALITY = {"eeg": "EEG", "meg": "MEG", "ieeg": "IEEG", "emg": "EMG"}
+
+
+def bids_suffix_modality(path: str) -> str | None:
+    """Modality from a recording's BIDS suffix (`sub-01_task-rest_eeg.set` -> EEG),
+    or None when the trailing `_<suffix>` is not a known datatype. The rate cap
+    then follows from MODALITY_RATES (EEG/MEG 250 Hz, IEEG/EMG 1000 Hz)."""
+    stem = os.path.basename(path).rsplit(".", 1)[0]
+    suffix = stem.rsplit("_", 1)[-1].lower() if "_" in stem else ""
+    return _SUFFIX_MODALITY.get(suffix)
+
 ANNEX_TARGET_RE = re.compile(r"\.git/annex/objects/[A-Za-z0-9]+/[A-Za-z0-9]+/([^/]+)/\1$")
 ANNEX_POINTER_CONTENT_RE = re.compile(r"^/annex/objects/(.+)$")
 
@@ -452,6 +470,13 @@ def convert_recording(primary_local: str, events_local: str | None, store_path: 
     rec = Recording.from_file(primary_local)
     if events_local and os.path.exists(events_local):
         bids.apply_events_tsv(rec, events_local)
+    # Suffix-driven modality: group + resample the whole recording by its BIDS
+    # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
+    # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
+    modality = bids_suffix_modality(primary_local)
+    if modality:
+        for label in rec.channels:
+            rec.channels[label]["modality"] = modality
     rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
 
 
@@ -577,33 +602,39 @@ def main() -> int:
     converted_entries: list[dict] = []
     failures: list[str] = []
 
+    n = len(convert)
+
+    def record(r: dict, i: int) -> None:
+        # Log each recording as it finishes (live progress over a long backfill),
+        # not all at once at the end.
+        if r["ok"]:
+            converted_entries.append(r["entry"])
+            print(f"[zarr] [{i}/{n}] converted {r['primary']} -> {r['entry']['zarr']}", flush=True)
+        else:
+            failures.append(r["primary"])
+            print(f"::warning::[{i}/{n}] conversion failed for {r['primary']}: {r['error']}", flush=True)
+
     jobs = max(1, args.jobs)
     with tempfile.TemporaryDirectory() as tmp:
         ctx = {
             "repo": repo, "bucket": bucket, "dataset_id": dataset_id, "head": head,
             "head_files": head_set, "local": args.local, "tmp": tmp, "updated": updated,
         }
-        if jobs == 1 or len(convert) <= 1:
+        if jobs == 1 or n <= 1:
             _init_worker(ctx)
-            results = [convert_one(p) for p in convert]
+            for i, p in enumerate(convert, 1):
+                record(convert_one(p), i)
         else:
             with ProcessPoolExecutor(
                 max_workers=jobs, initializer=_init_worker, initargs=(ctx,)
             ) as ex:
                 futs = {ex.submit(convert_one, p): p for p in convert}
-                results = []
-                for fut in as_completed(futs):
+                for i, fut in enumerate(as_completed(futs), 1):
                     try:
-                        results.append(fut.result())
+                        r = fut.result()
                     except Exception as exc:  # worker process died (OOM/segfault)
-                        results.append({"ok": False, "primary": futs[fut], "error": f"worker crashed: {exc}"})
-        for r in results:
-            if r["ok"]:
-                converted_entries.append(r["entry"])
-                print(f"[zarr] converted {r['primary']} -> {r['entry']['zarr']}", flush=True)
-            else:
-                failures.append(r["primary"])
-                print(f"::warning::conversion failed for {r['primary']}: {r['error']}", flush=True)
+                        r = {"ok": False, "primary": futs[fut], "error": f"worker crashed: {exc}"}
+                    record(r, i)
 
     for rel_store in remove:
         subprocess.run(

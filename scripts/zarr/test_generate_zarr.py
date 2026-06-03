@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
     affected_primaries,
+    bids_suffix_modality,
     compute_worklist,
     events_sibling_for,
     is_primary,
@@ -282,6 +283,22 @@ class TestParseAnnexKey(unittest.TestCase):
 
     def test_non_annex_blob_returns_none(self):
         self.assertIsNone(parse_annex_key("just some file contents\n"))
+
+
+class TestBidsSuffixModality(unittest.TestCase):
+    def test_known_suffixes_map_to_modality(self):
+        self.assertEqual(bids_suffix_modality("sub-01/eeg/sub-01_task-rest_eeg.set"), "EEG")
+        self.assertEqual(bids_suffix_modality("sub-01/meg/sub-01_task-rest_meg.fif"), "MEG")
+        self.assertEqual(bids_suffix_modality("sub-01/ieeg/sub-01_task-rest_ieeg.edf"), "IEEG")
+        self.assertEqual(bids_suffix_modality("sub-01/emg/sub-01_task-grip_emg.edf"), "EMG")
+
+    def test_suffix_is_case_insensitive_and_uses_basename(self):
+        self.assertEqual(bids_suffix_modality("X/sub-01_task-A_EEG.SET"), "EEG")
+
+    def test_unknown_or_missing_suffix_returns_none(self):
+        self.assertIsNone(bids_suffix_modality("sub-01/beh/sub-01_task-rest_physio.tsv"))
+        self.assertIsNone(bids_suffix_modality("sub-01/eeg/sub-01_channels.tsv"))
+        self.assertIsNone(bids_suffix_modality("noextnounderscore"))
 
 
 if __name__ == "__main__":
