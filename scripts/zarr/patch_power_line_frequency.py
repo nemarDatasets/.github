@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling via sys.path)
+    electrode_positions_for,
     event_descriptions_for,
     git_ls_files,
     power_line_frequency_for,
@@ -82,6 +83,23 @@ def current_value_descriptions(doc: dict) -> dict | None:
 def set_value_descriptions(doc: dict, descs: dict[str, str]) -> dict:
     """Set `value_descriptions` in a zarr.json doc's attributes (mutates + returns)."""
     doc.setdefault("attributes", {})["value_descriptions"] = descs
+    return doc
+
+
+def current_electrode_positions(doc: dict) -> dict | None:
+    """The `electrode_positions` dict currently in a zarr.json doc (None if unset)."""
+    attrs = doc.get("attributes")
+    ep = attrs.get("electrode_positions") if isinstance(attrs, dict) else None
+    return ep if isinstance(ep, dict) else None
+
+
+def set_electrode_positions(
+    doc: dict, positions: dict, coordinate_system: str, coordinate_units: str
+) -> dict:
+    """Set the three electrode-position attrs in a zarr.json doc (mutates + returns)."""
+    doc.setdefault("attributes", {})["electrode_positions"] = positions
+    doc["attributes"]["electrode_coordinate_system"] = coordinate_system
+    doc["attributes"]["electrode_coordinate_units"] = coordinate_units
     return doc
 
 
@@ -203,6 +221,9 @@ def patch_dataset(
     def resolve_descs(path: str) -> dict[str, str]:
         return event_descriptions_for(repo, path, head_files, "HEAD")
 
+    def resolve_elec(path: str) -> dict | None:
+        return electrode_positions_for(repo, path, head_files, "HEAD")
+
     planned = plan_patches(stores, resolve)
     patched, urls, by_zarr = 0, [], {}
     for zarr_rel, _, plf in planned:
@@ -243,6 +264,38 @@ def patch_dataset(
         urls.append(f"{purge_base.rstrip('/')}/{ekey}")
         desc_patched += 1
 
+    # Patch electrode positions into each store's root zarr.json.
+    elec_patched = 0
+    for e in stores:
+        zarr_rel = e.get("zarr")
+        path = e.get("path")
+        if not isinstance(zarr_rel, str) or not isinstance(path, str):
+            continue
+        elec = resolve_elec(path)
+        if elec is None:
+            continue
+        key = store_meta_key(dataset_id, zarr_rel)
+        doc_text = s3_get_text(bucket, key)
+        if doc_text is None:
+            continue
+        doc = json.loads(doc_text)
+        attrs = doc.get("attributes") or {}
+        if (
+            current_electrode_positions(doc) == elec["positions"]
+            and attrs.get("electrode_coordinate_system") == elec["coordinate_system"]
+            and attrs.get("electrode_coordinate_units") == elec["coordinate_units"]
+        ):
+            continue  # all three attrs already equal -> idempotent skip
+        set_electrode_positions(
+            doc, elec["positions"], elec["coordinate_system"], elec["coordinate_units"]
+        )
+        if apply:
+            s3_put_text(bucket, key, json.dumps(doc), "application/json")
+        url = f"{purge_base.rstrip('/')}/{key}"
+        if url not in urls:
+            urls.append(url)
+        elec_patched += 1
+
     # Keep the index entries consistent so a later read carries the value too.
     if patched and by_zarr:
         changed_index = False
@@ -263,6 +316,7 @@ def patch_dataset(
         "declared_plf": len(planned),
         "patched": patched,
         "desc_patched": desc_patched,
+        "elec_patched": elec_patched,
         "apply": apply,
     }
 
@@ -285,7 +339,7 @@ def main() -> int:
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] patching {len(datasets)} dataset(s) on bucket {args.bucket}")
-    totals = {"datasets": 0, "plf": 0, "desc": 0}
+    totals = {"datasets": 0, "plf": 0, "desc": 0, "elec": 0}
     with tempfile.TemporaryDirectory() as tmp:
         for did in datasets:
             try:
@@ -298,9 +352,10 @@ def main() -> int:
                 totals["datasets"] += 1
                 totals["plf"] += res.get("patched", 0)
                 totals["desc"] += res.get("desc_patched", 0)
+                totals["elec"] += res.get("elec_patched", 0)
     print(
-        f"[{mode}] done: {totals['plf']} PLF + {totals['desc']} description patch(es) "
-        f"across {totals['datasets']} dataset(s)"
+        f"[{mode}] done: {totals['plf']} PLF + {totals['desc']} description + "
+        f"{totals['elec']} electrode patch(es) across {totals['datasets']} dataset(s)"
     )
     return 0
 
