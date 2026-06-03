@@ -308,7 +308,10 @@ def validate_store(store_local: str) -> None:
 
 
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
-    subprocess.run(["aws", "s3", "cp", src, dst, *(extra or [])], check=True)
+    # --only-show-errors drops the per-file transfer progress meter; with JOBS
+    # workers each streaming a ~100 MB blob, that meter otherwise floods the cron
+    # log to the point of uselessness.
+    subprocess.run(["aws", "s3", "cp", src, dst, "--only-show-errors", *(extra or [])], check=True)
 
 
 def s3_read_json(bucket: str, key: str) -> dict | None:
