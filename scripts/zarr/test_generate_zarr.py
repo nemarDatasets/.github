@@ -12,7 +12,9 @@ Run with:
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     compute_worklist,
     events_sibling_for,
     is_primary,
+    materialize_local,
     merge_index,
     parse_annex_key,
     safe_store_prefix,
@@ -234,6 +237,37 @@ class TestSafeStorePrefix(unittest.TestCase):
         for bad in ("../escape.zarr", "sub-01/../../x.zarr", "/abs/x.zarr", "a//b.zarr"):
             with self.assertRaises(ValueError):
                 safe_store_prefix("nemar", "nm000104", bad)
+
+
+class TestMaterializeLocal(unittest.TestCase):
+    def test_resolves_working_tree_paths_and_annex_key(self):
+        key = "SHA256E-s100--abcdef.set"
+        primary = "sub-01/eeg/sub-01_task-x_eeg.set"
+        events = "sub-01/eeg/sub-01_task-x_events.tsv"
+        with tempfile.TemporaryDirectory() as repo:
+            os.makedirs(os.path.join(repo, "sub-01", "eeg"))
+            # annex-style symlink for the primary; a plain file for the events sidecar
+            os.symlink(
+                f"../../.git/annex/objects/aa/bb/{key}/{key}",
+                os.path.join(repo, primary),
+            )
+            with open(os.path.join(repo, events), "w") as fh:
+                fh.write("onset\tduration\n0\t0\n")
+            pl, el, k = materialize_local(repo, primary, {primary, events})
+            self.assertEqual(pl, os.path.join(repo, primary))
+            self.assertEqual(el, os.path.join(repo, events))
+            self.assertEqual(k, key)
+
+    def test_no_events_sibling_when_absent(self):
+        primary = "sub-02/eeg/sub-02_task-x_eeg.edf"
+        with tempfile.TemporaryDirectory() as repo:
+            os.makedirs(os.path.join(repo, "sub-02", "eeg"))
+            with open(os.path.join(repo, primary), "w") as fh:
+                fh.write("not-an-annex-blob")  # regular in-git file -> key None
+            pl, el, k = materialize_local(repo, primary, {primary})
+            self.assertEqual(pl, os.path.join(repo, primary))
+            self.assertIsNone(el)
+            self.assertIsNone(k)
 
 
 class TestParseAnnexKey(unittest.TestCase):
