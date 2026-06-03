@@ -521,11 +521,20 @@ def store_metadata(store_path: str) -> dict:
                     "duration_s": (nsamp / rate) if rate and nsamp else None,
                 }
             )
-        return {
+        # Count event descriptions when the events group exists and carries them.
+        event_description_count: int | None = None
+        if "events" in root:
+            vd = dict(root["events"].attrs).get("value_descriptions")
+            if isinstance(vd, dict):
+                event_description_count = len(vd)
+        result: dict = {
             "modalities": sorted(modalities),
             "groups": groups,
             "power_line_frequency": ra.get("power_line_frequency"),
         }
+        if event_description_count is not None:
+            result["event_description_count"] = event_description_count
+        return result
     except Exception as exc:  # noqa: BLE001 - best-effort metadata, never fatal
         print(f"::warning::store_metadata failed for {store_path}: {exc}", flush=True)
         return {}
@@ -554,12 +563,12 @@ def materialize_local(
     return primary_local, events_local, primary_key
 
 
-def embed_root_attr(store_path: str, key: str, value: object) -> None:
-    """Write a scalar into the Zarr v3 root group's attributes (its `zarr.json`)
-    after biosigIO has written the store. Carries a display hint the converter knows
-    from BIDS context but biosigIO does not (PowerLineFrequency), so the viewer reads
-    it straight from the store with no extra fetch."""
-    meta_path = os.path.join(store_path, "zarr.json")
+def embed_attr(meta_path: str, key: str, value: object) -> None:
+    """Write a key into the `attributes` dict of an arbitrary Zarr v3 group zarr.json.
+
+    Reads `meta_path`, sets `attributes[key] = value`, and writes back in place.
+    Preserves all other fields. Use `embed_root_attr` for the store-root shorthand.
+    """
     with open(meta_path, encoding="utf-8") as fh:
         doc = json.load(fh)
     doc.setdefault("attributes", {})[key] = value
@@ -567,11 +576,81 @@ def embed_root_attr(store_path: str, key: str, value: object) -> None:
         json.dump(doc, fh)
 
 
+def embed_root_attr(store_path: str, key: str, value: object) -> None:
+    """Write a scalar into the Zarr v3 root group's attributes (its `zarr.json`)
+    after biosigIO has written the store. Carries a display hint the converter knows
+    from BIDS context but biosigIO does not (PowerLineFrequency), so the viewer reads
+    it straight from the store with no extra fetch."""
+    embed_attr(os.path.join(store_path, "zarr.json"), key, value)
+
+
+def event_descriptions_for(
+    repo_dir: str, primary_path: str, head_files: set[str], head: str
+) -> dict[str, str]:
+    """BIDS event-code descriptions for a recording, resolved via the inheritance
+    principle: among the `_events.json` sidecars sitting in the recording's
+    directory or an ancestor whose entities are a subset of the recording's, the
+    most specific one wins (overrides less specific). Returns a flat mapping of
+    event code -> description string (empty dict when none apply or no Levels are
+    declared).
+
+    Each applicable `_events.json` sidecar is parsed as a BIDS column-metadata
+    object. For every top-level value that is a dict containing a ``"Levels"`` dict,
+    its ``{str: str}`` entries are merged (most-specific sidecar wins). This supports
+    multiple columns declaring Levels (e.g. ``value``, ``trial_type``).
+
+    Sidecars are small JSON files tracked in git (not annexed); read via the working
+    tree when present and ``git cat-file`` otherwise, matching the no-checkout
+    workflow clone behaviour.
+    """
+    stem = filename_stem(primary_path)
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(stem)
+    needle = "_events.json"
+    candidates: list[tuple[int, int, str]] = []
+    for f in head_files:
+        if not f.endswith(needle):
+            continue
+        cdir = os.path.dirname(f)
+        # Applicable only if the sidecar is in the recording's dir or an ancestor.
+        if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+            continue
+        cents = _bids_entities(filename_stem(f))
+        # ...and its entities must be a subset of the recording's.
+        if any(rec_ents.get(k) != v for k, v in cents.items()):
+            continue
+        depth = cdir.count("/") + (1 if cdir else 0)
+        candidates.append((depth, len(cents), f))
+    candidates.sort()  # least specific first; the most specific value overrides
+    result: dict[str, str] = {}
+    for _, _, f in candidates:
+        text = _read_repo_text(repo_dir, head, f)
+        if text is None:
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for col_meta in data.values():
+            if not isinstance(col_meta, dict):
+                continue
+            levels = col_meta.get("Levels")
+            if not isinstance(levels, dict):
+                continue
+            for code, desc in levels.items():
+                if isinstance(code, str) and code and isinstance(desc, str) and desc:
+                    result[code] = desc
+    return result
+
+
 def convert_recording(
     primary_local: str,
     events_local: str | None,
     store_path: str,
     power_line_frequency: float | None = None,
+    value_descriptions: dict[str, str] | None = None,
 ) -> None:
     from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
@@ -588,6 +667,10 @@ def convert_recording(
     rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
     if power_line_frequency is not None:
         embed_root_attr(store_path, "power_line_frequency", power_line_frequency)
+    if value_descriptions:
+        events_meta = os.path.join(store_path, "events", "zarr.json")
+        if os.path.exists(events_meta):
+            embed_attr(events_meta, "value_descriptions", value_descriptions)
 
 
 # --- Parallel conversion ------------------------------------------------------
@@ -626,7 +709,8 @@ def convert_one(primary: str) -> dict:
                 c["repo"], c["bucket"], c["dataset_id"], primary, c["head_files"], c["head"], work
             )
         plf = power_line_frequency_for(c["repo"], primary, c["head_files"], c["head"])
-        convert_recording(primary_local, events_local, store_local, plf)
+        descs = event_descriptions_for(c["repo"], primary, c["head_files"], c["head"])
+        convert_recording(primary_local, events_local, store_local, plf, descs or None)
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.
         validate_store(store_local)
