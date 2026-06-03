@@ -279,8 +279,13 @@ def patch_dataset(
         if doc_text is None:
             continue
         doc = json.loads(doc_text)
-        if current_electrode_positions(doc) == elec["positions"]:
-            continue  # already equal -> idempotent skip
+        attrs = doc.get("attributes") or {}
+        if (
+            current_electrode_positions(doc) == elec["positions"]
+            and attrs.get("electrode_coordinate_system") == elec["coordinate_system"]
+            and attrs.get("electrode_coordinate_units") == elec["coordinate_units"]
+        ):
+            continue  # all three attrs already equal -> idempotent skip
         set_electrode_positions(
             doc, elec["positions"], elec["coordinate_system"], elec["coordinate_units"]
         )
