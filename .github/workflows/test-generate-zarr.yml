@@ -1,0 +1,30 @@
+name: Test generate_zarr
+
+# Runs scripts/zarr/test_generate_zarr.py on PRs touching scripts/zarr/.
+# 22 no-mock unit assertions over the pure helpers (path classification,
+# incremental worklist, index merge, annex-key parsing). biosigIO/zarr are
+# lazy-imported inside the I/O functions, so the test needs no extra deps.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/zarr/**"
+      - ".github/workflows/test-generate-zarr.yml"
+  pull_request:
+    paths:
+      - "scripts/zarr/**"
+      - ".github/workflows/test-generate-zarr.yml"
+  workflow_dispatch:
+
+jobs:
+  python-unit-test:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run zarr driver tests
+        run: python scripts/zarr/test_generate_zarr.py
