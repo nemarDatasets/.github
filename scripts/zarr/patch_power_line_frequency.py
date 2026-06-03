@@ -285,7 +285,7 @@ def main() -> int:
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] patching {len(datasets)} dataset(s) on bucket {args.bucket}")
-    totals = {"datasets": 0, "patched": 0}
+    totals = {"datasets": 0, "plf": 0, "desc": 0}
     with tempfile.TemporaryDirectory() as tmp:
         for did in datasets:
             try:
@@ -296,8 +296,12 @@ def main() -> int:
             print(f"  {res}")
             if "patched" in res:
                 totals["datasets"] += 1
-                totals["patched"] += res["patched"]
-    print(f"[{mode}] done: {totals['patched']} store(s) across {totals['datasets']} dataset(s)")
+                totals["plf"] += res.get("patched", 0)
+                totals["desc"] += res.get("desc_patched", 0)
+    print(
+        f"[{mode}] done: {totals['plf']} PLF + {totals['desc']} description patch(es) "
+        f"across {totals['datasets']} dataset(s)"
+    )
     return 0
 
 
