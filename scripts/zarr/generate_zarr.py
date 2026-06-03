@@ -503,7 +503,8 @@ def convert_one(primary: str) -> dict:
             [
                 "aws", "s3", "sync", store_local,
                 safe_store_prefix(c["bucket"], c["dataset_id"], rel_store),
-                "--delete", "--cache-control", "public, max-age=86400",
+                "--delete", "--only-show-errors",
+                "--cache-control", "public, max-age=86400",
             ],
             check=True,
         )
@@ -606,7 +607,8 @@ def main() -> int:
 
     for rel_store in remove:
         subprocess.run(
-            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store), "--recursive"],
+            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
+             "--recursive", "--only-show-errors"],
             check=True,
         )
         print(f"[zarr] removed store {rel_store}", flush=True)
