@@ -133,8 +133,27 @@ def _bids_entities(stem: str) -> dict[str, str]:
     return ents
 
 
+def _read_repo_text(repo_dir: str, head: str, path: str) -> str | None:
+    """Read a git-tracked text file at `head`. Uses the working tree when present
+    (local/Hallu mode), else falls back to `git cat-file` -- the workflow clones
+    `--no-checkout`, so there is no working tree there. None if unreadable."""
+    try:
+        with open(os.path.join(repo_dir, path), encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        pass
+    try:
+        return subprocess.check_output(
+            ["git", "-C", repo_dir, "cat-file", "blob", f"{head}:{path}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
 def power_line_frequency_for(
-    repo_dir: str, primary_path: str, head_files: set[str]
+    repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> float | None:
     """BIDS PowerLineFrequency (Hz) for a recording, resolved via the inheritance
     principle: among the `_<suffix>.json` sidecars sitting in the recording's
@@ -142,9 +161,10 @@ def power_line_frequency_for(
     most specific one that declares PowerLineFrequency wins. Returns None when none
     declare it (so the viewer leaves the notch off).
 
-    The sidecars are git-tracked text (not annexed), so they are present in the
-    checkout / working tree in both S3 and local modes -- no download needed. We
-    grep the head file list once and read at most a handful of small JSONs.
+    Sidecars are git-tracked text (not annexed); they are read at `head` from the
+    working tree when present and `git cat-file` otherwise, so this works in both
+    the no-checkout workflow clone and the local/Hallu working tree -- one grep of
+    the head file list, then a couple of small reads, no annex download.
     """
     stem = filename_stem(primary_path)
     suffix = stem.rsplit("_", 1)[-1].lower() if "_" in stem else ""
@@ -170,10 +190,14 @@ def power_line_frequency_for(
     candidates.sort()  # least specific first; the most specific value overrides
     plf: float | None = None
     for _, _, f in candidates:
+        text = _read_repo_text(repo_dir, head, f)
+        if text is None:
+            continue
         try:
-            with open(os.path.join(repo_dir, f), encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
+            data = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
             continue
         v = data.get("PowerLineFrequency")
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
@@ -601,7 +625,7 @@ def convert_one(primary: str) -> dict:
             primary_local, events_local, primary_key = materialize_recording(
                 c["repo"], c["bucket"], c["dataset_id"], primary, c["head_files"], c["head"], work
             )
-        plf = power_line_frequency_for(c["repo"], primary, c["head_files"])
+        plf = power_line_frequency_for(c["repo"], primary, c["head_files"], c["head"])
         convert_recording(primary_local, events_local, store_local, plf)
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.

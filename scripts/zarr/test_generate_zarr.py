@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -317,21 +318,21 @@ class TestPowerLineFrequencyFor(unittest.TestCase):
             self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"PowerLineFrequency": 60})
             self._write(d, "task-rest_eeg.json", {"PowerLineFrequency": 50})  # less specific
             head = {"sub-01/eeg/sub-01_task-rest_eeg.json", "task-rest_eeg.json"}
-            self.assertEqual(power_line_frequency_for(d, rec, head), 60.0)
+            self.assertEqual(power_line_frequency_for(d, rec, head, "HEAD"), 60.0)
 
     def test_inherited_from_root_when_no_sibling(self):
         with tempfile.TemporaryDirectory() as d:
             rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
             self._write(d, "task-rest_eeg.json", {"PowerLineFrequency": 50})
             head = {"task-rest_eeg.json"}
-            self.assertEqual(power_line_frequency_for(d, rec, head), 50.0)
+            self.assertEqual(power_line_frequency_for(d, rec, head, "HEAD"), 50.0)
 
     def test_none_when_field_absent(self):
         with tempfile.TemporaryDirectory() as d:
             rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
             self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"SamplingFrequency": 1024})
             head = {"sub-01/eeg/sub-01_task-rest_eeg.json"}
-            self.assertIsNone(power_line_frequency_for(d, rec, head))
+            self.assertIsNone(power_line_frequency_for(d, rec, head, "HEAD"))
 
     def test_non_subset_entities_do_not_apply(self):
         with tempfile.TemporaryDirectory() as d:
@@ -339,21 +340,48 @@ class TestPowerLineFrequencyFor(unittest.TestCase):
             # A sidecar for a different task must not apply to this recording.
             self._write(d, "sub-01/eeg/sub-01_task-other_eeg.json", {"PowerLineFrequency": 60})
             head = {"sub-01/eeg/sub-01_task-other_eeg.json"}
-            self.assertIsNone(power_line_frequency_for(d, rec, head))
+            self.assertIsNone(power_line_frequency_for(d, rec, head, "HEAD"))
 
     def test_wrong_suffix_does_not_satisfy(self):
         with tempfile.TemporaryDirectory() as d:
             rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
             self._write(d, "sub-01/eeg/sub-01_task-rest_ieeg.json", {"PowerLineFrequency": 60})
             head = {"sub-01/eeg/sub-01_task-rest_ieeg.json"}
-            self.assertIsNone(power_line_frequency_for(d, rec, head))
+            self.assertIsNone(power_line_frequency_for(d, rec, head, "HEAD"))
 
     def test_non_numeric_value_ignored(self):
         with tempfile.TemporaryDirectory() as d:
             rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
             self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"PowerLineFrequency": "n/a"})
             head = {"sub-01/eeg/sub-01_task-rest_eeg.json"}
-            self.assertIsNone(power_line_frequency_for(d, rec, head))
+            self.assertIsNone(power_line_frequency_for(d, rec, head, "HEAD"))
+
+    def test_reads_via_git_when_no_working_tree(self):
+        # The workflow clones --no-checkout, so the sidecar is only in the git
+        # object store, not on disk. Resolution must fall back to `git cat-file`.
+        sidecar = "sub-01/eeg/sub-01_task-rest_eeg.json"
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as clone_parent:
+            self._write(src, sidecar, {"PowerLineFrequency": 60})
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t",
+            }
+            def run(*a: str) -> None:
+                subprocess.run(a, check=True, env=env, capture_output=True)
+
+            run("git", "-C", src, "init", "-q", "-b", "main")
+            run("git", "-C", src, "add", "-A")
+            run("git", "-C", src, "commit", "-qm", "init")
+            clone = os.path.join(clone_parent, "repo")
+            run("git", "clone", "--no-checkout", "-q", src, clone)
+            self.assertFalse(os.path.exists(os.path.join(clone, sidecar)))  # no working tree
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self.assertEqual(
+                power_line_frequency_for(clone, rec, {sidecar}, "HEAD"), 60.0
+            )
 
 
 class TestEmbedRootAttr(unittest.TestCase):
