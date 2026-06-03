@@ -26,6 +26,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     affected_primaries,
     bids_suffix_modality,
     compute_worklist,
+    electrode_positions_for,
     embed_attr,
     embed_root_attr,
     event_descriptions_for,
@@ -580,6 +581,320 @@ class TestEventDescriptionsFor(unittest.TestCase):
             rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
             result = event_descriptions_for(clone, rec, {sidecar}, "HEAD")
             self.assertEqual(result, {"10": "face", "20": "house"})
+
+
+class TestElectrodePositionsFor(unittest.TestCase):
+    """Tests for electrode_positions_for -- TSV parsing, BIDS inheritance, coordsystem."""
+
+    def _write(self, root: str, rel: str, body: str) -> None:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(body)
+
+    def _write_json(self, root: str, rel: str, body: dict) -> None:
+        self._write(root, rel, json.dumps(body))
+
+    def _tsv(self, *rows: tuple) -> str:
+        return "\n".join("\t".join(str(c) for c in row) for row in rows) + "\n"
+
+    # -- TSV parsing -----------------------------------------------------------
+
+    def test_standard_tsv_parses_positions(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "80.784", "26.133", "-4.001"),
+                ("FP2", "-80.784", "26.133", "-4.001"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_task-rest_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_task-rest_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
+            self.assertAlmostEqual(result["positions"]["FP2"][0], -80.784)
+
+    def test_extra_columns_do_not_break_parsing(self):
+        """Columns like type, impedance, status after z must be ignored."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-x_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z", "type", "impedance"),
+                ("Fz", "1.0", "2.0", "3.0", "EEG", "5"),
+                ("Cz", "0.0", "0.0", "4.0", "EEG", "n/a"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_task-x_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_task-x_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertIn("Fz", result["positions"])
+            self.assertIn("Cz", result["positions"])
+            self.assertEqual(result["positions"]["Fz"], [1.0, 2.0, 3.0])
+
+    def test_non_standard_column_order(self):
+        """z before y before x order must still work."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("z", "name", "y", "x"),
+                ("9.0", "Oz", "0.0", "0.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["positions"]["Oz"], [0.0, 0.0, 9.0])
+
+    def test_na_rows_skipped(self):
+        """Rows where x, y, or z is 'n/a' (case-insensitive) must be skipped."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "80.0", "26.0", "n/a"),
+                ("FP2", "N/A", "26.0", "-4.0"),
+                ("Cz", "0.0", "0.0", "88.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertNotIn("FP1", result["positions"])
+            self.assertNotIn("FP2", result["positions"])
+            self.assertIn("Cz", result["positions"])
+
+    def test_non_numeric_rows_skipped(self):
+        """Rows where x/y/z cannot be parsed as float must be skipped."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("REF", "unknown", "0.0", "0.0"),
+                ("Cz", "0.0", "0.0", "88.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertNotIn("REF", result["positions"])
+            self.assertIn("Cz", result["positions"])
+
+    def test_missing_name_xyz_columns_returns_none(self):
+        """A TSV without a 'name' or 'x'/'y'/'z' column must return None."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("label", "lat", "lon"),
+                ("FP1", "10.0", "20.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNone(result)
+
+    def test_all_rows_skipped_returns_none(self):
+        """If all data rows are invalid (all n/a), return None."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "n/a", "n/a", "n/a"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNone(result)
+
+    # -- BIDS inheritance ------------------------------------------------------
+
+    def test_absent_electrodes_tsv_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            result = electrode_positions_for(d, rec, set(), "HEAD")
+            self.assertIsNone(result)
+
+    def test_sibling_beats_root(self):
+        """More-specific sibling must win over a root-level electrodes.tsv."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            root_tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "1.0", "2.0", "3.0"),
+            )
+            sibling_tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "80.0", "26.0", "-4.0"),
+            )
+            self._write(d, "electrodes.tsv", root_tsv)
+            self._write(d, "sub-01/eeg/sub-01_task-rest_electrodes.tsv", sibling_tsv)
+            head = {
+                "electrodes.tsv",
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+            }
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertAlmostEqual(result["positions"]["FP1"][0], 80.0)
+
+    def test_root_only_inheritance(self):
+        """When only a root-level electrodes.tsv exists, it must be used."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "80.0", "26.0", "-4.0"),
+            )
+            self._write(d, "electrodes.tsv", tsv)
+            head = {"electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertIn("FP1", result["positions"])
+
+    def test_non_subset_entities_not_applied(self):
+        """An electrodes.tsv for a different task must not apply."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("Cz", "0.0", "0.0", "88.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_task-other_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_task-other_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNone(result)
+
+    # -- coordsystem.json ------------------------------------------------------
+
+    def test_coordsystem_units_and_system_extracted(self):
+        """EEGCoordinateSystem and EEGCoordinateUnits must appear in the result."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("FP1", "80.0", "26.0", "-4.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_task-rest_electrodes.tsv", tsv)
+            self._write_json(d, "sub-01/eeg/sub-01_task-rest_coordsystem.json", {
+                "EEGCoordinateSystem": "EEGLAB",
+                "EEGCoordinateUnits": "mm",
+            })
+            head = {
+                "sub-01/eeg/sub-01_task-rest_electrodes.tsv",
+                "sub-01/eeg/sub-01_task-rest_coordsystem.json",
+            }
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["coordinate_system"], "EEGLAB")
+            self.assertEqual(result["coordinate_units"], "mm")
+
+    def test_absent_coordsystem_gives_empty_strings(self):
+        """When no coordsystem.json resolves, both strings must be empty."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_eeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("Cz", "0.0", "0.0", "88.0"),
+            )
+            self._write(d, "sub-01/eeg/sub-01_electrodes.tsv", tsv)
+            head = {"sub-01/eeg/sub-01_electrodes.tsv"}
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["coordinate_system"], "")
+            self.assertEqual(result["coordinate_units"], "")
+
+    def test_ieeg_coordsystem_keys_extracted(self):
+        """iEEGCoordinateSystem/iEEGCoordinateUnits must also be read."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/ieeg/sub-01_task-rest_ieeg.set"
+            tsv = self._tsv(
+                ("name", "x", "y", "z"),
+                ("A1", "10.0", "20.0", "30.0"),
+            )
+            self._write(d, "sub-01/ieeg/sub-01_task-rest_electrodes.tsv", tsv)
+            self._write_json(d, "sub-01/ieeg/sub-01_task-rest_coordsystem.json", {
+                "iEEGCoordinateSystem": "Talairach",
+                "iEEGCoordinateUnits": "mm",
+            })
+            head = {
+                "sub-01/ieeg/sub-01_task-rest_electrodes.tsv",
+                "sub-01/ieeg/sub-01_task-rest_coordsystem.json",
+            }
+            result = electrode_positions_for(d, rec, head, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["coordinate_system"], "Talairach")
+            self.assertEqual(result["coordinate_units"], "mm")
+
+    # -- embed onto root -------------------------------------------------------
+
+    def test_embed_electrode_attrs_onto_root(self):
+        """The three attrs land on the root zarr.json and preserve existing attrs."""
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": {
+                            "format": "biosigio-zarr",
+                            "channel_groups": ["eeg_250hz"],
+                            "power_line_frequency": 60.0,
+                        },
+                    },
+                    fh,
+                )
+            positions = {"FP1": [80.0, 26.0, -4.0], "FP2": [-80.0, 26.0, -4.0]}
+            embed_root_attr(store, "electrode_positions", positions)
+            embed_root_attr(store, "electrode_coordinate_system", "EEGLAB")
+            embed_root_attr(store, "electrode_coordinate_units", "mm")
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            attrs = doc["attributes"]
+            self.assertEqual(attrs["electrode_positions"], positions)
+            self.assertEqual(attrs["electrode_coordinate_system"], "EEGLAB")
+            self.assertEqual(attrs["electrode_coordinate_units"], "mm")
+            self.assertEqual(attrs["power_line_frequency"], 60.0)  # preserved
+            self.assertEqual(attrs["channel_groups"], ["eeg_250hz"])  # preserved
+
+    # -- git cat-file fallback (no-checkout clone) -----------------------------
+
+    def test_reads_via_git_when_no_working_tree(self):
+        """The workflow clones --no-checkout; must resolve via git cat-file."""
+        elec_rel = "sub-01/eeg/sub-01_task-rest_electrodes.tsv"
+        cs_rel = "sub-01/eeg/sub-01_task-rest_coordsystem.json"
+        tsv_body = "name\tx\ty\tz\nFP1\t80.784\t26.133\t-4.001\n"
+        cs_body = json.dumps({"EEGCoordinateSystem": "EEGLAB", "EEGCoordinateUnits": "mm"})
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as clone_parent:
+            for rel, body in ((elec_rel, tsv_body), (cs_rel, cs_body)):
+                p = os.path.join(src, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t",
+            }
+
+            def run(*a: str) -> None:
+                subprocess.run(a, check=True, env=env, capture_output=True)
+
+            run("git", "-C", src, "init", "-q", "-b", "main")
+            run("git", "-C", src, "add", "-A")
+            run("git", "-C", src, "commit", "-qm", "init")
+            clone = os.path.join(clone_parent, "repo")
+            run("git", "clone", "--no-checkout", "-q", src, clone)
+            # Confirm no working tree
+            self.assertFalse(os.path.exists(os.path.join(clone, elec_rel)))
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            result = electrode_positions_for(clone, rec, {elec_rel, cs_rel}, "HEAD")
+            self.assertIsNotNone(result)
+            self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
+            self.assertEqual(result["coordinate_system"], "EEGLAB")
+            self.assertEqual(result["coordinate_units"], "mm")
 
 
 if __name__ == "__main__":

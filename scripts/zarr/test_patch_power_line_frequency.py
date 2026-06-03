@@ -11,10 +11,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from patch_power_line_frequency import (  # type: ignore[import-not-found]  # noqa: E402
+    current_electrode_positions,
     current_plf,
     current_value_descriptions,
     events_meta_key,
     plan_patches,
+    set_electrode_positions,
     set_plf,
     set_value_descriptions,
     store_meta_key,
@@ -110,6 +112,47 @@ class TestSetValueDescriptions(unittest.TestCase):
         doc: dict = {"zarr_format": 3}
         set_value_descriptions(doc, {"1": "onset"})
         self.assertEqual(doc["attributes"]["value_descriptions"], {"1": "onset"})
+
+
+class TestCurrentElectrodePositions(unittest.TestCase):
+    def test_reads_dict(self):
+        doc = {"attributes": {"electrode_positions": {"FP1": [80.0, 26.0, -4.0]}}}
+        self.assertEqual(current_electrode_positions(doc), {"FP1": [80.0, 26.0, -4.0]})
+
+    def test_none_when_absent(self):
+        self.assertIsNone(current_electrode_positions({"attributes": {"format": "x"}}))
+        self.assertIsNone(current_electrode_positions({}))
+        self.assertIsNone(current_electrode_positions({"attributes": None}))
+
+    def test_none_when_not_a_dict(self):
+        self.assertIsNone(
+            current_electrode_positions({"attributes": {"electrode_positions": "oops"}})
+        )
+
+
+class TestSetElectrodePositions(unittest.TestCase):
+    def test_adds_all_three_attrs_and_preserves_existing(self):
+        doc = {"attributes": {"format": "biosigio-zarr", "channel_groups": ["eeg_250hz"]}}
+        positions = {"FP1": [80.0, 26.0, -4.0], "FP2": [-80.0, 26.0, -4.0]}
+        set_electrode_positions(doc, positions, "EEGLAB", "mm")
+        attrs = doc["attributes"]
+        self.assertEqual(attrs["electrode_positions"], positions)
+        self.assertEqual(attrs["electrode_coordinate_system"], "EEGLAB")
+        self.assertEqual(attrs["electrode_coordinate_units"], "mm")
+        self.assertEqual(attrs["channel_groups"], ["eeg_250hz"])
+
+    def test_creates_attributes_when_missing(self):
+        doc: dict = {"zarr_format": 3}
+        set_electrode_positions(doc, {"Cz": [0.0, 0.0, 88.0]}, "CTF", "cm")
+        self.assertIn("electrode_positions", doc["attributes"])
+        self.assertEqual(doc["attributes"]["electrode_coordinate_system"], "CTF")
+        self.assertEqual(doc["attributes"]["electrode_coordinate_units"], "cm")
+
+    def test_empty_strings_for_absent_coordsystem(self):
+        doc: dict = {}
+        set_electrode_positions(doc, {"Cz": [0.0, 0.0, 88.0]}, "", "")
+        self.assertEqual(doc["attributes"]["electrode_coordinate_system"], "")
+        self.assertEqual(doc["attributes"]["electrode_coordinate_units"], "")
 
 
 if __name__ == "__main__":

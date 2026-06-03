@@ -584,6 +584,127 @@ def embed_root_attr(store_path: str, key: str, value: object) -> None:
     embed_attr(os.path.join(store_path, "zarr.json"), key, value)
 
 
+def electrode_positions_for(
+    repo_dir: str, primary_path: str, head_files: set[str], head: str
+) -> dict | None:
+    """BIDS electrode positions for a recording, resolved via the inheritance
+    principle: among the `_electrodes.tsv` sidecars in the recording's directory
+    or an ancestor whose entities are a subset of the recording's, the most
+    specific one wins. A sibling `_coordsystem.json` is resolved the same way.
+
+    The TSV is parsed by its header row to find the `name`/`x`/`y`/`z` columns
+    (robust to extra columns like type/impedance and to column-order variation).
+    Rows where any of x/y/z is missing, non-numeric, or "n/a" are skipped.
+
+    Returns ``{"positions": {label: [x, y, z]}, "coordinate_system": str,
+    "coordinate_units": str}`` or None when no `_electrodes.tsv` resolves or it
+    contains no valid rows.
+    """
+    stem = filename_stem(primary_path)
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(stem)
+
+    def _resolve_sidecar(needle: str) -> str | None:
+        """Return the most-specific applicable sidecar path, or None.
+
+        `needle` is an entity-prefixed suffix like ``_electrodes.tsv``.
+        A file matches when its basename ends with `needle` (e.g.
+        ``sub-01_task-rest_electrodes.tsv``) or its basename is exactly
+        the bare form without the leading underscore (e.g. ``electrodes.tsv``
+        at the dataset root). Both forms carry empty entities, so the entity
+        subset check still applies correctly.
+        """
+        bare = needle.lstrip("_")  # "electrodes.tsv" from "_electrodes.tsv"
+        candidates: list[tuple[int, int, str]] = []
+        for f in head_files:
+            bname = os.path.basename(f)
+            if not (f.endswith(needle) or bname == bare):
+                continue
+            cdir = os.path.dirname(f)
+            if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+                continue
+            cents = _bids_entities(filename_stem(f))
+            if any(rec_ents.get(k) != v for k, v in cents.items()):
+                continue
+            depth = cdir.count("/") + (1 if cdir else 0)
+            candidates.append((depth, len(cents), f))
+        if not candidates:
+            return None
+        candidates.sort()
+        # most specific = last after ascending sort
+        return candidates[-1][2]
+
+    elec_path = _resolve_sidecar("_electrodes.tsv")
+    if elec_path is None:
+        return None
+    elec_text = _read_repo_text(repo_dir, head, elec_path)
+    if not elec_text:
+        return None
+
+    # Parse the TSV by its header to locate name/x/y/z columns.
+    lines = elec_text.splitlines()
+    if not lines:
+        return None
+    header = [col.strip().lower() for col in lines[0].split("\t")]
+    try:
+        name_i = header.index("name")
+        x_i = header.index("x")
+        y_i = header.index("y")
+        z_i = header.index("z")
+    except ValueError:
+        return None  # required columns absent
+
+    positions: dict[str, list[float]] = {}
+    for row_line in lines[1:]:
+        if not row_line.strip():
+            continue
+        cols = row_line.split("\t")
+        if len(cols) <= max(name_i, x_i, y_i, z_i):
+            continue
+        label = cols[name_i].strip()
+        if not label:
+            continue
+        try:
+            xv = cols[x_i].strip()
+            yv = cols[y_i].strip()
+            zv = cols[z_i].strip()
+            if xv.lower() == "n/a" or yv.lower() == "n/a" or zv.lower() == "n/a":
+                continue
+            positions[label] = [float(xv), float(yv), float(zv)]
+        except (ValueError, IndexError):
+            continue
+
+    if not positions:
+        return None
+
+    # Resolve the sibling coordsystem.json for coordinate metadata.
+    coord_system = ""
+    coord_units = ""
+    cs_path = _resolve_sidecar("_coordsystem.json")
+    if cs_path is not None:
+        cs_text = _read_repo_text(repo_dir, head, cs_path)
+        if cs_text:
+            try:
+                cs_data = json.loads(cs_text)
+                if isinstance(cs_data, dict):
+                    sys_val = cs_data.get("EEGCoordinateSystem") or cs_data.get(
+                        "iEEGCoordinateSystem"
+                    ) or cs_data.get("MEGCoordinateSystem") or ""
+                    units_val = cs_data.get("EEGCoordinateUnits") or cs_data.get(
+                        "iEEGCoordinateUnits"
+                    ) or cs_data.get("MEGCoordinateUnits") or ""
+                    coord_system = str(sys_val) if sys_val else ""
+                    coord_units = str(units_val) if units_val else ""
+            except ValueError:
+                pass
+
+    return {
+        "positions": positions,
+        "coordinate_system": coord_system,
+        "coordinate_units": coord_units,
+    }
+
+
 def event_descriptions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict[str, str]:
@@ -651,6 +772,7 @@ def convert_recording(
     store_path: str,
     power_line_frequency: float | None = None,
     value_descriptions: dict[str, str] | None = None,
+    electrode_positions: dict | None = None,
 ) -> None:
     from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
@@ -671,6 +793,10 @@ def convert_recording(
         events_meta = os.path.join(store_path, "events", "zarr.json")
         if os.path.exists(events_meta):
             embed_attr(events_meta, "value_descriptions", value_descriptions)
+    if electrode_positions is not None:
+        embed_root_attr(store_path, "electrode_positions", electrode_positions["positions"])
+        embed_root_attr(store_path, "electrode_coordinate_system", electrode_positions["coordinate_system"])
+        embed_root_attr(store_path, "electrode_coordinate_units", electrode_positions["coordinate_units"])
 
 
 # --- Parallel conversion ------------------------------------------------------
@@ -710,7 +836,8 @@ def convert_one(primary: str) -> dict:
             )
         plf = power_line_frequency_for(c["repo"], primary, c["head_files"], c["head"])
         descs = event_descriptions_for(c["repo"], primary, c["head_files"], c["head"])
-        convert_recording(primary_local, events_local, store_local, plf, descs or None)
+        elec = electrode_positions_for(c["repo"], primary, c["head_files"], c["head"])
+        convert_recording(primary_local, events_local, store_local, plf, descs or None, elec)
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.
         validate_store(store_local)
