@@ -122,6 +122,65 @@ def events_sibling_for(primary_path: str) -> str:
     return f"{d}/{name}" if d else name
 
 
+def _bids_entities(stem: str) -> dict[str, str]:
+    """Entity key->value pairs from a BIDS stem (`sub-01_task-x_run-2_eeg` ->
+    {sub: 01, task: x, run: 2}); the trailing suffix token (no dash) is ignored."""
+    ents: dict[str, str] = {}
+    for tok in stem.split("_"):
+        if "-" in tok:
+            k, v = tok.split("-", 1)
+            ents[k] = v
+    return ents
+
+
+def power_line_frequency_for(
+    repo_dir: str, primary_path: str, head_files: set[str]
+) -> float | None:
+    """BIDS PowerLineFrequency (Hz) for a recording, resolved via the inheritance
+    principle: among the `_<suffix>.json` sidecars sitting in the recording's
+    directory or an ancestor whose entities are a subset of the recording's, the
+    most specific one that declares PowerLineFrequency wins. Returns None when none
+    declare it (so the viewer leaves the notch off).
+
+    The sidecars are git-tracked text (not annexed), so they are present in the
+    checkout / working tree in both S3 and local modes -- no download needed. We
+    grep the head file list once and read at most a handful of small JSONs.
+    """
+    stem = filename_stem(primary_path)
+    suffix = stem.rsplit("_", 1)[-1].lower() if "_" in stem else ""
+    if not suffix:
+        return None
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(stem)
+    needle = f"_{suffix}.json"
+    candidates: list[tuple[int, int, str]] = []
+    for f in head_files:
+        if not f.endswith(needle):
+            continue
+        cdir = os.path.dirname(f)
+        # Applicable only if the sidecar is in the recording's dir or an ancestor.
+        if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+            continue
+        cents = _bids_entities(filename_stem(f))
+        # ...and its entities must be a subset of the recording's.
+        if any(rec_ents.get(k) != v for k, v in cents.items()):
+            continue
+        depth = cdir.count("/") + (1 if cdir else 0)
+        candidates.append((depth, len(cents), f))
+    candidates.sort()  # least specific first; the most specific value overrides
+    plf: float | None = None
+    for _, _, f in candidates:
+        try:
+            with open(os.path.join(repo_dir, f), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        v = data.get("PowerLineFrequency")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            plf = float(v)
+    return plf
+
+
 def affected_primaries(changed_path: str, primaries_by_dir: dict[str, list[str]]) -> set[str]:
     """Primary recordings a changed path rebuilds, restricted to those at HEAD.
 
@@ -438,7 +497,11 @@ def store_metadata(store_path: str) -> dict:
                     "duration_s": (nsamp / rate) if rate and nsamp else None,
                 }
             )
-        return {"modalities": sorted(modalities), "groups": groups}
+        return {
+            "modalities": sorted(modalities),
+            "groups": groups,
+            "power_line_frequency": ra.get("power_line_frequency"),
+        }
     except Exception as exc:  # noqa: BLE001 - best-effort metadata, never fatal
         print(f"::warning::store_metadata failed for {store_path}: {exc}", flush=True)
         return {}
@@ -467,7 +530,25 @@ def materialize_local(
     return primary_local, events_local, primary_key
 
 
-def convert_recording(primary_local: str, events_local: str | None, store_path: str) -> None:
+def embed_root_attr(store_path: str, key: str, value: object) -> None:
+    """Write a scalar into the Zarr v3 root group's attributes (its `zarr.json`)
+    after biosigIO has written the store. Carries a display hint the converter knows
+    from BIDS context but biosigIO does not (PowerLineFrequency), so the viewer reads
+    it straight from the store with no extra fetch."""
+    meta_path = os.path.join(store_path, "zarr.json")
+    with open(meta_path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    doc.setdefault("attributes", {})[key] = value
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
+
+def convert_recording(
+    primary_local: str,
+    events_local: str | None,
+    store_path: str,
+    power_line_frequency: float | None = None,
+) -> None:
     from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
     rec = Recording.from_file(primary_local)
@@ -481,6 +562,8 @@ def convert_recording(primary_local: str, events_local: str | None, store_path: 
         for label in rec.channels:
             rec.channels[label]["modality"] = modality
     rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
+    if power_line_frequency is not None:
+        embed_root_attr(store_path, "power_line_frequency", power_line_frequency)
 
 
 # --- Parallel conversion ------------------------------------------------------
@@ -518,7 +601,8 @@ def convert_one(primary: str) -> dict:
             primary_local, events_local, primary_key = materialize_recording(
                 c["repo"], c["bucket"], c["dataset_id"], primary, c["head_files"], c["head"], work
             )
-        convert_recording(primary_local, events_local, store_local)
+        plf = power_line_frequency_for(c["repo"], primary, c["head_files"])
+        convert_recording(primary_local, events_local, store_local, plf)
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.
         validate_store(store_local)

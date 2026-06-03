@@ -12,6 +12,7 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -24,11 +25,13 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     affected_primaries,
     bids_suffix_modality,
     compute_worklist,
+    embed_root_attr,
     events_sibling_for,
     is_primary,
     materialize_local,
     merge_index,
     parse_annex_key,
+    power_line_frequency_for,
     safe_store_prefix,
     store_rel_for,
 )
@@ -299,6 +302,79 @@ class TestBidsSuffixModality(unittest.TestCase):
         self.assertIsNone(bids_suffix_modality("sub-01/beh/sub-01_task-rest_physio.tsv"))
         self.assertIsNone(bids_suffix_modality("sub-01/eeg/sub-01_channels.tsv"))
         self.assertIsNone(bids_suffix_modality("noextnounderscore"))
+
+
+class TestPowerLineFrequencyFor(unittest.TestCase):
+    def _write(self, root: str, rel: str, body: dict) -> None:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+    def test_sibling_sidecar_wins_over_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"PowerLineFrequency": 60})
+            self._write(d, "task-rest_eeg.json", {"PowerLineFrequency": 50})  # less specific
+            head = {"sub-01/eeg/sub-01_task-rest_eeg.json", "task-rest_eeg.json"}
+            self.assertEqual(power_line_frequency_for(d, rec, head), 60.0)
+
+    def test_inherited_from_root_when_no_sibling(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "task-rest_eeg.json", {"PowerLineFrequency": 50})
+            head = {"task-rest_eeg.json"}
+            self.assertEqual(power_line_frequency_for(d, rec, head), 50.0)
+
+    def test_none_when_field_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"SamplingFrequency": 1024})
+            head = {"sub-01/eeg/sub-01_task-rest_eeg.json"}
+            self.assertIsNone(power_line_frequency_for(d, rec, head))
+
+    def test_non_subset_entities_do_not_apply(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            # A sidecar for a different task must not apply to this recording.
+            self._write(d, "sub-01/eeg/sub-01_task-other_eeg.json", {"PowerLineFrequency": 60})
+            head = {"sub-01/eeg/sub-01_task-other_eeg.json"}
+            self.assertIsNone(power_line_frequency_for(d, rec, head))
+
+    def test_wrong_suffix_does_not_satisfy(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_ieeg.json", {"PowerLineFrequency": 60})
+            head = {"sub-01/eeg/sub-01_task-rest_ieeg.json"}
+            self.assertIsNone(power_line_frequency_for(d, rec, head))
+
+    def test_non_numeric_value_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_eeg.json", {"PowerLineFrequency": "n/a"})
+            head = {"sub-01/eeg/sub-01_task-rest_eeg.json"}
+            self.assertIsNone(power_line_frequency_for(d, rec, head))
+
+
+class TestEmbedRootAttr(unittest.TestCase):
+    def test_adds_attribute_and_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": {"format": "biosigio-zarr", "channel_groups": ["eeg_250hz"]},
+                    },
+                    fh,
+                )
+            embed_root_attr(store, "power_line_frequency", 60.0)
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual(doc["attributes"]["power_line_frequency"], 60.0)
+            self.assertEqual(doc["attributes"]["channel_groups"], ["eeg_250hz"])  # preserved
 
 
 if __name__ == "__main__":
