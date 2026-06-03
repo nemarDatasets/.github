@@ -421,6 +421,29 @@ def store_metadata(store_path: str) -> dict:
         return {}
 
 
+def materialize_local(
+    repo_dir: str, primary_path: str, head_files: set[str]
+) -> tuple[str, str | None, str | None]:
+    """Local-mode materialisation (e.g. Hallu after `nemar dataset download`).
+
+    The dataset working tree already holds the annex content (the data files are
+    symlinks resolving to local annex objects), so biosigIO reads the
+    working-tree paths directly and companions resolve beside the primary --
+    no S3 download. Returns (primary_local, events_local|None, annex_key|None);
+    the key is read from the symlink target for index provenance, best-effort.
+    """
+    primary_local = os.path.join(repo_dir, primary_path)
+    events_rel = events_sibling_for(primary_path)
+    events_local = os.path.join(repo_dir, events_rel) if events_rel in head_files else None
+    primary_key: str | None = None
+    try:
+        if os.path.islink(primary_local):
+            primary_key = parse_annex_key(os.readlink(primary_local))
+    except OSError:
+        primary_key = None
+    return primary_local, events_local, primary_key
+
+
 def convert_recording(primary_local: str, events_local: str | None, store_path: str) -> None:
     from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
@@ -437,6 +460,13 @@ def main() -> int:
     ap.add_argument("--bucket", default="nemar")
     ap.add_argument("--region", default="us-east-2")
     ap.add_argument("--full", action="store_true", help="convert every recording")
+    ap.add_argument(
+        "--local",
+        action="store_true",
+        help="read recordings from the local working tree (annex content present, "
+        "e.g. on Hallu after `nemar dataset download`) instead of downloading the "
+        "annex blobs from S3",
+    )
     ap.add_argument("--callback-out", required=True, help="write the zarr-ready body here")
     args = ap.parse_args()
 
@@ -476,9 +506,14 @@ def main() -> int:
             store_local = os.path.join(out_root, rel_store)
             os.makedirs(os.path.dirname(store_local), exist_ok=True)
             try:
-                primary_local, events_local, primary_key = materialize_recording(
-                    repo, bucket, dataset_id, primary, head_set, head, work
-                )
+                if args.local:
+                    primary_local, events_local, primary_key = materialize_local(
+                        repo, primary, head_set
+                    )
+                else:
+                    primary_local, events_local, primary_key = materialize_recording(
+                        repo, bucket, dataset_id, primary, head_set, head, work
+                    )
                 convert_recording(primary_local, events_local, store_local)
                 # Guard the --delete sync below: an empty/partial store would
                 # otherwise wipe a previously-valid one. zarr.json => v3 root.
