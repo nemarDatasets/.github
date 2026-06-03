@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling via sys.path)
+    event_descriptions_for,
     git_ls_files,
     power_line_frequency_for,
 )
@@ -54,6 +55,11 @@ def store_meta_key(dataset_id: str, zarr_rel: str) -> str:
     return f"{dataset_id}/zarr/{zarr_rel.strip('/')}/zarr.json"
 
 
+def events_meta_key(dataset_id: str, zarr_rel: str) -> str:
+    """S3 key of a store's events group metadata (`<id>/zarr/<rel>.zarr/events/zarr.json`)."""
+    return f"{dataset_id}/zarr/{zarr_rel.strip('/')}/events/zarr.json"
+
+
 def current_plf(doc: dict) -> object:
     """The `power_line_frequency` currently in a zarr.json doc (None if unset)."""
     attrs = doc.get("attributes")
@@ -63,6 +69,19 @@ def current_plf(doc: dict) -> object:
 def set_plf(doc: dict, plf: float) -> dict:
     """Set `power_line_frequency` in a zarr.json doc's attributes (mutates + returns)."""
     doc.setdefault("attributes", {})["power_line_frequency"] = plf
+    return doc
+
+
+def current_value_descriptions(doc: dict) -> dict | None:
+    """The `value_descriptions` currently in a zarr.json doc (None if unset)."""
+    attrs = doc.get("attributes")
+    vd = attrs.get("value_descriptions") if isinstance(attrs, dict) else None
+    return vd if isinstance(vd, dict) else None
+
+
+def set_value_descriptions(doc: dict, descs: dict[str, str]) -> dict:
+    """Set `value_descriptions` in a zarr.json doc's attributes (mutates + returns)."""
+    doc.setdefault("attributes", {})["value_descriptions"] = descs
     return doc
 
 
@@ -181,6 +200,9 @@ def patch_dataset(
     def resolve(path: str) -> float | None:
         return power_line_frequency_for(repo, path, head_files, "HEAD")
 
+    def resolve_descs(path: str) -> dict[str, str]:
+        return event_descriptions_for(repo, path, head_files, "HEAD")
+
     planned = plan_patches(stores, resolve)
     patched, urls, by_zarr = 0, [], {}
     for zarr_rel, _, plf in planned:
@@ -197,6 +219,29 @@ def patch_dataset(
             s3_put_text(bucket, key, json.dumps(doc), "application/json")
         urls.append(f"{purge_base.rstrip('/')}/{key}")
         patched += 1
+
+    # Patch event descriptions into the events group zarr.json for each store.
+    desc_patched = 0
+    for e in stores:
+        zarr_rel = e.get("zarr")
+        path = e.get("path")
+        if not isinstance(zarr_rel, str) or not isinstance(path, str):
+            continue
+        descs = resolve_descs(path)
+        if not descs:
+            continue
+        ekey = events_meta_key(dataset_id, zarr_rel)
+        edoc_text = s3_get_text(bucket, ekey)
+        if edoc_text is None:
+            continue  # no events group in this store -> skip
+        edoc = json.loads(edoc_text)
+        if current_value_descriptions(edoc) == descs:
+            continue  # already equal -> idempotent skip
+        set_value_descriptions(edoc, descs)
+        if apply:
+            s3_put_text(bucket, ekey, json.dumps(edoc), "application/json")
+        urls.append(f"{purge_base.rstrip('/')}/{ekey}")
+        desc_patched += 1
 
     # Keep the index entries consistent so a later read carries the value too.
     if patched and by_zarr:
@@ -217,6 +262,7 @@ def patch_dataset(
         "stores": len(stores),
         "declared_plf": len(planned),
         "patched": patched,
+        "desc_patched": desc_patched,
         "apply": apply,
     }
 

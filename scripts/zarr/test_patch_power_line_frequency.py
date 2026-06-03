@@ -12,8 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from patch_power_line_frequency import (  # type: ignore[import-not-found]  # noqa: E402
     current_plf,
+    current_value_descriptions,
+    events_meta_key,
     plan_patches,
     set_plf,
+    set_value_descriptions,
     store_meta_key,
 )
 
@@ -66,6 +69,47 @@ class TestPlanPatches(unittest.TestCase):
 
         out = plan_patches(stores, resolve)
         self.assertEqual(out, [("sub-01/eeg/sub-01_eeg.zarr", "sub-01/eeg/sub-01_eeg.set", 60.0)])
+
+
+class TestEventsMetaKey(unittest.TestCase):
+    def test_builds_events_zarr_json_key(self):
+        self.assertEqual(
+            events_meta_key("on007139", "sub-01/eeg/sub-01_task-rest_eeg.zarr"),
+            "on007139/zarr/sub-01/eeg/sub-01_task-rest_eeg.zarr/events/zarr.json",
+        )
+
+    def test_strips_stray_slashes(self):
+        self.assertEqual(
+            events_meta_key("nm000132", "/a.zarr/"),
+            "nm000132/zarr/a.zarr/events/zarr.json",
+        )
+
+
+class TestCurrentValueDescriptions(unittest.TestCase):
+    def test_reads_dict(self):
+        doc = {"attributes": {"value_descriptions": {"21": "face"}}}
+        self.assertEqual(current_value_descriptions(doc), {"21": "face"})
+
+    def test_none_when_absent(self):
+        self.assertIsNone(current_value_descriptions({"attributes": {"format": "x"}}))
+        self.assertIsNone(current_value_descriptions({}))
+        self.assertIsNone(current_value_descriptions({"attributes": None}))
+
+    def test_none_when_not_a_dict(self):
+        self.assertIsNone(current_value_descriptions({"attributes": {"value_descriptions": "oops"}}))
+
+
+class TestSetValueDescriptions(unittest.TestCase):
+    def test_adds_and_preserves(self):
+        doc = {"attributes": {"n_events": 5, "label_map": {}}}
+        set_value_descriptions(doc, {"21": "face", "22": "house"})
+        self.assertEqual(doc["attributes"]["value_descriptions"], {"21": "face", "22": "house"})
+        self.assertEqual(doc["attributes"]["n_events"], 5)
+
+    def test_creates_attributes_when_missing(self):
+        doc: dict = {"zarr_format": 3}
+        set_value_descriptions(doc, {"1": "onset"})
+        self.assertEqual(doc["attributes"]["value_descriptions"], {"1": "onset"})
 
 
 if __name__ == "__main__":

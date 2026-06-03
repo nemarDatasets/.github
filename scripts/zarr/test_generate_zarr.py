@@ -26,7 +26,9 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     affected_primaries,
     bids_suffix_modality,
     compute_worklist,
+    embed_attr,
     embed_root_attr,
+    event_descriptions_for,
     events_sibling_for,
     is_primary,
     materialize_local,
@@ -403,6 +405,181 @@ class TestEmbedRootAttr(unittest.TestCase):
                 doc = json.load(fh)
             self.assertEqual(doc["attributes"]["power_line_frequency"], 60.0)
             self.assertEqual(doc["attributes"]["channel_groups"], ["eeg_250hz"])  # preserved
+
+
+class TestEmbedAttr(unittest.TestCase):
+    """embed_attr writes into an arbitrary group zarr.json, not only the store root."""
+
+    def _make_zarr_json(self, path: str, attrs: dict) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"zarr_format": 3, "node_type": "group", "attributes": attrs}, fh)
+
+    def test_writes_into_sub_group_zarr_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            meta = os.path.join(d, "rec.zarr", "events", "zarr.json")
+            self._make_zarr_json(meta, {"n_events": 42, "label_map": {}})
+            embed_attr(meta, "value_descriptions", {"21": "stimulus - face"})
+            with open(meta, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual(doc["attributes"]["value_descriptions"], {"21": "stimulus - face"})
+            self.assertEqual(doc["attributes"]["n_events"], 42)  # preserved
+
+    def test_creates_attributes_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            meta = os.path.join(d, "zarr.json")
+            with open(meta, "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3}, fh)
+            embed_attr(meta, "my_key", "my_value")
+            with open(meta, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual(doc["attributes"]["my_key"], "my_value")
+
+    def test_embed_root_attr_delegates(self):
+        """embed_root_attr must still work (it now delegates to embed_attr)."""
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3, "attributes": {"x": 1}}, fh)
+            embed_root_attr(store, "power_line_frequency", 50.0)
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual(doc["attributes"]["power_line_frequency"], 50.0)
+            self.assertEqual(doc["attributes"]["x"], 1)
+
+
+class TestEventDescriptionsFor(unittest.TestCase):
+    def _write(self, root: str, rel: str, body: dict) -> None:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+
+    def test_sibling_sidecar_wins_over_root(self):
+        """Most-specific sidecar overrides less-specific one for the same code."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            # Root-level (less specific): code 1 -> "boundary event"
+            self._write(d, "task-rest_events.json", {
+                "value": {"Levels": {"1": "boundary event", "21": "generic face"}},
+            })
+            # Sibling (more specific): code 21 overrides; code 99 is new
+            self._write(d, "sub-01/eeg/sub-01_task-rest_events.json", {
+                "value": {"Levels": {"21": "stimulus - face", "99": "response"}},
+            })
+            head = {
+                "task-rest_events.json",
+                "sub-01/eeg/sub-01_task-rest_events.json",
+            }
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result["21"], "stimulus - face")  # sibling wins
+            self.assertEqual(result["1"], "boundary event")    # root carries over
+            self.assertEqual(result["99"], "response")          # sibling-only code
+
+    def test_inherited_from_root_when_no_sibling(self):
+        """on007139 pattern: events.json at dataset root, no sibling in eeg dir."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-Flanker_eeg.set"
+            self._write(d, "task-Flanker_events.json", {
+                "value": {"Levels": {"1": "left arrow", "2": "right arrow"}},
+            })
+            head = {"task-Flanker_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result, {"1": "left arrow", "2": "right arrow"})
+
+    def test_merge_levels_across_multiple_columns(self):
+        """Codes from 'value' and 'trial_type' columns are both captured."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-x_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-x_events.json", {
+                "value": {"Levels": {"21": "stimulus - face"}},
+                "trial_type": {"Levels": {"go": "go trial", "nogo": "no-go trial"}},
+            })
+            head = {"sub-01/eeg/sub-01_task-x_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertIn("21", result)
+            self.assertIn("go", result)
+            self.assertIn("nogo", result)
+
+    def test_non_subset_entities_not_applied(self):
+        """A sidecar for a different task must not apply to this recording."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-other_events.json", {
+                "value": {"Levels": {"10": "face"}},
+            })
+            head = {"sub-01/eeg/sub-01_task-other_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result, {})
+
+    def test_absent_sidecar_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            result = event_descriptions_for(d, rec, set(), "HEAD")
+            self.assertEqual(result, {})
+
+    def test_non_string_values_ignored(self):
+        """Levels entries with non-string key or value are skipped."""
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            # JSON keys are always strings, but values might be non-string
+            self._write(d, "sub-01/eeg/sub-01_task-rest_events.json", {
+                "value": {"Levels": {"21": 42, "22": None, "23": "valid"}},
+            })
+            head = {"sub-01/eeg/sub-01_task-rest_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result, {"23": "valid"})
+
+    def test_empty_string_keys_and_values_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_events.json", {
+                "value": {"Levels": {"": "empty key", "21": ""}},
+            })
+            head = {"sub-01/eeg/sub-01_task-rest_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result, {})
+
+    def test_no_levels_field_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self._write(d, "sub-01/eeg/sub-01_task-rest_events.json", {
+                "value": {"Description": "the event value column", "Units": "n/a"},
+            })
+            head = {"sub-01/eeg/sub-01_task-rest_events.json"}
+            result = event_descriptions_for(d, rec, head, "HEAD")
+            self.assertEqual(result, {})
+
+    def test_reads_via_git_when_no_working_tree(self):
+        """Mirrors the PLF git test: clone --no-checkout, must use git cat-file."""
+        sidecar = "sub-01/eeg/sub-01_task-rest_events.json"
+        sidecar_body = {"value": {"Levels": {"10": "face", "20": "house"}}}
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as clone_parent:
+            p = os.path.join(src, sidecar)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(sidecar_body, fh)
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t",
+            }
+
+            def run(*a: str) -> None:
+                subprocess.run(a, check=True, env=env, capture_output=True)
+
+            run("git", "-C", src, "init", "-q", "-b", "main")
+            run("git", "-C", src, "add", "-A")
+            run("git", "-C", src, "commit", "-qm", "init")
+            clone = os.path.join(clone_parent, "repo")
+            run("git", "clone", "--no-checkout", "-q", src, clone)
+            self.assertFalse(os.path.exists(os.path.join(clone, sidecar)))
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            result = event_descriptions_for(clone, rec, {sidecar}, "HEAD")
+            self.assertEqual(result, {"10": "face", "20": "house"})
 
 
 if __name__ == "__main__":
