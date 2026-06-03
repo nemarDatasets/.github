@@ -33,9 +33,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # --- Path classification -------------------------------------------------
@@ -54,6 +56,24 @@ INDEX_FORMAT_VERSION = 1
 # uppercase modality names; the defaults already match, set explicitly so the
 # NEMAR caps are visible/auditable here rather than implied by the library.
 MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
+
+# The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
+# by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
+# EOG/REF/trigger channels ride along; biosigIO's EEGLAB importer can only see an
+# empty chanlocs `type` and would otherwise fall back to OTHER -> MISC, yielding a
+# `misc_1024hz` group (no cap) instead of the intended `eeg_250hz`. We force every
+# channel's modality from the suffix so the whole recording lands in one coherent
+# group at the modality's MODALITY_RATES cap.
+_SUFFIX_MODALITY = {"eeg": "EEG", "meg": "MEG", "ieeg": "IEEG", "emg": "EMG"}
+
+
+def bids_suffix_modality(path: str) -> str | None:
+    """Modality from a recording's BIDS suffix (`sub-01_task-rest_eeg.set` -> EEG),
+    or None when the trailing `_<suffix>` is not a known datatype. The rate cap
+    then follows from MODALITY_RATES (EEG/MEG 250 Hz, IEEG/EMG 1000 Hz)."""
+    stem = os.path.basename(path).rsplit(".", 1)[0]
+    suffix = stem.rsplit("_", 1)[-1].lower() if "_" in stem else ""
+    return _SUFFIX_MODALITY.get(suffix)
 
 ANNEX_TARGET_RE = re.compile(r"\.git/annex/objects/[A-Za-z0-9]+/[A-Za-z0-9]+/([^/]+)/\1$")
 ANNEX_POINTER_CONTENT_RE = re.compile(r"^/annex/objects/(.+)$")
@@ -288,7 +308,10 @@ def validate_store(store_local: str) -> None:
 
 
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
-    subprocess.run(["aws", "s3", "cp", src, dst, *(extra or [])], check=True)
+    # --only-show-errors drops the per-file transfer progress meter; with JOBS
+    # workers each streaming a ~100 MB blob, that meter otherwise floods the cron
+    # log to the point of uselessness.
+    subprocess.run(["aws", "s3", "cp", src, dst, "--only-show-errors", *(extra or [])], check=True)
 
 
 def s3_read_json(bucket: str, key: str) -> dict | None:
@@ -450,7 +473,84 @@ def convert_recording(primary_local: str, events_local: str | None, store_path: 
     rec = Recording.from_file(primary_local)
     if events_local and os.path.exists(events_local):
         bids.apply_events_tsv(rec, events_local)
+    # Suffix-driven modality: group + resample the whole recording by its BIDS
+    # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
+    # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
+    modality = bids_suffix_modality(primary_local)
+    if modality:
+        for label in rec.channels:
+            rec.channels[label]["modality"] = modality
     rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
+
+
+# --- Parallel conversion ------------------------------------------------------
+# Recordings are independent (distinct S3 store prefixes), so they convert in a
+# ProcessPoolExecutor: each worker streams its own annex blob, converts, validates,
+# and `aws s3 sync`s its store, then returns the index entry. Conversion is
+# CPU-bound (resample + zstd), so processes (not threads) give real parallelism.
+# The shared context (repo, bucket, head, the head file set) is pickled once per
+# worker via the initializer, not once per task.
+
+_CTX: dict = {}
+
+
+def _init_worker(ctx: dict) -> None:
+    _CTX.clear()
+    _CTX.update(ctx)
+
+
+def convert_one(primary: str) -> dict:
+    """Convert + upload one recording in a pool worker. Returns
+    {"ok": True, "primary", "entry"} or {"ok": False, "primary", "error"}.
+    Self-contained and picklable; reads shared inputs from the worker `_CTX`."""
+    c = _CTX
+    rel_store = store_rel_for(primary)
+    work = os.path.join(c["tmp"], "work", primary.replace("/", "_"))
+    store_local = os.path.join(c["tmp"], "stores", rel_store)
+    os.makedirs(work, exist_ok=True)
+    os.makedirs(os.path.dirname(store_local), exist_ok=True)
+    try:
+        if c["local"]:
+            primary_local, events_local, primary_key = materialize_local(
+                c["repo"], primary, c["head_files"]
+            )
+        else:
+            primary_local, events_local, primary_key = materialize_recording(
+                c["repo"], c["bucket"], c["dataset_id"], primary, c["head_files"], c["head"], work
+            )
+        convert_recording(primary_local, events_local, store_local)
+        # Guard the --delete sync: an empty/partial store would otherwise wipe a
+        # previously-valid one. zarr.json => v3 root.
+        validate_store(store_local)
+        meta = store_metadata(store_local)
+        if not meta.get("groups"):
+            raise RuntimeError(f"store has no channel groups: {store_local}")
+        # Latest-only: --delete drops stale chunk objects a smaller new store no
+        # longer needs. Long origin TTL; the callback purges zarr.json/index.json.
+        subprocess.run(
+            [
+                "aws", "s3", "sync", store_local,
+                safe_store_prefix(c["bucket"], c["dataset_id"], rel_store),
+                "--delete", "--only-show-errors",
+                "--cache-control", "public, max-age=86400",
+            ],
+            check=True,
+        )
+        entry = {
+            "path": primary,
+            "zarr": rel_store,
+            "source_key": primary_key,
+            "updated_utc": c["updated"],
+            **meta,
+        }
+        return {"ok": True, "primary": primary, "entry": entry}
+    except Exception as exc:  # noqa: BLE001 - isolate one bad recording
+        return {"ok": False, "primary": primary, "error": str(exc)}
+    finally:
+        # Parallel workers share the NVMe scratch; reclaim each recording's copy
+        # right after upload so N concurrent stores don't accumulate on disk.
+        for d in (store_local, work):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def main() -> int:
@@ -461,6 +561,15 @@ def main() -> int:
     ap.add_argument("--region", default="us-east-2")
     ap.add_argument("--full", action="store_true", help="convert every recording")
     ap.add_argument(
+        "--clean",
+        action="store_true",
+        help="wipe s3://<bucket>/<id>/zarr/ first, then full-rebuild the whole "
+        "dataset. The serving copy must mirror the current dataset exactly, so a "
+        "trigger remakes it wholesale rather than incrementally (no orphaned "
+        "stores from removed/renamed recordings, no stale groups from a regroup, "
+        "no merged index). Implies --full.",
+    )
+    ap.add_argument(
         "--local",
         action="store_true",
         help="read recordings from the local working tree (annex content present, "
@@ -468,6 +577,14 @@ def main() -> int:
         "annex blobs from S3",
     )
     ap.add_argument("--callback-out", required=True, help="write the zarr-ready body here")
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="convert this many recordings in parallel (ProcessPoolExecutor). "
+        "Default 1 (serial). The Hallu cron raises it; cap to keep N concurrent "
+        "multi-GB recordings within local scratch + RAM.",
+    )
     args = ap.parse_args()
 
     dataset_id = args.dataset_id
@@ -476,9 +593,14 @@ def main() -> int:
     head = _run(["git", "-C", repo, "rev-parse", "HEAD"]).strip()
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    prior = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
-    prior_commit = (prior or {}).get("source_commit")
-    full = args.full or not prior_commit or not is_ancestor(repo, prior_commit, head)
+    # --clean rebuilds from scratch: ignore any prior index (no merge, no diff) so
+    # the run is unconditionally full and the index is rewritten fresh below.
+    if args.clean:
+        prior, prior_commit, full = None, None, True
+    else:
+        prior = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
+        prior_commit = (prior or {}).get("source_commit")
+        full = args.full or not prior_commit or not is_ancestor(repo, prior_commit, head)
 
     head_files = git_ls_files(repo, head)
     if full:
@@ -487,6 +609,17 @@ def main() -> int:
         assert prior_commit  # full is False only when prior_commit is a real ancestor SHA
         diff = git_diff_name_status(repo, prior_commit, head)
     convert, remove = compute_worklist(head_files, diff, full)
+
+    # Wipe the whole serving prefix before rebuilding. Guarded on a non-empty
+    # worklist so a transient "no recordings" read can never nuke a good copy;
+    # the convert loop then re-uploads every store into the emptied prefix.
+    if args.clean and convert:
+        print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
+        subprocess.run(
+            ["aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
+             "--recursive", "--only-show-errors"],
+            check=True,
+        )
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
@@ -497,58 +630,44 @@ def main() -> int:
     converted_entries: list[dict] = []
     failures: list[str] = []
 
+    n = len(convert)
+
+    def record(r: dict, i: int) -> None:
+        # Log each recording as it finishes (live progress over a long backfill),
+        # not all at once at the end.
+        if r["ok"]:
+            converted_entries.append(r["entry"])
+            print(f"[zarr] [{i}/{n}] converted {r['primary']} -> {r['entry']['zarr']}", flush=True)
+        else:
+            failures.append(r["primary"])
+            print(f"::warning::[{i}/{n}] conversion failed for {r['primary']}: {r['error']}", flush=True)
+
+    jobs = max(1, args.jobs)
     with tempfile.TemporaryDirectory() as tmp:
-        out_root = os.path.join(tmp, "stores")
-        for primary in convert:
-            rel_store = store_rel_for(primary)
-            work = os.path.join(tmp, "work", os.path.dirname(rel_store))
-            os.makedirs(work, exist_ok=True)
-            store_local = os.path.join(out_root, rel_store)
-            os.makedirs(os.path.dirname(store_local), exist_ok=True)
-            try:
-                if args.local:
-                    primary_local, events_local, primary_key = materialize_local(
-                        repo, primary, head_set
-                    )
-                else:
-                    primary_local, events_local, primary_key = materialize_recording(
-                        repo, bucket, dataset_id, primary, head_set, head, work
-                    )
-                convert_recording(primary_local, events_local, store_local)
-                # Guard the --delete sync below: an empty/partial store would
-                # otherwise wipe a previously-valid one. zarr.json => v3 root.
-                validate_store(store_local)
-                meta = store_metadata(store_local)
-                if not meta.get("groups"):
-                    raise RuntimeError(f"store has no channel groups: {store_local}")
-                # Latest-only: --delete drops stale chunk objects a smaller new
-                # store no longer needs. Long origin TTL; the Cloudflare cache
-                # rule shortens zarr.json/index.json and the callback purges them.
-                subprocess.run(
-                    [
-                        "aws", "s3", "sync", store_local,
-                        safe_store_prefix(bucket, dataset_id, rel_store),
-                        "--delete", "--cache-control", "public, max-age=86400",
-                    ],
-                    check=True,
-                )
-                converted_entries.append(
-                    {
-                        "path": primary,
-                        "zarr": rel_store,
-                        "source_key": primary_key,
-                        "updated_utc": updated,
-                        **meta,
-                    }
-                )
-                print(f"[zarr] converted {primary} -> {rel_store}", flush=True)
-            except Exception as exc:  # noqa: BLE001 - isolate one bad recording
-                failures.append(primary)
-                print(f"::warning::conversion failed for {primary}: {exc}", flush=True)
+        ctx = {
+            "repo": repo, "bucket": bucket, "dataset_id": dataset_id, "head": head,
+            "head_files": head_set, "local": args.local, "tmp": tmp, "updated": updated,
+        }
+        if jobs == 1 or n <= 1:
+            _init_worker(ctx)
+            for i, p in enumerate(convert, 1):
+                record(convert_one(p), i)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=jobs, initializer=_init_worker, initargs=(ctx,)
+            ) as ex:
+                futs = {ex.submit(convert_one, p): p for p in convert}
+                for i, fut in enumerate(as_completed(futs), 1):
+                    try:
+                        r = fut.result()
+                    except Exception as exc:  # worker process died (OOM/segfault)
+                        r = {"ok": False, "primary": futs[fut], "error": f"worker crashed: {exc}"}
+                    record(r, i)
 
     for rel_store in remove:
         subprocess.run(
-            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store), "--recursive"],
+            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
+             "--recursive", "--only-show-errors"],
             check=True,
         )
         print(f"[zarr] removed store {rel_store}", flush=True)
