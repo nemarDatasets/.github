@@ -1,0 +1,11 @@
+# Python dependencies for the NEMAR Zarr converter driver (generate_zarr.py).
+#
+# Declaring biosigIO here (instead of only as a `uv pip install` command in the
+# workflow) makes it a real entry in GitHub's dependency graph, so this public
+# repo shows up under biosigIO's "Used by" / Dependents and the converter work is
+# credited to neuromechanist/biosigio. It also single-sources the version pin for
+# both the Actions workflow and the Hallu cron.
+#
+# Extras: [zarr] -> zarr v3 store writer/reader; [meg] -> mne (.fif + BrainVision
+# .vhdr importers). Core biosigIO covers .set/.fdt/.edf/.bdf.
+biosigio[zarr,meg]>=1.1.2

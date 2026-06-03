@@ -98,11 +98,11 @@ jobs:
         id: install
         run: |
           set -euo pipefail
-          # [zarr] -> zarr v3 + the store writer/reader; [meg] -> mne, which
-          # backs the .fif and BrainVision .vhdr importers. Core deps cover
-          # .set/.fdt/.edf/.bdf. --system installs into the setup-python runtime
-          # so `python scripts/...` resolves biosigio.
-          uv pip install --system 'biosigio[zarr,meg]>=1.1.2'
+          # Install from the manifest (scripts/zarr/requirements.txt) rather than an
+          # inline spec, so GitHub's dependency graph parses it and credits
+          # biosigIO under its "Used by". --system installs into the setup-python
+          # runtime so `python scripts/...` resolves biosigio.
+          uv pip install --system -r scripts/zarr/requirements.txt
 
       - name: Mint GH App installation token for dataset repo
         id: app-token
