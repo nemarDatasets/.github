@@ -561,6 +561,15 @@ def main() -> int:
     ap.add_argument("--region", default="us-east-2")
     ap.add_argument("--full", action="store_true", help="convert every recording")
     ap.add_argument(
+        "--clean",
+        action="store_true",
+        help="wipe s3://<bucket>/<id>/zarr/ first, then full-rebuild the whole "
+        "dataset. The serving copy must mirror the current dataset exactly, so a "
+        "trigger remakes it wholesale rather than incrementally (no orphaned "
+        "stores from removed/renamed recordings, no stale groups from a regroup, "
+        "no merged index). Implies --full.",
+    )
+    ap.add_argument(
         "--local",
         action="store_true",
         help="read recordings from the local working tree (annex content present, "
@@ -584,9 +593,14 @@ def main() -> int:
     head = _run(["git", "-C", repo, "rev-parse", "HEAD"]).strip()
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    prior = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
-    prior_commit = (prior or {}).get("source_commit")
-    full = args.full or not prior_commit or not is_ancestor(repo, prior_commit, head)
+    # --clean rebuilds from scratch: ignore any prior index (no merge, no diff) so
+    # the run is unconditionally full and the index is rewritten fresh below.
+    if args.clean:
+        prior, prior_commit, full = None, None, True
+    else:
+        prior = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
+        prior_commit = (prior or {}).get("source_commit")
+        full = args.full or not prior_commit or not is_ancestor(repo, prior_commit, head)
 
     head_files = git_ls_files(repo, head)
     if full:
@@ -595,6 +609,17 @@ def main() -> int:
         assert prior_commit  # full is False only when prior_commit is a real ancestor SHA
         diff = git_diff_name_status(repo, prior_commit, head)
     convert, remove = compute_worklist(head_files, diff, full)
+
+    # Wipe the whole serving prefix before rebuilding. Guarded on a non-empty
+    # worklist so a transient "no recordings" read can never nuke a good copy;
+    # the convert loop then re-uploads every store into the emptied prefix.
+    if args.clean and convert:
+        print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
+        subprocess.run(
+            ["aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
+             "--recursive", "--only-show-errors"],
+            check=True,
+        )
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
