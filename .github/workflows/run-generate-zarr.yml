@@ -1,0 +1,214 @@
+name: Run Generate Zarr
+
+# Central Zarr serving-copy generator for NEMAR datasets (epic
+# nemarOrg/nemar-cli#684, Stream B; this sub-issue #20).
+#
+# Builds a derived, LATEST-ONLY biosigIO Zarr v3 store per recording in a
+# dataset and writes them to s3://nemar/<id>/zarr/... . The conversion is
+# incremental: scripts/zarr/generate_zarr.py diffs HEAD against the commit the
+# previous run recorded in index.json and rebuilds only the recordings whose
+# data file, companion, or _events.tsv changed (`full=true` rebuilds all). On
+# completion it POSTs /webhooks/zarr-ready on the Worker (X-Webhook-Token).
+#
+# Lives at nemarDatasets/.github so Actions minutes bill against the Team
+# allowance. The Worker dispatcher (nemar-cli :: triggerZarrGeneration) POSTs
+# repository_dispatch[generate-zarr] here on a main-branch data/events push.
+#
+# Sibling of generate-manifest.yml / run-generate-archive.yml; same App-token +
+# full-history-clone + AWS-creds + callback shape.
+
+on:
+  repository_dispatch:
+    types: [generate-zarr]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      ref:
+        description: "Branch to convert (default main)"
+        required: false
+        type: string
+        default: "main"
+      full:
+        description: "Convert every recording (ignore the incremental diff)"
+        required: false
+        type: boolean
+        default: false
+      callback_url:
+        description: "Callback URL (defaults to api.nemar.org)"
+        required: false
+        type: string
+        default: "https://api.nemar.org/webhooks/zarr-ready"
+
+jobs:
+  zarr:
+    name: Generate Zarr Serving Copy
+    runs-on: ubuntu-latest
+    # Incremental runs are single-digit minutes; a full backfill of a large
+    # dataset (download + convert every recording) is the long tail. Cap well
+    # above that but far below the 360-min default so a hung run can't pin a
+    # runner indefinitely.
+    timeout-minutes: 120
+    # The App token (dataset access), AWS creds (S3), and NEMAR_WEBHOOK_TOKEN
+    # (callback) cover every authenticated call; the default GITHUB_TOKEN is
+    # never used.
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+      FULL: ${{ github.event.client_payload.full || inputs.full || 'false' }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/zarr-ready' }}
+      AWS_DEFAULT_REGION: us-east-2
+      S3_BUCKET: nemar
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *)
+              echo "::error::Invalid dataset_id shape: $DATASET_ID (expected nm/on/xx + 6 digits)"
+              exit 1
+              ;;
+          esac
+          echo "Inputs OK: dataset_id=${DATASET_ID} ref=${REF} full=${FULL}"
+
+      - name: Checkout .github (for scripts/zarr/)
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        id: setup-uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install biosigIO
+        id: install
+        run: |
+          set -euo pipefail
+          # [zarr] -> zarr v3 + the store writer/reader; [meg] -> mne, which
+          # backs the .fif and BrainVision .vhdr importers. Core deps cover
+          # .set/.fdt/.edf/.bdf. --system installs into the setup-python runtime
+          # so `python scripts/...` resolves biosigio.
+          uv pip install --system 'biosigio[zarr,meg]>=1.1.2'
+
+      - name: Mint GH App installation token for dataset repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Clone dataset repo (full history, no working tree)
+        id: clone
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/repo
+          # Full history (no --depth) so the incremental diff can reach the
+          # prior-converted commit; --no-checkout because the driver reads the
+          # tree with git plumbing (it never needs a materialised working tree,
+          # and a checkout would only create broken annex symlinks).
+          git clone --no-checkout --branch "$REF" \
+            "https://x-access-token:${GH_TOKEN}@github.com/nemarDatasets/${DATASET_ID}.git" \
+            /tmp/repo
+          echo "Cloned ${DATASET_ID}@${REF} into /tmp/repo"
+
+      - name: Configure AWS credentials
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Generate Zarr stores
+        id: emit
+        run: |
+          set -euo pipefail
+          FULL_FLAG=""
+          if [ "$FULL" = "true" ]; then
+            FULL_FLAG="1"
+          fi
+          # ${FULL_FLAG:+--full} expands to the single token --full when set,
+          # else to nothing -- no unquoted-empty word-splitting under set -u.
+          python scripts/zarr/generate_zarr.py \
+            --dataset-id "$DATASET_ID" \
+            --repo-dir /tmp/repo \
+            --bucket "$S3_BUCKET" \
+            --region "$AWS_DEFAULT_REGION" \
+            ${FULL_FLAG:+--full} \
+            --callback-out /tmp/zarr-callback.json
+
+      - name: POST callback (zarr-ready)
+        id: post-success
+        if: success()
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "No callback URL configured; skipping callback POST"
+            exit 0
+          fi
+          # --connect-timeout/--max-time cap a hung Worker. On non-2xx capture
+          # the body so the failure is unambiguous: the stores ARE on S3, the
+          # Worker refused the callback (auth, dataset-not-in-D1 -> 404, schema).
+          HTTP_STATUS=$(curl -sS -o /tmp/zarr-callback-response.txt \
+            -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/zarr-callback.json) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "::error title=zarr-ready callback rejected::Stores uploaded to S3 but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS. NOT a conversion failure. Response body follows."
+            cat /tmp/zarr-callback-response.txt || true
+            echo
+            exit 1
+          fi
+          echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS)"
+
+      - name: Flag partial conversion failures
+        id: flag-partial
+        if: success()
+        run: |
+          set -euo pipefail
+          # The driver returns 0 on a partial run (good stores + index are on S3
+          # and the callback recorded the state); turn the run red here, AFTER
+          # the callback, so an operator investigates the skipped recordings.
+          python -c "import json,sys; d=json.load(open('/tmp/zarr-callback.json')); n=d.get('errors',0); print(f'{n} recording(s) failed'); sys.exit(1 if n else 0)"
+
+      - name: POST failure callback (best-effort)
+        # Only on a HARD failure (clone/install/driver crash, or the success
+        # callback POST itself failing) -- NOT when flag-partial reds the run
+        # after a successful partial callback, which would clobber a valid
+        # 'ready' in D1 with 'failed'.
+        if: failure() && steps.post-success.outcome != 'success'
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A hard failure (clone/install/driver crash) before the success
+          # callback: tell the Worker the latest conversion failed so the
+          # datasets.zarr_status flips to 'failed'. Best-effort; tolerate a 404.
+          printf '{"dataset_id":"%s","status":"failed"}' "$DATASET_ID" > /tmp/zarr-fail.json
+          curl -sS --connect-timeout 10 --max-time 30 -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/zarr-fail.json || true
