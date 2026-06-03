@@ -28,3 +28,5 @@ jobs:
           python-version: "3.12"
       - name: Run zarr driver tests
         run: python scripts/zarr/test_generate_zarr.py
+      - name: Run zarr queue tests
+        run: python scripts/zarr/test_zarr_queue.py
