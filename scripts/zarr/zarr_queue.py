@@ -187,14 +187,29 @@ def mark_fail(
 
 
 def fetch_public_datasets(api_base: str) -> list[tuple[str, str]]:
-    url = f"{api_base.rstrip('/')}/datasets?limit=1000"
-    with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 - trusted NEMAR API
-        payload = json.loads(resp.read().decode("utf-8"))
+    """Every public dataset as (dataset_id, latest_version).
+
+    Paginates: `GET /datasets` caps a page at 200 regardless of `limit`, so we
+    walk `offset` until `total_count`. A non-default User-Agent is required --
+    api.nemar.org sits behind Cloudflare, which 403s the default Python-urllib UA
+    as a bot.
+    """
+    base = api_base.rstrip("/")
     out: list[tuple[str, str]] = []
-    for d in payload.get("datasets", []) or []:
-        if d.get("visibility") != "public":
-            continue
-        out.append((str(d.get("dataset_id", "")), str(d.get("latest_version") or "")))
+    offset, page = 0, 200
+    while True:
+        url = f"{base}/datasets?limit={page}&offset={offset}"
+        req = urllib.request.Request(url, headers={"User-Agent": "nemar-zarr-cron/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 - trusted NEMAR API
+            payload = json.loads(resp.read().decode("utf-8"))
+        rows = payload.get("datasets", []) or []
+        for d in rows:
+            if d.get("visibility") != "public":
+                continue
+            out.append((str(d.get("dataset_id", "")), str(d.get("latest_version") or "")))
+        offset += len(rows)
+        if not rows or offset >= int(payload.get("total_count", 0) or 0):
+            break
     return out
 
 
