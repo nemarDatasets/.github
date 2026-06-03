@@ -33,6 +33,11 @@ on:
         description: "Version (X.Y.Z, no leading v)"
         required: true
         type: string
+      force:
+        description: "Rebuild even if the archive already exists (recover a partial/corrupt zip)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   archive:
@@ -313,4 +318,33 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-2
           NODE_PATH: /tmp/archive-deps/node_modules
-        run: node /tmp/stream-archive.js
+        run: |
+          set -euo pipefail
+          # Idempotency guard (#670): skip the expensive re-download/re-zip/
+          # re-upload if the archive already exists (a duplicate or manual
+          # re-dispatch would otherwise rebuild it and could clobber the object
+          # mid-stream). Normal publishes already dispatch this exactly once now
+          # that the orchestrator's redundant generate_archive step was removed;
+          # this is defense-in-depth. Use `force=true` (workflow_dispatch) to
+          # rebuild over a partial/corrupt archive.
+          FORCE="${{ github.event.client_payload.force || inputs.force || 'false' }}"
+          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          if [ "$FORCE" = "true" ]; then
+            echo "force=true -- rebuilding archive regardless of existing object."
+          else
+            # Capture stderr so a 403/5xx is reported as such instead of being
+            # silently treated as "absent -> rebuild" with a misleading log.
+            set +e
+            head_out=$(aws s3api head-object --bucket nemar --key "$KEY" 2>&1)
+            head_rc=$?
+            set -e
+            if [ "$head_rc" -eq 0 ]; then
+              echo "Archive already exists at s3://nemar/$KEY -- skipping rebuild."
+              exit 0
+            elif echo "$head_out" | grep -qiE "Not Found|404|NoSuchKey"; then
+              echo "No existing archive at s3://nemar/$KEY -- building."
+            else
+              echo "::warning::head-object on $KEY returned an unexpected error (rc=$head_rc); proceeding to rebuild. Detail: $head_out"
+            fi
+          fi
+          node /tmp/stream-archive.js
