@@ -1,0 +1,42 @@
+name: Test patch_duration
+
+# Runs scripts/test_patch_duration.py (Tier-2 biosigIO duration fill) on PRs
+# touching the patch script, its test, or the generate_zarr helpers it reuses.
+# Installs biosigIO (+ pyedflib) so the real-EDF assertions actually run instead
+# of skipping. Scoped narrowly so the heavier biosigIO install only fires when
+# patch_duration-related files change, not on every scripts/** edit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/patch_duration.py"
+      - "scripts/test_patch_duration.py"
+      - "scripts/zarr/generate_zarr.py"
+      - "scripts/zarr/requirements.txt"
+      - ".github/workflows/test-patch-duration.yml"
+  pull_request:
+    paths:
+      - "scripts/patch_duration.py"
+      - "scripts/test_patch_duration.py"
+      - "scripts/zarr/generate_zarr.py"
+      - "scripts/zarr/requirements.txt"
+      - ".github/workflows/test-patch-duration.yml"
+  workflow_dispatch:
+
+jobs:
+  python-unit-test:
+    name: patch_duration unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install biosigIO + pyedflib (real-recording read)
+        # The test generates a real EDF with pyedflib and reads it back through
+        # biosigIO (Recording.from_file). Without these the test self-skips and
+        # gives no coverage, so install them explicitly here.
+        run: python -m pip install --quiet -r scripts/zarr/requirements.txt pyedflib
+      - name: Run patch_duration tests
+        run: python scripts/test_patch_duration.py
