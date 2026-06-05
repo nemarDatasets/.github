@@ -1,0 +1,175 @@
+name: Generate Records
+
+# Central Tier-1 record emitter for NEMAR dataset versions.
+#
+# Sibling to generate-manifest.yml. Where that workflow emits one
+# VersionManifest + summary per dataset version, this one emits a JSON
+# ARRAY of neuroschema v0.3.0 `record` documents -- one per primary signal
+# file -- from a git-tree walk on a managed runner (no annex download, no
+# biosigIO/MNE). Recording duration / sample counts come from the BIDS
+# sidecar; absent ones are emitted as null for a Tier-2 backfill.
+#
+# This workflow lives at nemarDatasets/.github so its Actions minutes bill
+# against the GitHub Team allowance.
+#
+# Triggered by:
+#   - repository_dispatch[generate-records] from the Worker (production path)
+#   - workflow_dispatch                      (manual recovery / re-run)
+#
+# Artifacts:
+#   s3://nemar/<id>/version/v<X.Y.Z>-records.json   (records.json)
+#
+# emit + validate below are REAL and fully wired. The S3 upload and the
+# .nemar/records.json commit-back + Worker callback are intentionally
+# left as a clearly-marked skeleton/TODO (see the marked steps) pending
+# the route/Worker contract; flip them on once that lands.
+
+on:
+  repository_dispatch:
+    types: [generate-records]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      version:
+        description: "Version (X.Y.Z, no leading v)"
+        required: true
+        type: string
+
+jobs:
+  records:
+    name: Generate Records
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      # Pin to the released neuroschema so the validation step is reproducible.
+      NEUROSCHEMA_VERSION: "0.3.0"
+      AWS_DEFAULT_REGION: us-east-2
+      S3_BUCKET: nemar
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          if [ -z "$DATASET_ID" ]; then
+            echo "::error::Missing dataset_id"
+            exit 1
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::Missing version"
+            exit 1
+          fi
+          # Strip a stray leading v; S3 keys use the bare version.
+          VERSION="${VERSION#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=v${VERSION}" >> "$GITHUB_ENV"
+          echo "Inputs OK: dataset_id=${DATASET_ID} version=${VERSION}"
+
+      - name: Checkout .github (for scripts/emit_records.py)
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Mint GH App installation token for dataset repo
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Shallow-clone dataset repo at tag
+        id: clone
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/repo
+          git clone --depth 1 --branch "$TAG" --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/nemarDatasets/${DATASET_ID}.git" \
+            /tmp/repo
+          echo "Cloned ${DATASET_ID}@${TAG} into /tmp/repo"
+
+      - name: Emit records.json
+        id: emit
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          python scripts/emit_records.py \
+            --dataset-id "$DATASET_ID" \
+            --version "$VERSION" \
+            --repo-dir /tmp/repo \
+            --out-dir /tmp/out
+          echo "--- records.json head ---"
+          head -c 2000 /tmp/out/records.json || true
+          echo
+
+      - name: Validate records.json against neuroschema v0.3.0
+        id: validate-records
+        run: |
+          set -euo pipefail
+          # The neuroschema validator (validate_document) operates on a SINGLE
+          # object and routes it through the root envelope (doc_type 'record'
+          # -> core/record.schema.json). records.json is an ARRAY, so we loop
+          # and validate each element; feeding the whole array to the CLI would
+          # fail with "[...] is not of type object". neuroschema is NOT on PyPI;
+          # install it from the released git tag (pulls jsonschema) into an
+          # isolated env so emit stays stdlib-only. The deprecated-RefResolver
+          # DeprecationWarning on stderr is harmless and must not fail the step.
+          python -m pip install --quiet \
+            "neuroschema @ git+https://github.com/nemarOrg/neuroschema@v${NEUROSCHEMA_VERSION}"
+          python - "/tmp/out/records.json" <<'PY'
+          import json
+          import sys
+
+          from neuroschema.validate import validate_document  # root envelope by default
+
+          docs = json.load(open(sys.argv[1]))
+          assert isinstance(docs, list), "records.json must be a JSON array"
+          bad = 0
+          for i, doc in enumerate(docs):
+              for err in validate_document(doc):  # schema_path=None -> root -> record
+                  bad += 1
+                  path = ".".join(str(p) for p in err.absolute_path) or "(root)"
+                  print(f"::error::[{i}] {path}: {err.message}")
+          print(f"{'VALID' if bad == 0 else 'INVALID'}: {len(docs)} record(s), {bad} error(s)")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # --------------------------------------------------------------------
+      # SKELETON / TODO (issue: records route + Worker callback contract):
+      # The emit + validate steps above are production-real. The S3 upload
+      # and the .nemar/records.json commit-back + Worker callback below are
+      # intentionally a documented skeleton until the route/contract lands.
+      # Uncomment + wire the secrets (AWS_*, NEMAR_WEBHOOK_TOKEN, callback
+      # URL) at that point. The target S3 key is fixed:
+      #   s3://nemar/<id>/version/v<X.Y.Z>-records.json
+      # --------------------------------------------------------------------
+      - name: Configure AWS credentials (TODO - enable at route cutover)
+        id: aws-creds
+        if: ${{ false }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Upload records.json to S3 (TODO - enable at route cutover)
+        id: upload
+        if: ${{ false }}
+        run: |
+          set -euo pipefail
+          RECORDS_KEY="${DATASET_ID}/version/${TAG}-records.json"
+          aws s3 cp /tmp/out/records.json "s3://${S3_BUCKET}/${RECORDS_KEY}" \
+            --content-type application/json \
+            --region us-east-2
+          echo "RECORDS_URL=https://${S3_BUCKET}.s3.us-east-2.amazonaws.com/${RECORDS_KEY}" >> "$GITHUB_ENV"
