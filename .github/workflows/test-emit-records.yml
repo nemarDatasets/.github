@@ -46,4 +46,8 @@ jobs:
           set -euo pipefail
           mv neuroschema-src "${GITHUB_WORKSPACE}/../neuroschema"
       - name: Run scripts tests
-        run: python scripts/test_emit_records.py
+        run: |
+          python scripts/test_emit_records.py
+          # backfill_records.py is stdlib-only (selection/planning); its test
+          # needs no extra deps.
+          python scripts/test_backfill_records.py
