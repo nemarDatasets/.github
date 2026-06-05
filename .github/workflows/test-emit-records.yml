@@ -1,0 +1,49 @@
+name: Test emit_records
+
+# Runs scripts/test_emit_records.py on PRs touching scripts/.
+# Real-git assertions (no mocks): annex-symlink + git-blob primaries,
+# BIDS sidecar inheritance from root, channels.tsv nchans/type tally,
+# null branches (no sidecar / no channels.tsv / no RecordingDuration),
+# and neuroschema v0.3.0 record validation.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-emit-records.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-emit-records.yml"
+  workflow_dispatch:
+
+jobs:
+  python-unit-test:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install jsonschema (for the neuroschema validation arm)
+        # emit_records.py is stdlib-only; the test's validation arm needs
+        # jsonschema. We install only jsonschema (not the whole neuroschema
+        # package) and point the test at the released schema files vendored
+        # via a shallow neuroschema checkout below.
+        run: python -m pip install --quiet jsonschema
+      - name: Check out neuroschema (released schema for validation arm)
+        uses: actions/checkout@v4
+        with:
+          repository: nemarOrg/neuroschema
+          ref: v0.3.0
+          path: neuroschema-src
+      - name: Stage neuroschema as the test's sibling checkout
+        # test_emit_records.py looks for the schema at ../neuroschema/schema
+        # relative to the repo root (the sibling-checkout layout used locally).
+        run: |
+          set -euo pipefail
+          mv neuroschema-src "${GITHUB_WORKSPACE}/../neuroschema"
+      - name: Run scripts tests
+        run: python scripts/test_emit_records.py
