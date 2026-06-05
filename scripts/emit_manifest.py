@@ -89,6 +89,11 @@ README_INLINE_MAX_BYTES = 256 * 1024
 
 # raw.githubusercontent.com base for the canary HEAD checks.
 RAW_GITHUB_BASE = "https://raw.githubusercontent.com/nemarDatasets"
+# Canonical public data-plane origin for the additive bytes_url (#615). This is
+# a build-time script with no request context, so it emits the canonical host;
+# the served manifest.json mirrors the same shape per-request (nemar-cli
+# backend/src/services/data-router.ts:buildBytesUrl).
+DATA_NEMAR_BASE = "https://data.nemar.org"
 CANARY_TIMEOUT_S = 10
 CANARY_MAX_ADDITIONAL = 4  # +1 for dataset_description.json = 5 total
 
@@ -172,6 +177,21 @@ def extract_algo_from_key(key: str) -> str:
     return m.group(1).lower()
 
 
+def bytes_url_for(dataset_id: str, tag: str, path: str, key: str) -> str:
+    """Stable public contract URL for a file's bytes (#615).
+
+    Additive sibling to `key`/`size`/`checksum`. Unlike a presigned S3 URL it
+    never expires. git-keyed files -> raw.githubusercontent.com pinned to the
+    tag; annex-keyed files -> the per-file data-plane route on data.nemar.org
+    (which 302s to the bytes). Mirrors nemar-cli's served-manifest buildBytesUrl
+    so the raw S3 manifest and the served manifest.json agree.
+    """
+    encoded = "/".join(urllib_quote(seg) for seg in path.split("/"))
+    if key.startswith("git:"):
+        return f"{RAW_GITHUB_BASE}/{dataset_id}/{tag}/{encoded}"
+    return f"{DATA_NEMAR_BASE}/{dataset_id}/{tag}/{encoded}"
+
+
 def build_manifest(
     *,
     dataset_id: str,
@@ -245,6 +265,12 @@ def build_manifest(
                 "size": size,
                 "checksum": f"git:{sha}",
             }
+
+    # Additive bytes_url per entry (#615): a stable, non-expiring contract URL,
+    # derived from the key already on each entry. One pass keeps the three
+    # entry-build sites above focused on the key/size/checksum core.
+    for entry_path, entry in files.items():
+        entry["bytes_url"] = bytes_url_for(dataset_id, tag, entry_path, entry["key"])
 
     # Match JS Date#toISOString(): millisecond precision, trailing Z.
     now = datetime.now(timezone.utc)

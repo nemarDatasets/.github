@@ -165,6 +165,11 @@ class EmitManifestRealGitTests(unittest.TestCase):
         self.assertTrue(meta["key"].startswith("git:"), f"unexpected key={meta['key']}")
         self.assertEqual(meta["checksum"], meta["key"])
         self.assertGreater(meta["size"], 0)
+        # bytes_url for a git-keyed file -> raw.githubusercontent pinned to the tag.
+        self.assertEqual(
+            meta["bytes_url"],
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v0.0.0/dataset_description.json",
+        )
 
     def test_annex_symlink_is_annex_keyed(self):
         meta = self.manifest["files"].get(ANNEX_REL_PATH)
@@ -172,6 +177,11 @@ class EmitManifestRealGitTests(unittest.TestCase):
         self.assertEqual(meta["key"], ANNEX_KEY)
         self.assertEqual(meta["size"], 12345)
         self.assertEqual(meta["checksum"], "sha256:abcdef0123456789")
+        # bytes_url for an annex-keyed file -> the data.nemar.org per-file route.
+        self.assertEqual(
+            meta["bytes_url"],
+            "https://data.nemar.org/nm099999/v0.0.0/sub-01/eeg/sub-01_task-rest_eeg.edf",
+        )
 
     def test_git_internals_excluded(self):
         for path in self.manifest["files"].keys():
