@@ -165,6 +165,11 @@ class EmitManifestRealGitTests(unittest.TestCase):
         self.assertTrue(meta["key"].startswith("git:"), f"unexpected key={meta['key']}")
         self.assertEqual(meta["checksum"], meta["key"])
         self.assertGreater(meta["size"], 0)
+        # bytes_url for a git-keyed file -> raw.githubusercontent pinned to the tag.
+        self.assertEqual(
+            meta["bytes_url"],
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v0.0.0/dataset_description.json",
+        )
 
     def test_annex_symlink_is_annex_keyed(self):
         meta = self.manifest["files"].get(ANNEX_REL_PATH)
@@ -172,6 +177,11 @@ class EmitManifestRealGitTests(unittest.TestCase):
         self.assertEqual(meta["key"], ANNEX_KEY)
         self.assertEqual(meta["size"], 12345)
         self.assertEqual(meta["checksum"], "sha256:abcdef0123456789")
+        # bytes_url for an annex-keyed file -> the data.nemar.org per-file route.
+        self.assertEqual(
+            meta["bytes_url"],
+            "https://data.nemar.org/nm099999/v0.0.0/sub-01/eeg/sub-01_task-rest_eeg.edf",
+        )
 
     def test_git_internals_excluded(self):
         for path in self.manifest["files"].keys():
@@ -973,6 +983,35 @@ class ReadmeNoneSchema11Tests(unittest.TestCase):
 
     def test_schema_version_still_11(self):
         self.assertEqual(self.summary["schema_version"], "1.1")
+
+
+class BytesUrlForUnitTests(unittest.TestCase):
+    """Pure-function coverage of bytes_url_for, incl. per-segment URL-encoding
+    (parity with nemar-cli backend/src/services/data-router.ts buildBytesUrl)."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        import emit_manifest  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+        self.fn = emit_manifest.bytes_url_for
+
+    def test_git_keyed_uses_raw_github(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "dataset_description.json", "git:abc123"),
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v1.0.0/dataset_description.json",
+        )
+
+    def test_annex_keyed_uses_data_nemar(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "sub-01/eeg/sub-01_eeg.edf", "SHA256E-s10--ab.edf"),
+            "https://data.nemar.org/nm099999/v1.0.0/sub-01/eeg/sub-01_eeg.edf",
+        )
+
+    def test_path_segments_url_encoded_slashes_preserved(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "sub-01/eeg/sub-01_task-rest events.tsv", "git:zzz"),
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v1.0.0/sub-01/eeg/sub-01_task-rest%20events.tsv",
+        )
 
 
 if __name__ == "__main__":
