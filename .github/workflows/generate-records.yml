@@ -146,26 +146,23 @@ jobs:
           PY
 
       # --------------------------------------------------------------------
-      # SKELETON / TODO (issue: records route + Worker callback contract):
-      # The emit + validate steps above are production-real. The S3 upload
-      # and the .nemar/records.json commit-back + Worker callback below are
-      # intentionally a documented skeleton until the route/contract lands.
-      # Uncomment + wire the secrets (AWS_*, NEMAR_WEBHOOK_TOKEN, callback
-      # URL) at that point. The target S3 key is fixed:
+      # Upload the records.json snapshot to the per-version S3 key
       #   s3://nemar/<id>/version/v<X.Y.Z>-records.json
+      # served by the data plane's GET /<id>/<version>/records.json route
+      # (nemar-cli #706, epic #615 P2). The .nemar/records.json commit-back
+      # and the Worker "records-ready" callback remain a documented follow-up
+      # (NEMAR_WEBHOOK_TOKEN + callback URL), not wired here yet.
       # --------------------------------------------------------------------
-      - name: Configure AWS credentials (TODO - enable at route cutover)
+      - name: Configure AWS credentials
         id: aws-creds
-        if: ${{ false }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-2
 
-      - name: Upload records.json to S3 (TODO - enable at route cutover)
+      - name: Upload records.json to S3
         id: upload
-        if: ${{ false }}
         run: |
           set -euo pipefail
           RECORDS_KEY="${DATASET_ID}/version/${TAG}-records.json"
