@@ -145,6 +145,10 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      - name: Install biosigIO (Tier-2 duration reader)
+        id: install-biosigio
+        run: python -m pip install --quiet -r scripts/zarr/requirements.txt
+
       # --------------------------------------------------------------------
       # Upload the records.json snapshot to the per-version S3 key
       #   s3://nemar/<id>/version/v<X.Y.Z>-records.json
@@ -160,6 +164,26 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-2
+
+      - name: Patch null durations via biosigIO (Tier-2, best-effort)
+        id: patch-durations
+        run: |
+          set -euo pipefail
+          # For the records whose BIDS sidecar lacked RecordingDuration (Tier-1
+          # left recording_duration null), biosigIO full-reads the recording
+          # (downloaded from S3 via the annex key) to fill duration + ntimes.
+          # Best-effort: an unreadable/unsupported file stays null and does not
+          # fail the run. No re-validate needed -- the patch only writes numbers
+          # into signal_summary's number|null duration/ntimes fields, so it
+          # cannot drift the neuroschema shape.
+          python scripts/patch_duration.py \
+            --records-path /tmp/out/records.json \
+            --dataset-id "$DATASET_ID" \
+            --version "$VERSION" \
+            --repo-dir /tmp/repo
+          echo "--- records.json head (post Tier-2) ---"
+          head -c 1500 /tmp/out/records.json || true
+          echo
 
       - name: Upload records.json to S3
         id: upload

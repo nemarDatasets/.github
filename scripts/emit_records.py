@@ -306,11 +306,10 @@ def build_record(
         sf = None
     dur = sidecar.get("RecordingDuration")
     if not (isinstance(dur, (int, float)) and not isinstance(dur, bool)):
-        # TIER-2 TODO: when the sidecar does not declare RecordingDuration,
-        # backfill it (and ntimes) from the already-converted Zarr store /
-        # biosigIO in the Tier-2 follow-up PR. Tier-1 emits null. Do NOT add
-        # a `duration_source` field -- record/provenance are
-        # additionalProperties:false and reject any extra key.
+        # Tier-1 leaves recording_duration null here; scripts/patch_duration.py
+        # (run after emit, before the S3 upload) fills it via a biosigIO full
+        # read of the recording. Do NOT add a `duration_source` field --
+        # record/provenance are additionalProperties:false and reject extra keys.
         dur = None
 
     # channels.tsv (authoritative for nchans + channel_type_counts), resolved
