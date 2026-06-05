@@ -38,6 +38,11 @@ on:
         required: false
         default: false
         type: boolean
+      callback_url:
+        description: "Callback URL (defaults to api.nemar.org/webhooks/archive-ready)"
+        required: false
+        type: string
+        default: "https://api.nemar.org/webhooks/archive-ready"
 
 jobs:
   archive:
@@ -348,3 +353,68 @@ jobs:
             fi
           fi
           node /tmp/stream-archive.js
+
+      # Mirror of run-generate-zarr.yml's zarr-ready callback. Records the
+      # latest-only archive state on the dataset's D1 row so the observability
+      # dashboard (dashboard.nemar.org/observability) reports archive coverage
+      # live, instead of only after the admin archive-sweep backfill.
+      # (nemarOrg/nemar-cli#695 / #696.)
+      - name: POST callback (archive-ready)
+        id: post-success
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "No callback URL configured; skipping callback POST"
+            exit 0
+          fi
+          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          # The zip is present (just uploaded, or already existed on the
+          # idempotent skip path). Read its size for datasets.archive_size; a
+          # HEAD failure just omits the size (the Worker tolerates a null size).
+          SIZE=$(aws s3api head-object --bucket nemar --key "$KEY" --query ContentLength --output text 2>/dev/null || echo "")
+          if [ -n "$SIZE" ] && [ "$SIZE" != "None" ]; then
+            printf '{"dataset_id":"%s","status":"ready","version":"%s","size":%s}' "$DATASET_ID" "$VERSION" "$SIZE" > /tmp/archive-callback.json
+          else
+            printf '{"dataset_id":"%s","status":"ready","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/archive-callback.json
+          fi
+          # --connect-timeout/--max-time cap a hung Worker. On non-2xx capture the
+          # body so the failure is unambiguous: the zip IS on S3, the Worker
+          # refused the callback (auth, dataset-not-in-D1 -> 404, bad status).
+          HTTP_STATUS=$(curl -sS -o /tmp/archive-callback-response.txt \
+            -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/archive-callback.json) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "::error title=archive-ready callback rejected::Archive uploaded to S3 but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS. NOT an archive failure. Response body follows."
+            cat /tmp/archive-callback-response.txt || true
+            echo
+            exit 1
+          fi
+          echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS, size=${SIZE:-unknown})"
+
+      - name: POST failure callback (best-effort)
+        # Only on a HARD failure (clone/install/stream crash, an incomplete
+        # archive, or the success callback POST itself failing) -- so an
+        # archive that didn't fully build is recorded as 'failed' rather than
+        # silently advertised. Best-effort; tolerate a 404.
+        if: failure() && steps.post-success.outcome != 'success'
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
+        run: |
+          set -euo pipefail
+          printf '{"dataset_id":"%s","status":"failed","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/archive-fail.json
+          curl -sS --connect-timeout 10 --max-time 30 -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/archive-fail.json || true
