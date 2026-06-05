@@ -147,6 +147,13 @@ jobs:
 
       - name: Install biosigIO (Tier-2 duration reader)
         id: install-biosigio
+        # Best-effort: Tier-2 duration fill is optional enrichment, so a
+        # transient pip/PyPI failure must not fail the publish (the patch step
+        # below skips itself when this didn't succeed). Uses `python -m pip`
+        # (as the neuroschema-validate step above does) rather than the sister
+        # zarr workflow's `uv pip`; biosigIO's EDF/BDF/SET/BrainVision path
+        # needs no extra apt deps on ubuntu-latest.
+        continue-on-error: true
         run: python -m pip install --quiet -r scripts/zarr/requirements.txt
 
       # --------------------------------------------------------------------
@@ -169,6 +176,10 @@ jobs:
         id: patch-durations
         run: |
           set -euo pipefail
+          if [ "${{ steps.install-biosigio.outcome }}" != "success" ]; then
+            echo "::warning::biosigIO install failed; skipping Tier-2 duration patch (durations stay null)"
+            exit 0
+          fi
           # For the records whose BIDS sidecar lacked RecordingDuration (Tier-1
           # left recording_duration null), biosigIO full-reads the recording
           # (downloaded from S3 via the annex key) to fill duration + ntimes.

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -75,7 +76,15 @@ def read_duration(
             repo_dir, bucket, dataset_id, relpath, head_files, tag, work
         )
         rec = Recording.from_file(primary_local)
-        return float(rec.get_duration()), int(rec.get_n_samples())
+        dur = float(rec.get_duration())
+        nsamp = int(rec.get_n_samples())
+        if not math.isfinite(dur) or dur <= 0:
+            # A non-finite / non-positive duration would serialize as
+            # spec-violating JSON (json.dumps emits NaN/Infinity, which strict
+            # parsers like JS JSON.parse reject). Treat it as a read failure so
+            # the caller leaves recording_duration null (best-effort).
+            raise ValueError(f"biosigIO returned a non-finite/non-positive duration: {dur!r}")
+        return dur, nsamp
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -161,12 +170,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Best-effort end to end: Tier-2 is optional enrichment, so even a
+    # malformed/unwritable records.json degrades to "leave it as-is" + a
+    # warning rather than failing the publish. (The neuroschema validation
+    # step runs immediately before this, so a valid JSON array is the norm.)
     args = parse_args(argv)
     records_path = Path(args.records_path)
-    records = json.loads(records_path.read_text())
+    try:
+        records = json.loads(records_path.read_text())
+    except Exception as e:  # noqa: BLE001 - best-effort
+        print(
+            f"::warning::[patch_duration] could not read {records_path} ({e}); skipping Tier-2",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
     if not isinstance(records, list):
-        print("::error::[patch_duration] records.json is not a JSON array", file=sys.stderr)
-        return 2
+        print(
+            "::warning::[patch_duration] records.json is not a JSON array; skipping Tier-2",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
 
     filled, gaps = patch_records(
         records,
@@ -175,7 +200,15 @@ def main(argv: list[str] | None = None) -> int:
         dataset_id=args.dataset_id,
         version=args.version,
     )
-    records_path.write_text(json.dumps(records, indent=2))
+    try:
+        records_path.write_text(json.dumps(records, indent=2))
+    except Exception as e:  # noqa: BLE001 - best-effort
+        print(
+            f"::warning::[patch_duration] could not write {records_path} ({e}); Tier-2 changes lost",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
 
     print(
         f"[patch_duration] dataset={args.dataset_id} version={args.version.lstrip('v')} "
