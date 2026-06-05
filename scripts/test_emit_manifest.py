@@ -985,5 +985,34 @@ class ReadmeNoneSchema11Tests(unittest.TestCase):
         self.assertEqual(self.summary["schema_version"], "1.1")
 
 
+class BytesUrlForUnitTests(unittest.TestCase):
+    """Pure-function coverage of bytes_url_for, incl. per-segment URL-encoding
+    (parity with nemar-cli backend/src/services/data-router.ts buildBytesUrl)."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        import emit_manifest  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+        self.fn = emit_manifest.bytes_url_for
+
+    def test_git_keyed_uses_raw_github(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "dataset_description.json", "git:abc123"),
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v1.0.0/dataset_description.json",
+        )
+
+    def test_annex_keyed_uses_data_nemar(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "sub-01/eeg/sub-01_eeg.edf", "SHA256E-s10--ab.edf"),
+            "https://data.nemar.org/nm099999/v1.0.0/sub-01/eeg/sub-01_eeg.edf",
+        )
+
+    def test_path_segments_url_encoded_slashes_preserved(self):
+        self.assertEqual(
+            self.fn("nm099999", "v1.0.0", "sub-01/eeg/sub-01_task-rest events.tsv", "git:zzz"),
+            "https://raw.githubusercontent.com/nemarDatasets/nm099999/v1.0.0/sub-01/eeg/sub-01_task-rest%20events.tsv",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
