@@ -127,17 +127,26 @@ jobs:
           # DeprecationWarning on stderr is harmless and must not fail the step.
           python -m pip install --quiet \
             "neuroschema @ git+https://github.com/nemarOrg/neuroschema@v${NEUROSCHEMA_VERSION}"
+          # neuroschema resolves its SCHEMA_DIR relative to the source tree
+          # (../../../schema), which does not exist under site-packages on a clean
+          # pip install -- the schema/*.json are not packaged as package-data. So
+          # clone the tag for the schema/ dir and pass it via schema_dir explicitly.
+          rm -rf /tmp/neuroschema-src
+          git clone --depth 1 --branch "v${NEUROSCHEMA_VERSION}" \
+            https://github.com/nemarOrg/neuroschema /tmp/neuroschema-src
           python - "/tmp/out/records.json" <<'PY'
           import json
           import sys
+          from pathlib import Path
 
-          from neuroschema.validate import validate_document  # root envelope by default
+          from neuroschema.validate import validate_document
 
+          SCHEMA_DIR = Path("/tmp/neuroschema-src/schema")  # cloned tag's schema/ dir
           docs = json.load(open(sys.argv[1]))
           assert isinstance(docs, list), "records.json must be a JSON array"
           bad = 0
           for i, doc in enumerate(docs):
-              for err in validate_document(doc):  # schema_path=None -> root -> record
+              for err in validate_document(doc, schema_dir=SCHEMA_DIR):  # root -> record
                   bad += 1
                   path = ".".join(str(p) for p in err.absolute_path) or "(root)"
                   print(f"::error::[{i}] {path}: {err.message}")
