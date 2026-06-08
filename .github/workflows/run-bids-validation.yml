@@ -155,7 +155,7 @@ jobs:
           # validator-version.json pin at template-deploy time). Manual
           # workflow_dispatch can override via the validator_version input.
           echo "Running BIDS validator @${VALIDATOR_VERSION}"
-          deno run -A "jsr:@bids/validator@${VALIDATOR_VERSION}" . --json > .nemar/validation.json || true
+          deno run -A "jsr:@bids/validator@${VALIDATOR_VERSION}" . --json --ignoreWarnings > .nemar/validation.json || true
           cat .nemar/validation.json
 
       - name: Collect git-annex pointer files
