@@ -173,9 +173,15 @@ jobs:
         id: result
         run: |
           set -euo pipefail
+          # Markdown error detail surfaced on the dataset-repo check-run
+          # (output[text]) so PR authors can read failures in their own repo's
+          # Checks tab without opening the central run logs. Stays empty unless
+          # real errors are found; the finalize step reads it via --rawfile.
+          : > /tmp/error-details.md
           if [ ! -f .nemar/validation.json ] || ! jq empty .nemar/validation.json 2>/dev/null; then
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             echo "summary=BIDS validator failed to produce valid output" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "The BIDS validator did not produce parseable output. See the linked central run logs for details." > /tmp/error-details.md
             echo "::error::BIDS validator failed to produce valid output"
             exit 0
           fi
@@ -202,6 +208,28 @@ jobs:
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) (skipped $ANNEX_ERRORS annex-pointer error(s))." >> "$GITHUB_OUTPUT"
             echo "::error::BIDS validation found $REAL_ERRORS error(s)"
+            # Build the human-readable error detail (grouped-by-code summary +
+            # capped detail table) for the check-run output[text]. Capped to
+            # stay well under GitHub's 64KB output limit; never fails the step.
+            jq -r --slurpfile annexed /tmp/annex-files.json '
+              [.issues.issues[]
+               | select(.severity == "error")
+               | select(.location as $loc | ($annexed[0] | index($loc)) | not)] as $errs
+              | ($errs | length) as $n
+              | ([$errs[].code] | group_by(.) | map({code: .[0], count: length}) | sort_by(-.count)) as $bycode
+              | "### BIDS validation errors\n\n"
+                + "**\($n) error(s)** across **\($bycode | length) code(s)**:\n\n"
+                + ($bycode[:25] | map("- `\(.code)` x \(.count)") | join("\n"))
+                + (if ($bycode | length) > 25 then "\n- ...and \(($bycode | length) - 25) more code(s)" else "" end)
+                + "\n\n<details><summary>First \([$n, 50] | min) error(s)</summary>\n\n"
+                + "| File | Code | Detail |\n|---|---|---|\n"
+                + ($errs[:50] | map(
+                    "| `\(.location // "-")` | `\(.code)\(if .subCode then " / " + .subCode else "" end)` | \((.issueMessage // "") | gsub("[\n|]"; " ") | .[0:140]) |"
+                  ) | join("\n"))
+                + "\n\n</details>"
+                + (if $n > 50 then "\n\n_...and \($n - 50) more error(s) not shown; full report in the linked central run._" else "" end)
+            ' .nemar/validation.json > /tmp/error-details.md || true
+            # Also echo the raw error objects to the central run log (unchanged).
             jq --slurpfile annexed /tmp/annex-files.json \
               '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | not)][]' \
               .nemar/validation.json
@@ -235,9 +263,19 @@ jobs:
             TITLE="BIDS validation failed"
           fi
           DETAILS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          gh api -X PATCH "repos/nemarDatasets/$DATASET_ID/check-runs/$CHECK_ID" \
-            -f status=completed \
-            -f conclusion="$CONCLUSION" \
-            -f "output[title]=$TITLE" \
-            -f "output[summary]=$SUMMARY"$'\n\n'"[View central run logs]($DETAILS_URL)"
+          FULL_SUMMARY="$SUMMARY"$'\n\n'"[View central run logs]($DETAILS_URL)"
+          # Attach the error detail (built by the result step) as output[text]
+          # so PR authors see the actual errors on this repo's check. Build the
+          # PATCH body as JSON to safely carry multi-line markdown; omit `text`
+          # when empty (e.g. on success). --rawfile needs the file to exist.
+          [ -f /tmp/error-details.md ] || : > /tmp/error-details.md
+          jq -n \
+            --arg conclusion "$CONCLUSION" \
+            --arg title "$TITLE" \
+            --arg summary "$FULL_SUMMARY" \
+            --rawfile text /tmp/error-details.md \
+            '{status: "completed", conclusion: $conclusion,
+              output: ({title: $title, summary: $summary}
+                       + (if ($text | length) > 0 then {text: $text} else {} end))}' \
+            | gh api -X PATCH "repos/nemarDatasets/$DATASET_ID/check-runs/$CHECK_ID" --input -
           echo "Finalized check-run $CHECK_ID -> $CONCLUSION"
