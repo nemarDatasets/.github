@@ -19,10 +19,12 @@ name: Generate Records
 # Artifacts:
 #   s3://nemar/<id>/version/v<X.Y.Z>-records.json   (records.json)
 #
-# emit + validate below are REAL and fully wired. The S3 upload and the
-# .nemar/records.json commit-back + Worker callback are intentionally
-# left as a clearly-marked skeleton/TODO (see the marked steps) pending
-# the route/Worker contract; flip them on once that lands.
+# Fully wired end to end (epic nemarOrg/nemar-cli#736, Phase 5 / #742): emit ->
+# neuroschema-validate -> Tier-2 biosigIO duration patch -> S3 upload ->
+# records-ready callback to api.nemar.org/webhooks/records-ready. Dispatched on
+# publish by run-version-doi.yml's trigger-records job. records.json is an S3
+# artifact served by the data plane (loadRecords); it is NOT committed back to
+# the dataset repo.
 
 on:
   repository_dispatch:
@@ -37,6 +39,11 @@ on:
         description: "Version (X.Y.Z, no leading v)"
         required: true
         type: string
+      callback_url:
+        description: "Callback URL (defaults to api.nemar.org/webhooks/records-ready)"
+        required: false
+        type: string
+        default: "https://api.nemar.org/webhooks/records-ready"
 
 jobs:
   records:
@@ -169,9 +176,9 @@ jobs:
       # Upload the records.json snapshot to the per-version S3 key
       #   s3://nemar/<id>/version/v<X.Y.Z>-records.json
       # served by the data plane's GET /<id>/<version>/records.json route
-      # (nemar-cli #706, epic #615 P2). The .nemar/records.json commit-back
-      # and the Worker "records-ready" callback remain a documented follow-up
-      # (NEMAR_WEBHOOK_TOKEN + callback URL), not wired here yet.
+      # (nemar-cli #706, epic #615 P2), then POST a records-ready callback to
+      # the Worker for observability (epic #736 Phase 5 / #742). records.json is
+      # an S3 artifact, not committed back to the dataset repo.
       # --------------------------------------------------------------------
       - name: Configure AWS credentials
         id: aws-creds
@@ -214,3 +221,60 @@ jobs:
             --content-type application/json \
             --region us-east-2
           echo "RECORDS_URL=https://${S3_BUCKET}.s3.us-east-2.amazonaws.com/${RECORDS_KEY}" >> "$GITHUB_ENV"
+
+      # Tell the Worker the records.json artifact is on S3 so the observability
+      # dashboard reflects records coverage (epic nemarOrg/nemar-cli#736 Phase 5
+      # / #742). Mirror of run-generate-archive.yml's archive-ready callback. The
+      # records.json artifact is served from S3 directly, so this is state-only.
+      - name: POST callback (records-ready)
+        id: post-success
+        if: success()
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "No callback URL configured; skipping callback POST"
+            exit 0
+          fi
+          printf '{"dataset_id":"%s","status":"ready","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/records-callback.json
+          # --connect-timeout/--max-time cap a hung Worker. On non-2xx capture the
+          # body so the failure is unambiguous: records.json IS on S3, the Worker
+          # refused the callback (auth, dataset-not-in-D1 -> 404, bad status).
+          HTTP_STATUS=$(curl -sS -o /tmp/records-callback-response.txt \
+            -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/records-callback.json) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            # Best-effort: records.json IS on S3 and is served from there
+            # directly, so the records-ready callback is observability-only. A
+            # non-2xx (the endpoint not yet deployed during this epic's rollout,
+            # the dataset not in D1, or a transient Worker hiccup) must NOT redden
+            # a successful generation -- unlike archive-ready, whose callback is
+            # strict. Warn so a persistently broken chain is still noticeable.
+            echo "::warning title=records-ready callback non-2xx::records.json uploaded to S3 but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS (observability-only; not failing the run). Response body follows."
+            cat /tmp/records-callback-response.txt || true
+            echo
+            exit 0
+          fi
+          echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS)"
+
+      - name: POST failure callback (best-effort)
+        # Only on a HARD failure (emit/validate/upload crash, or the success
+        # callback POST itself failing) -- records a 'failed' state rather than
+        # silently leaving the prior state. Best-effort; tolerate a 404.
+        if: failure() && steps.post-success.outcome != 'success'
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
+        run: |
+          set -euo pipefail
+          printf '{"dataset_id":"%s","status":"failed","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/records-fail.json
+          curl -sS --connect-timeout 10 --max-time 30 -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
+            --data @/tmp/records-fail.json || true

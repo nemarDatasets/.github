@@ -283,3 +283,40 @@ jobs:
             -f event_type=generate-archive \
             -f "client_payload[dataset_id]=$DATASET_ID" \
             -f "client_payload[version]=$VERSION"
+
+  trigger-records:
+    name: Trigger Records Generation
+    needs: publish-doi
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ needs.publish-doi.outputs.version }}
+    steps:
+      - name: Mint App token scoped to .github
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          # Sibling of trigger-archive: dispatches generate-records on the
+          # central .github repo after the version DOI is published (epic
+          # nemarOrg/nemar-cli#736, Phase 5 / #742). Until now generate-records
+          # was never dispatched on publish, so records.json 404'd for every
+          # dataset. Independent job so a records-dispatch failure doesn't block
+          # the archive dispatch (and vice versa).
+          repositories: .github
+
+      - name: Dispatch records generation
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "Triggering records generation for $DATASET_ID v$VERSION"
+
+          gh api "repos/nemarDatasets/.github/dispatches" \
+            -f event_type=generate-records \
+            -f "client_payload[dataset_id]=$DATASET_ID" \
+            -f "client_payload[version]=$VERSION"
