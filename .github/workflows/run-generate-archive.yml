@@ -362,7 +362,25 @@ jobs:
               echo "::warning::head-object on $KEY returned an unexpected error (rc=$head_rc); proceeding to rebuild. Detail: $head_out"
             fi
           fi
+          # Delete-on-failure (nemarOrg/nemar-cli#739): the streaming script
+          # finalizes whatever it managed to append and completes the multipart
+          # upload BEFORE it exits non-zero on an incomplete build, so a failed
+          # run leaves a partial zip at the canonical key. Combined with the
+          # idempotency guard above, that partial would make every subsequent
+          # dispatch a no-op until a human passes force=true. Remove it on any
+          # non-zero exit so a re-dispatch rebuilds cleanly. The normal publish
+          # path is protected by the skip-if-exists guard (it never overwrites a
+          # good archive); only an explicit force=true rebuild can reach here
+          # with a prior good object, and that is a deliberate recovery action.
+          set +e
           node /tmp/stream-archive.js
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::archive build failed (rc=$rc); removing any partial at s3://nemar/$KEY"
+            aws s3 rm "s3://nemar/$KEY" || true
+            exit "$rc"
+          fi
 
       # Mirror of run-generate-zarr.yml's zarr-ready callback. Records the
       # latest-only archive state on the dataset's D1 row so the observability
