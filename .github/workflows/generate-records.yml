@@ -245,10 +245,16 @@ jobs:
             -H "X-Webhook-Token: ${CALLBACK_TOKEN}" \
             --data @/tmp/records-callback.json) || HTTP_STATUS="000"
           if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
-            echo "::error title=records-ready callback rejected::records.json uploaded to S3 but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS. NOT a generation failure. Response body follows."
+            # Best-effort: records.json IS on S3 and is served from there
+            # directly, so the records-ready callback is observability-only. A
+            # non-2xx (the endpoint not yet deployed during this epic's rollout,
+            # the dataset not in D1, or a transient Worker hiccup) must NOT redden
+            # a successful generation -- unlike archive-ready, whose callback is
+            # strict. Warn so a persistently broken chain is still noticeable.
+            echo "::warning title=records-ready callback non-2xx::records.json uploaded to S3 but the Worker callback at $CALLBACK_URL returned HTTP $HTTP_STATUS (observability-only; not failing the run). Response body follows."
             cat /tmp/records-callback-response.txt || true
             echo
-            exit 1
+            exit 0
           fi
           echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS)"
 
