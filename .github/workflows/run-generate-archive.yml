@@ -175,6 +175,12 @@ jobs:
           // where the publish cascade flipped public moments before this job
           // ran and every annexed blob 403'd against the not-yet-propagated
           // public policy, producing a hollow archive.
+          //
+          // The retry covers connect-time/HTTP errors (throttle, 5xx, 403/404)
+          // since the body is not consumed until after this returns; a mid-
+          // stream I/O error after archiver starts reading resp.Body instead
+          // surfaces on the archive-level "error" handler (sets exitCode 1, job
+          // fails red) rather than the per-file skip path.
           async function getAnnexObject(s3, key) {
             var lastErr;
             for (var attempt = 1; attempt <= 3; attempt++) {
