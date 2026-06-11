@@ -39,6 +39,11 @@ on:
         description: "Version (X.Y.Z, no leading v)"
         required: true
         type: string
+      callback_url:
+        description: "Callback URL (defaults to api.nemar.org/webhooks/records-ready)"
+        required: false
+        type: string
+        default: "https://api.nemar.org/webhooks/records-ready"
 
 jobs:
   records:
@@ -226,7 +231,7 @@ jobs:
         if: success()
         env:
           CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
         run: |
           set -euo pipefail
           if [ -z "$CALLBACK_URL" ]; then
@@ -265,7 +270,7 @@ jobs:
         if: failure() && steps.post-success.outcome != 'success'
         env:
           CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/records-ready' }}
         run: |
           set -euo pipefail
           printf '{"dataset_id":"%s","status":"failed","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/records-fail.json
