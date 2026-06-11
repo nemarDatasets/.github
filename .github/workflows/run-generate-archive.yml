@@ -135,17 +135,15 @@ jobs:
           var fs = require("fs");
           var path = require("path");
           var S3Client = require("@aws-sdk/client-s3").S3Client;
+          var GetObjectCommand = require("@aws-sdk/client-s3").GetObjectCommand;
           var Upload = require("@aws-sdk/lib-storage").Upload;
           var archiver = require("archiver");
           var PassThrough = require("stream").PassThrough;
-          var https = require("https");
-          var http = require("http");
 
           var DATASET_ID = process.env.DATASET_ID;
           var VERSION = process.env.VERSION;
           var BUCKET = "nemar";
           var REGION = process.env.AWS_DEFAULT_REGION || "us-east-2";
-          var S3_BASE = "https://" + BUCKET + ".s3." + REGION + ".amazonaws.com";
 
           function resolveAnnexKey(filePath) {
             try {
@@ -167,24 +165,31 @@ jobs:
             return null;
           }
 
-          function fetchUrl(url) {
-            return new Promise(function (resolve, reject) {
-              var mod = url.indexOf("https") === 0 ? https : http;
-              mod
-                .get(url, function (res) {
-                  if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                    fetchUrl(res.headers.location).then(resolve).catch(reject);
-                    return;
-                  }
-                  if (res.statusCode !== 200) {
-                    res.resume();
-                    reject(new Error("HTTP " + res.statusCode + " for " + url));
-                    return;
-                  }
-                  resolve(res);
-                })
-                .on("error", reject);
-            });
+          // Authenticated S3 read of an annex blob, with a small bounded
+          // backoff for transient cold-start/throttle errors. Using signed
+          // GetObject (the same AWS creds that write the zip) instead of an
+          // anonymous public-URL GET removes the dependency on the dataset's
+          // S3 public-access state: blobs read whether the prefix is public,
+          // private, or mid-propagation right after a publish flip. This is
+          // the bug behind the nm000111 incident (nemarOrg/nemar-cli#736),
+          // where the publish cascade flipped public moments before this job
+          // ran and every annexed blob 403'd against the not-yet-propagated
+          // public policy, producing a hollow archive.
+          async function getAnnexObject(s3, key) {
+            var lastErr;
+            for (var attempt = 1; attempt <= 3; attempt++) {
+              try {
+                return await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+              } catch (e) {
+                lastErr = e;
+                if (attempt < 3) {
+                  await new Promise(function (r) {
+                    setTimeout(r, 500 * attempt);
+                  });
+                }
+              }
+            }
+            throw lastErr;
           }
 
           function walkDir(dir, base) {
@@ -263,9 +268,8 @@ jobs:
                   archive.once("error", reject);
                 });
                 if (annexKey) {
-                  var url = S3_BASE + "/" + DATASET_ID + "/objects/" + encodeURIComponent(annexKey);
-                  var stream = await fetchUrl(url);
-                  archive.append(stream, { name: rel });
+                  var resp = await getAnnexObject(s3, DATASET_ID + "/objects/" + annexKey);
+                  archive.append(resp.Body, { name: rel });
                 } else {
                   archive.append(fs.createReadStream(full), { name: rel });
                 }
