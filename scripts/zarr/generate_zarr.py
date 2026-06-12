@@ -57,6 +57,16 @@ INDEX_FORMAT_VERSION = 1
 # NEMAR caps are visible/auditable here rather than implied by the library.
 MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
 
+# Large recordings are converted with biosigIO's STREAMING path (bounded RAM)
+# instead of the in-memory `Recording.from_file -> to_zarr`, which loads the whole
+# recording at float64 2-3x and OOMs on multi-GB iEEG/MEG (e.g. nm000253's 18 GB
+# BrainVision recordings). Gated on (a) size and (b) an MNE-native format, so the
+# streamed read matches the in-memory reader for that format exactly (BrainVision/
+# FIF both go through MNE either way); EDF/EEGLAB stay on the in-memory path.
+# Requires biosigio>=1.1.5. Threshold is env-overridable for the Hallu cron.
+STREAM_MIN_BYTES = int(os.environ.get("ZARR_STREAM_MIN_BYTES", str(2 * 1024**3)))
+STREAM_EXTS = (".vhdr", ".fif")
+
 # The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
 # by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
 # EOG/REF/trigger channels ride along; biosigIO's EEGLAB importer can only see an
@@ -766,6 +776,26 @@ def event_descriptions_for(
     return result
 
 
+def _recording_size_bytes(primary_local: str) -> int:
+    """On-disk size of a recording: its primary file + same-stem companions
+    (`.eeg`/`.vmrk` for BrainVision; FIF is single-file). Drives the streaming
+    decision -- the bulk lives in the `.eeg` companion, not the tiny `.vhdr`."""
+    d = os.path.dirname(primary_local) or "."
+    stem = filename_stem(primary_local)
+    total = 0
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return 0
+    for fn in entries:
+        if os.path.splitext(fn)[0] == stem:
+            try:
+                total += os.path.getsize(os.path.join(d, fn))
+            except OSError:
+                pass
+    return total
+
+
 def convert_recording(
     primary_local: str,
     events_local: str | None,
@@ -774,25 +804,49 @@ def convert_recording(
     value_descriptions: dict[str, str] | None = None,
     electrode_positions: dict | None = None,
 ) -> None:
-    from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
-
-    # mixed_rate="resample": a Zarr store is a derived serving copy (viewing + ML),
-    # not the authoritative recording, so for a mixed-sampling-rate EDF/BDF (e.g.
-    # polysomnography: EEG ~200 Hz + SpO2 ~12.5 Hz) upsample the slow channels onto
-    # the fastest channel's grid rather than failing the conversion. biosigIO
-    # defaults to "error" everywhere else so no one gets resampled data unknowingly
-    # (requires biosigio>=1.1.4; ignored for non-EDF formats). See nemar-cli#737.
-    rec = Recording.from_file(primary_local, mixed_rate="resample")
-    if events_local and os.path.exists(events_local):
-        bids.apply_events_tsv(rec, events_local)
-    # Suffix-driven modality: group + resample the whole recording by its BIDS
-    # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
-    # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
     modality = bids_suffix_modality(primary_local)
-    if modality:
-        for label in rec.channels:
-            rec.channels[label]["modality"] = modality
-    rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
+    # Large MNE-native recordings (multi-GB iEEG/MEG) use the streaming converter so
+    # peak RAM stays bounded; the in-memory path below would load them at float64 2-3x
+    # and OOM. Both paths read BrainVision/FIF through MNE, so the output matches.
+    if lower_ext(primary_local) in STREAM_EXTS and _recording_size_bytes(primary_local) > STREAM_MIN_BYTES:
+        from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
+        from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
+
+        events_df = (
+            read_events_tsv(events_local)
+            if events_local and os.path.exists(events_local)
+            else None
+        )
+        stream_to_zarr(
+            primary_local,
+            store_path,
+            force_modality=modality,
+            modality_rates=MODALITY_RATES,
+            dtype="int16",
+            events_df=events_df,
+            # Keep the temp channel-major memmap on the same (fast) scratch volume as
+            # the store; it is a sibling temp dir, not synced to S3.
+            scratch_dir=os.path.dirname(store_path) or None,
+        )
+    else:
+        from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
+
+        # mixed_rate="resample": a Zarr store is a derived serving copy (viewing + ML),
+        # not the authoritative recording, so for a mixed-sampling-rate EDF/BDF (e.g.
+        # polysomnography: EEG ~200 Hz + SpO2 ~12.5 Hz) upsample the slow channels onto
+        # the fastest channel's grid rather than failing the conversion. biosigIO
+        # defaults to "error" everywhere else so no one gets resampled data unknowingly
+        # (requires biosigio>=1.1.4; ignored for non-EDF formats). See nemar-cli#737.
+        rec = Recording.from_file(primary_local, mixed_rate="resample")
+        if events_local and os.path.exists(events_local):
+            bids.apply_events_tsv(rec, events_local)
+        # Suffix-driven modality: group + resample the whole recording by its BIDS
+        # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
+        # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
+        if modality:
+            for label in rec.channels:
+                rec.channels[label]["modality"] = modality
+        rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
     if power_line_frequency is not None:
         embed_root_attr(store_path, "power_line_frequency", power_line_frequency)
     if value_descriptions:

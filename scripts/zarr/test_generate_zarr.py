@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
+    _recording_size_bytes,
     affected_primaries,
     bids_suffix_modality,
     compute_worklist,
@@ -895,6 +896,31 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
+
+
+class TestRecordingSizeBytes(unittest.TestCase):
+    """Streaming gate sizing: primary + same-stem companions, not the whole dir."""
+
+    def test_sums_primary_and_same_stem_companions(self):
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "sub-01", "ieeg")
+            os.makedirs(sub)
+            stem = "sub-01_task-movie_ieeg"
+            # BrainVision triplet: the bulk lives in the .eeg companion.
+            with open(os.path.join(sub, f"{stem}.vhdr"), "wb") as fh:
+                fh.write(b"x" * 100)
+            with open(os.path.join(sub, f"{stem}.eeg"), "wb") as fh:
+                fh.write(b"y" * 5000)
+            with open(os.path.join(sub, f"{stem}.vmrk"), "wb") as fh:
+                fh.write(b"z" * 50)
+            # A different recording in the same dir must NOT be counted.
+            with open(os.path.join(sub, "sub-01_task-rest_ieeg.eeg"), "wb") as fh:
+                fh.write(b"q" * 9999)
+            primary = os.path.join(sub, f"{stem}.vhdr")
+            self.assertEqual(_recording_size_bytes(primary), 100 + 5000 + 50)
+
+    def test_missing_dir_returns_zero(self):
+        self.assertEqual(_recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 0)
 
 
 if __name__ == "__main__":
