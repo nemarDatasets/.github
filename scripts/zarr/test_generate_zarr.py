@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
     _recording_size_bytes,
     affected_primaries,
+    annex_key_size,
     bids_suffix_modality,
     compute_worklist,
     ctf_ds_of,
@@ -1188,6 +1189,30 @@ class TestSplitFif(unittest.TestCase):
             affected_primaries("sub-03/meg/sub-03_task-x_split-02_meg.fif", bd, m2h),
             {"sub-03/meg/sub-03_task-x_split-01_meg.fif"},
         )
+
+
+class TestAnnexKeySize(unittest.TestCase):
+    """The `-s<N>` size the download integrity check verifies a blob against."""
+
+    def test_sha256e_size(self):
+        self.assertEqual(
+            annex_key_size("SHA256E-s628291820--64135e784fc1.con"), 628291820
+        )
+
+    def test_md5e_size(self):
+        self.assertEqual(annex_key_size("MD5E-s12345--abcdef.edf"), 12345)
+
+    def test_large_eeg_size(self):
+        # The kind of >10 GB BrainVision blob that truncates without the check.
+        self.assertEqual(
+            annex_key_size("SHA256E-s12582746496--7ee1f5a2.eeg"), 12582746496
+        )
+
+    def test_no_size_field_returns_none(self):
+        self.assertIsNone(annex_key_size("URL--https://example.org/x.edf"))
+        self.assertIsNone(annex_key_size("WORM--whatever"))
+        self.assertIsNone(annex_key_size(None))
+        self.assertIsNone(annex_key_size(""))
 
 
 if __name__ == "__main__":

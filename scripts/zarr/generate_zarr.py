@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -580,11 +581,79 @@ def validate_store(store_local: str) -> None:
         raise RuntimeError(f"biosigIO wrote no zarr.json at {store_local}; store is empty/partial")
 
 
+_AWS_RETRIES = int(os.environ.get("ZARR_AWS_RETRIES", "4"))
+# Bound every aws transfer so a stuck TCP read can't hang a worker (or the whole
+# run) indefinitely -- a wedged `aws s3 rm --recursive` once sat at 0% CPU for an
+# hour. The read timeout is per-chunk, so it never trips a legitimately slow
+# multi-GB transfer; a genuine stall fails fast and the caller's loop retries.
+_AWS_TIMEOUTS = ["--cli-connect-timeout", "30", "--cli-read-timeout", "300"]
+
+
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
     # --only-show-errors drops the per-file transfer progress meter; with JOBS
     # workers each streaming a ~100 MB blob, that meter otherwise floods the cron
-    # log to the point of uselessness.
-    subprocess.run(["aws", "s3", "cp", src, dst, "--only-show-errors", *(extra or [])], check=True)
+    # log to the point of uselessness. Retry with backoff: under JOBS-way
+    # parallelism the AWS CLI intermittently fails a transfer (a vanished
+    # multipart temp -> rename ENOENT, a throttled connection), which `check=True`
+    # would otherwise surface as a hard per-recording failure.
+    cmd = ["aws", "s3", "cp", src, dst, "--only-show-errors", *_AWS_TIMEOUTS, *(extra or [])]
+    last: Exception | None = None
+    for attempt in range(1, _AWS_RETRIES + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            last = exc
+            if attempt < _AWS_RETRIES:
+                time.sleep(min(2**attempt, 30))
+    raise RuntimeError(f"aws s3 cp {src} -> {dst} failed after {_AWS_RETRIES} attempts: {last}")
+
+
+def annex_key_size(key: str | None) -> int | None:
+    """Byte size a git-annex SHA256E/MD5E key declares in its ``-s<N>`` field
+    (``SHA256E-s628291820--<hash>.con`` -> ``628291820``). ``None`` when the key
+    carries no size (e.g. a URL/WORM key)."""
+    m = re.search(r"-s(\d+)", key or "")
+    return int(m.group(1)) if m else None
+
+
+def download_blob(src: str, dst: str, expected_size: int | None) -> None:
+    """Download an annex blob to ``dst`` robustly: a unique temp + atomic rename
+    + size check against the key's declared size, retried with backoff.
+
+    Large MEG/iEEG blobs (KIT ``.con`` ~1 GB, BrainVision ``.eeg`` >10 GB, split
+    FIF >2 GB) intermittently arrive truncated under JOBS-way parallelism, which
+    then surfaces downstream as ``not EDF compliant (Filesize)`` or a split chain
+    that can't read its next file. A short/zero copy must never reach the reader:
+    verify the byte count, and on any mismatch/transfer error drop the temp and
+    retry rather than convert a corrupt file into a wrong store.
+    """
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    last: Exception | None = None
+    for attempt in range(1, _AWS_RETRIES + 1):
+        tmp = f"{dst}.part.{os.getpid()}.{attempt}"
+        try:
+            subprocess.run(
+                ["aws", "s3", "cp", src, tmp, "--only-show-errors", *_AWS_TIMEOUTS],
+                check=True,
+            )
+            got = os.path.getsize(tmp)
+            if expected_size is not None and got != expected_size:
+                raise RuntimeError(
+                    f"truncated download: got {got} of {expected_size} bytes"
+                )
+            os.replace(tmp, dst)
+            return
+        except Exception as exc:  # noqa: BLE001 - any failure -> drop temp + retry
+            last = exc
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            if attempt < _AWS_RETRIES:
+                time.sleep(min(2**attempt, 30))
+    raise RuntimeError(f"download {src} -> {dst} failed after {_AWS_RETRIES} attempts: {last}")
 
 
 def s3_read_json(bucket: str, key: str) -> dict | None:
@@ -636,7 +705,7 @@ def _fetch_blob(
         key = parse_annex_key(blob.decode("utf-8", "replace"))
     os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
     if key:
-        aws_cp(f"s3://{bucket}/{dataset_id}/objects/{key}", local)
+        download_blob(f"s3://{bucket}/{dataset_id}/objects/{key}", local, annex_key_size(key))
     else:
         with open(local, "wb") as fh:
             fh.write(blob)
@@ -1270,11 +1339,18 @@ def main() -> int:
     # the convert loop then re-uploads every store into the emptied prefix.
     if args.clean and convert:
         print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
-        subprocess.run(
-            ["aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
-             "--recursive", "--only-show-errors"],
-            check=True,
-        )
+        rm_cmd = [
+            "aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
+            "--recursive", "--only-show-errors", *_AWS_TIMEOUTS,
+        ]
+        for attempt in range(1, _AWS_RETRIES + 1):
+            try:
+                subprocess.run(rm_cmd, check=True)
+                break
+            except subprocess.CalledProcessError:
+                if attempt == _AWS_RETRIES:
+                    raise
+                time.sleep(min(2**attempt, 30))
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
