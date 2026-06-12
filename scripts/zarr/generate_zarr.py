@@ -776,7 +776,13 @@ def convert_recording(
 ) -> None:
     from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
-    rec = Recording.from_file(primary_local)
+    # mixed_rate="resample": a Zarr store is a derived serving copy (viewing + ML),
+    # not the authoritative recording, so for a mixed-sampling-rate EDF/BDF (e.g.
+    # polysomnography: EEG ~200 Hz + SpO2 ~12.5 Hz) upsample the slow channels onto
+    # the fastest channel's grid rather than failing the conversion. biosigIO
+    # defaults to "error" everywhere else so no one gets resampled data unknowingly
+    # (requires biosigio>=1.1.4; ignored for non-EDF formats). See nemar-cli#737.
+    rec = Recording.from_file(primary_local, mixed_rate="resample")
     if events_local and os.path.exists(events_local):
         bids.apply_events_tsv(rec, events_local)
     # Suffix-driven modality: group + resample the whole recording by its BIDS

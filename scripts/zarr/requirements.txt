@@ -8,4 +8,4 @@
 #
 # Extras: [zarr] -> zarr v3 store writer/reader; [meg] -> mne (.fif + BrainVision
 # .vhdr importers). Core biosigIO covers .set/.fdt/.edf/.bdf.
-biosigio[zarr,meg]>=1.1.2
+biosigio[zarr,meg]>=1.1.4
