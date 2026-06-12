@@ -1018,8 +1018,12 @@ class TestRecordingSizeBytes(unittest.TestCase):
             primary = os.path.join(sub, f"{stem}.vhdr")
             self.assertEqual(_recording_size_bytes(primary), 100 + 5000 + 50)
 
-    def test_missing_dir_returns_zero(self):
-        self.assertEqual(_recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 0)
+    def test_unreadable_dir_forces_streaming(self):
+        # A listdir failure must NOT read as size 0 (which would misroute a large
+        # recording to the OOM-prone in-memory path); it forces the streaming path.
+        self.assertGreater(
+            _recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 2 * 1024**3
+        )
 
 
 if __name__ == "__main__":

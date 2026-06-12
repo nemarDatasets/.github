@@ -541,12 +541,25 @@ def _materialize_ctf(
         rel = path[len(ds_path) + 1 :]  # path relative to the `.ds` dir
         found, _ = _fetch_blob(repo_dir, bucket, dataset_id, path, head, os.path.join(local_ds, rel))
         if not found:
-            print(f"::warning::CTF file {path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
+            # Every inner file came from `ls-tree head`; a missing one means a real
+            # tree/pack desync. A `.ds` is read as a whole (read_raw_ctf needs the
+            # `.meg4` + headers), and we cannot tell a mandatory file from an
+            # optional sidecar, so FAIL rather than convert a partial recording into
+            # a wrong store that would then `aws s3 sync --delete` over a good one.
+            raise RuntimeError(
+                f"CTF file {path!r} absent from ls-tree {head[:8]}; refusing to convert a "
+                "partial .ds recording"
+            )
     events_path = events_sibling_for(ds_path)
     events_local = None
     if events_path in head_files:
         events_local = os.path.join(work_dir, os.path.basename(events_path))
-        _fetch_blob(repo_dir, bucket, dataset_id, events_path, head, events_local)
+        found, _ = _fetch_blob(repo_dir, bucket, dataset_id, events_path, head, events_local)
+        if not found:
+            # Sidecar tracked at HEAD but unfetchable -> don't claim a phantom path
+            # (downstream would silently embed no events); warn and drop it.
+            print(f"::warning::CTF events {events_path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
+            events_local = None
     return local_ds, events_local, None
 
 
@@ -883,16 +896,31 @@ def _recording_size_bytes(primary_local: str) -> int:
     """On-disk size of a recording: its primary file + same-stem companions
     (`.eeg`/`.vmrk` for BrainVision; FIF is single-file), or every file under a CTF
     `.ds` directory. Drives the streaming decision -- the bulk lives in the `.eeg`
-    companion / `.meg4`, not the tiny `.vhdr` / `.ds` header files."""
+    companion / `.meg4`, not the tiny `.vhdr` / `.ds` header files.
+
+    On any stat/listing error this returns a value that FORCES the (bounded-memory)
+    streaming path rather than an undercount/zero, which would misroute a large
+    recording to the OOM-prone in-memory path. Only MNE-native exts reach streaming,
+    so over-forcing a small file there is at worst slower, never wrong."""
+    force = 1 << 62  # exceeds any real STREAM_MIN_BYTES -> routes to streaming
     # CTF `.ds` recording: sum the whole directory tree.
     if os.path.isdir(primary_local):
+        errored = False
+
+        def _onerr(_exc: OSError) -> None:
+            nonlocal errored
+            errored = True
+
         total = 0
-        for root, _dirs, files in os.walk(primary_local):
+        for root, _dirs, files in os.walk(primary_local, onerror=_onerr):
             for fn in files:
                 try:
                     total += os.path.getsize(os.path.join(root, fn))
                 except OSError:
-                    pass
+                    errored = True
+        if errored:
+            print(f"::warning::could not fully stat CTF dir {primary_local!r}; forcing streaming", flush=True)
+            return force
         return total
     d = os.path.dirname(primary_local) or "."
     stem = filename_stem(primary_local)
@@ -900,13 +928,15 @@ def _recording_size_bytes(primary_local: str) -> int:
     try:
         entries = os.listdir(d)
     except OSError:
-        return 0
+        print(f"::warning::could not list {d!r}; forcing streaming", flush=True)
+        return force
     for fn in entries:
         if os.path.splitext(fn)[0] == stem:
             try:
                 total += os.path.getsize(os.path.join(d, fn))
             except OSError:
-                pass
+                print(f"::warning::could not stat {fn!r}; forcing streaming", flush=True)
+                return force
     return total
 
 
