@@ -118,6 +118,83 @@ def entities_base(stem: str) -> str:
     return stem.rsplit("_", 1)[0] if "_" in stem else stem
 
 
+# --- BIDS split recordings (multi-file FIF) ------------------------------
+#
+# MNE writes a recording larger than the FIF 2 GB limit as a chain of files
+# `..._split-01_<suffix>.fif`, `..._split-02_<suffix>.fif`, ...; the first file
+# holds the header and a pointer to the next, so `read_raw_fif(split-01)` follows
+# the chain and returns the WHOLE recording. The other splits are not standalone
+# recordings -- reading one in isolation yields only its segment. So a split group
+# is ONE logical recording: the lowest-index split is the chain head (the only
+# buildable primary), every split must be materialised together for MNE to follow
+# the chain, and exactly one store is written (keyed at the head split's path).
+_SPLIT_RE = re.compile(r"_split-(\d+)")
+
+
+def split_index(path: str) -> int | None:
+    """Numeric `split-NN` entity of a BIDS split file (`..._split-02_meg.fif` -> 2),
+    or None when the path carries no `split-` entity."""
+    m = _SPLIT_RE.search(os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
+def _strip_split(stem: str) -> str:
+    """Remove the `_split-NN` entity token from a stem (no-op when absent)."""
+    return _SPLIT_RE.sub("", stem, count=1)
+
+
+def is_split_fif(path: str) -> bool:
+    """True for a FIF recording carrying a `split-` entity (the only ext where the
+    split chain matters; other formats are single-file)."""
+    return lower_ext(path) == ".fif" and split_index(path) is not None
+
+
+def split_group_key(path: str) -> str:
+    """Identity of the logical recording a split file belongs to: its path with the
+    `_split-NN` entity removed. `sub-03/meg/sub-03_task-x_split-02_meg.fif` ->
+    `sub-03/meg/sub-03_task-x_meg.fif`. A non-split path returns unchanged."""
+    d = os.path.dirname(path)
+    base = _SPLIT_RE.sub("", os.path.basename(path), count=1)
+    return f"{d}/{base}" if d else base
+
+
+def split_heads_and_members(primaries: list[str]) -> tuple[set[str], dict[str, str]]:
+    """Partition primaries into buildable heads + a non-head-split -> head map.
+
+    `heads` is every primary that should build a store: non-split primaries
+    verbatim, plus the lowest-index split of each FIF split group. `member_to_head`
+    maps each NON-head split to its head, so a change to any split rebuilds the one
+    head store. A degenerate group whose `split-01` is absent picks the lowest
+    present split as head (best-effort; MNE then reads from there)."""
+    groups: dict[str, list[str]] = {}
+    heads: set[str] = set()
+    for p in primaries:
+        if is_split_fif(p):
+            groups.setdefault(split_group_key(p), []).append(p)
+        else:
+            heads.add(p)
+    member_to_head: dict[str, str] = {}
+    for members in groups.values():
+        ordered = sorted(members, key=lambda x: (split_index(x), x))
+        head = ordered[0]
+        heads.add(head)
+        for m in ordered[1:]:
+            member_to_head[m] = head
+    return heads, member_to_head
+
+
+def split_members_for(primary_path: str, head_files: set[str]) -> list[str]:
+    """Every FIF split that shares `primary_path`'s split group, sorted by index
+    (includes the head). `[]` when `primary_path` is not a split file. Used to (a)
+    materialise the whole chain and (b) record the member list on the index entry so
+    the browser can resolve any split file to the one store."""
+    if not is_split_fif(primary_path):
+        return []
+    gkey = split_group_key(primary_path)
+    members = [p for p in head_files if is_split_fif(p) and split_group_key(p) == gkey]
+    return sorted(members, key=lambda x: (split_index(x), x))
+
+
 def store_rel_for(primary_path: str) -> str:
     """`sub-01/eeg/sub-01_task-x_eeg.set` -> `sub-01/eeg/sub-01_task-x_eeg.zarr`.
 
@@ -170,9 +247,13 @@ def events_sibling_for(primary_path: str) -> str:
     """BIDS events sidecar path for a recording (suffix `_events`, ext `.tsv`).
 
     `sub-01/eeg/sub-01_task-x_eeg.set` -> `sub-01/eeg/sub-01_task-x_events.tsv`.
+
+    The `split-NN` entity is dropped (a split FIF recording shares one events file
+    without it): `sub-03/meg/sub-03_task-x_split-01_meg.fif` ->
+    `sub-03/meg/sub-03_task-x_events.tsv`.
     """
     d = os.path.dirname(primary_path)
-    base = entities_base(filename_stem(primary_path))
+    base = _strip_split(entities_base(filename_stem(primary_path)))
     name = f"{base}_events.tsv"
     return f"{d}/{name}" if d else name
 
@@ -260,18 +341,29 @@ def power_line_frequency_for(
     return plf
 
 
-def affected_primaries(changed_path: str, primaries_by_dir: dict[str, list[str]]) -> set[str]:
-    """Primary recordings a changed path rebuilds, restricted to those at HEAD.
+def affected_primaries(
+    changed_path: str,
+    primaries_by_dir: dict[str, list[str]],
+    member_to_head: dict[str, str] | None = None,
+) -> set[str]:
+    """Buildable head primaries a changed path rebuilds, restricted to those at HEAD.
 
-    A primary maps to itself; a companion (`.fdt`/`.eeg`/`.vmrk`) maps to the
-    same-stem primary in its directory; a `*_events.tsv` maps to every primary
-    in its directory sharing the events entities-base (handles a single events
-    file shared across modality recordings in the same folder).
+    A head primary maps to itself; a non-head split FIF maps to its group head (via
+    `member_to_head`), so editing any split rebuilds the one store; a companion
+    (`.fdt`/`.eeg`/`.vmrk`) maps to the same-stem primary in its directory; a
+    `*_events.tsv` maps to every primary in its directory sharing the events
+    entities-base (the `split-NN` entity is ignored on both sides, since a split
+    recording's events file carries no split). `primaries_by_dir` holds only
+    buildable heads, so a non-head split is not in `here`.
     """
     d = os.path.dirname(changed_path)
     here = primaries_by_dir.get(d, [])
     if is_primary(changed_path):
-        return {changed_path} if changed_path in here else set()
+        if changed_path in here:
+            return {changed_path}
+        # A non-head split (not itself buildable) rebuilds its group head.
+        head = (member_to_head or {}).get(changed_path)
+        return {head} if head in here else set()
     ext = lower_ext(changed_path)
     if ext in COMPANION_EXTS:
         stem = filename_stem(changed_path)
@@ -279,7 +371,8 @@ def affected_primaries(changed_path: str, primaries_by_dir: dict[str, list[str]]
     if is_events_tsv(changed_path):
         ev_stem = filename_stem(changed_path)  # `sub-01_task-x_events`
         ev_base = ev_stem[: -len("_events")] if ev_stem.endswith("_events") else entities_base(ev_stem)
-        return {p for p in here if entities_base(filename_stem(p)) == ev_base}
+        ev_base = _strip_split(ev_base)
+        return {p for p in here if _strip_split(entities_base(filename_stem(p))) == ev_base}
     return set()
 
 
@@ -300,16 +393,23 @@ def compute_worklist(
     # CTF `.ds` recordings are directories derived from the files under them, not
     # tracked paths, so they are buildable primaries alongside the file primaries.
     ctf_dirs = ctf_ds_recordings(head_files)
+    # Collapse FIF split groups to their chain head: only the head builds a store,
+    # and a change to any split routes to that head (member_to_head).
+    heads, member_to_head = split_heads_and_members(primaries)
     by_dir: dict[str, list[str]] = {}
-    for p in primaries:
+    for p in heads:
         by_dir.setdefault(os.path.dirname(p), []).append(p)
-    all_primaries = sorted([*primaries, *ctf_dirs])
+    all_primaries = sorted([*heads, *ctf_dirs])
 
     if full:
         return all_primaries, []
 
     convert: set[str] = set()
     remove: set[str] = set()
+    # Deleted splits are resolved per split GROUP after the loop: a split file gone
+    # from HEAD is no longer in `member_to_head` (which is built from HEAD), so it
+    # can't route through it. Group by split_group_key and decide once per group.
+    deleted_split_groups: dict[str, list[str]] = {}
     for status, path in diff_entries:
         # A change anywhere inside a CTF `.ds` is a change to that one recording.
         ds = ctf_ds_of(path)
@@ -320,17 +420,39 @@ def compute_worklist(
                 remove.add(store_rel_for(ds))
             continue
         if status == "D":
-            if is_primary(path):
-                # The recording itself is gone -> drop its store. (If a same-name
-                # primary somehow still exists at HEAD it lands in convert below.)
+            if is_split_fif(path):
+                deleted_split_groups.setdefault(split_group_key(path), []).append(path)
+            elif is_primary(path):
+                # A buildable recording is gone -> drop its store. (If a same-name
+                # primary still exists at HEAD it lands in convert below.)
                 if path not in head_set:
                     remove.add(store_rel_for(path))
             else:
                 # A companion/events removal still rebuilds any sibling recording
                 # that remains (e.g. events.tsv deleted -> regenerate without events).
-                convert |= affected_primaries(path, by_dir)
+                convert |= affected_primaries(path, by_dir, member_to_head)
         else:  # "A", "M", "T", ...
-            convert |= affected_primaries(path, by_dir)
+            convert |= affected_primaries(path, by_dir, member_to_head)
+
+    # Per deleted split group: if any split still exists at HEAD, re-read the chain
+    # (rebuild its head); otherwise the whole recording is gone -> drop the store,
+    # which was keyed at the group's head (lowest split index seen for the group).
+    for gkey, deleted in deleted_split_groups.items():
+        head_here = next(
+            (h for h in heads if is_split_fif(h) and split_group_key(h) == gkey), None
+        )
+        # All entries are split FIFs, so split_index is never None here (-1 is an
+        # unreachable fallback that only quiets the type checker).
+        old_lowest = min(deleted, key=lambda x: (split_index(x) or 0, x))
+        if head_here is not None:
+            convert.add(head_here)
+            # If the deletion reaches below the surviving head, the group's head
+            # index shifted up (old head removed): drop its now-orphaned store. The
+            # `remove -= convert_stores` guard below protects a rebuilt store.
+            if (split_index(old_lowest) or -1) < (split_index(head_here) or -1):
+                remove.add(store_rel_for(old_lowest))
+        else:
+            remove.add(store_rel_for(old_lowest))
 
     present = head_set | ctf_dirs  # a `.ds` dir is "present" when it has files at HEAD
     convert &= present  # never convert something not present at HEAD
@@ -590,8 +712,13 @@ def materialize_recording(
         for p in head_files
         if os.path.dirname(p) == d and filename_stem(p) == stem
     ]
+    # For a split FIF, pull every split in the group (read_raw_fif(split-01) follows
+    # the chain on disk; without split-02.. present the head read raises). Their
+    # basenames are distinct, so they land beside the head under their BIDS names
+    # and MNE resolves the chain. [] for non-split recordings.
+    split_members = split_members_for(primary_path, head_files)
     events_path = events_sibling_for(primary_path)
-    wanted = list(dict.fromkeys([primary_path, *siblings]))
+    wanted = list(dict.fromkeys([primary_path, *siblings, *split_members]))
     if events_path in head_files:
         wanted.append(events_path)
 
@@ -1066,6 +1193,11 @@ def convert_one(primary: str) -> dict:
             "updated_utc": c["updated"],
             **meta,
         }
+        # For a split FIF, record all member source paths so the browser can map any
+        # split file (e.g. a click on split-02) to this single head store.
+        members = split_members_for(primary, c["head_files"])
+        if members:
+            entry["split_members"] = members
         return {"ok": True, "primary": primary, "entry": entry}
     except Exception as exc:  # noqa: BLE001 - isolate one bad recording
         return {"ok": False, "primary": primary, "error": str(exc)}

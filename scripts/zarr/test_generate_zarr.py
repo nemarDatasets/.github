@@ -36,11 +36,16 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     events_sibling_for,
     is_ctf_ds,
     is_primary,
+    is_split_fif,
     materialize_local,
     merge_index,
     parse_annex_key,
     power_line_frequency_for,
     safe_store_prefix,
+    split_group_key,
+    split_heads_and_members,
+    split_index,
+    split_members_for,
     store_rel_for,
 )
 
@@ -83,6 +88,13 @@ class TestPathClassification(unittest.TestCase):
         self.assertEqual(
             events_sibling_for("sub-02/emg/sub-02_task-rest_run-1_emg.edf"),
             "sub-02/emg/sub-02_task-rest_run-1_events.tsv",
+        )
+
+    def test_events_sibling_for_split_fif_drops_split_entity(self):
+        # A split recording shares one events file without the split- entity.
+        self.assertEqual(
+            events_sibling_for("sub-03/meg/sub-03_task-x_run-02_split-01_meg.fif"),
+            "sub-03/meg/sub-03_task-x_run-02_events.tsv",
         )
 
 
@@ -1023,6 +1035,158 @@ class TestRecordingSizeBytes(unittest.TestCase):
         # recording to the OOM-prone in-memory path); it forces the streaming path.
         self.assertGreater(
             _recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 2 * 1024**3
+        )
+
+
+class TestSplitFif(unittest.TestCase):
+    """Multi-file FIF split recordings collapse to one head store."""
+
+    def test_split_index_and_group_key(self):
+        p1 = "sub-03/meg/sub-03_task-x_run-02_split-01_meg.fif"
+        p2 = "sub-03/meg/sub-03_task-x_run-02_split-02_meg.fif"
+        self.assertEqual(split_index(p1), 1)
+        self.assertEqual(split_index(p2), 2)
+        self.assertIsNone(split_index("sub-03/meg/sub-03_task-x_run-02_meg.fif"))
+        # Both splits resolve to the same group key (split entity removed).
+        self.assertEqual(split_group_key(p1), "sub-03/meg/sub-03_task-x_run-02_meg.fif")
+        self.assertEqual(split_group_key(p1), split_group_key(p2))
+
+    def test_is_split_fif_only_true_for_fif_with_split(self):
+        self.assertTrue(is_split_fif("sub-03/meg/sub-03_task-x_split-01_meg.fif"))
+        self.assertFalse(is_split_fif("sub-03/meg/sub-03_task-x_meg.fif"))  # no split
+        # A `split-` entity on a non-FIF format is not part of the FIF chain logic.
+        self.assertFalse(is_split_fif("sub-03/eeg/sub-03_task-x_split-01_eeg.set"))
+
+    def test_heads_and_members_picks_lowest_split(self):
+        primaries = [
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-03_meg.fif",
+            "sub-04/eeg/sub-04_task-y_eeg.set",  # non-split primary, carried verbatim
+        ]
+        heads, member_to_head = split_heads_and_members(primaries)
+        self.assertEqual(
+            heads,
+            {
+                "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+                "sub-04/eeg/sub-04_task-y_eeg.set",
+            },
+        )
+        self.assertEqual(
+            member_to_head,
+            {
+                "sub-03/meg/sub-03_task-x_split-02_meg.fif": "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+                "sub-03/meg/sub-03_task-x_split-03_meg.fif": "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            },
+        )
+
+    def test_heads_picks_lowest_present_when_split01_absent(self):
+        # Degenerate group missing split-01: lowest present split is the head.
+        primaries = [
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-03_meg.fif",
+        ]
+        heads, member_to_head = split_heads_and_members(primaries)
+        self.assertEqual(heads, {"sub-03/meg/sub-03_task-x_split-02_meg.fif"})
+        self.assertEqual(
+            member_to_head,
+            {"sub-03/meg/sub-03_task-x_split-03_meg.fif": "sub-03/meg/sub-03_task-x_split-02_meg.fif"},
+        )
+
+    def test_split_members_for_returns_sorted_chain(self):
+        head_files = {
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_events.tsv",
+            "sub-04/eeg/sub-04_task-y_eeg.set",
+        }
+        members = split_members_for("sub-03/meg/sub-03_task-x_split-01_meg.fif", head_files)
+        self.assertEqual(
+            members,
+            [
+                "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+                "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            ],
+        )
+        # A non-split primary has no members.
+        self.assertEqual(split_members_for("sub-04/eeg/sub-04_task-y_eeg.set", head_files), [])
+
+    def test_full_converts_only_head_split(self):
+        head = [
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            "sub-03/meg/sub-03_task-x_events.tsv",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-03/meg/sub-03_task-x_split-01_meg.fif"])
+        self.assertEqual(remove, [])
+
+    def test_modify_any_split_rebuilds_head(self):
+        head = [
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+        ]
+        for changed in (
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+        ):
+            convert, remove = compute_worklist(head, [("M", changed)], full=False)
+            self.assertEqual(convert, ["sub-03/meg/sub-03_task-x_split-01_meg.fif"])
+            self.assertEqual(remove, [])
+
+    def test_events_change_rebuilds_split_head(self):
+        head = [
+            "sub-03/meg/sub-03_task-x_split-01_meg.fif",
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif",
+            "sub-03/meg/sub-03_task-x_events.tsv",
+        ]
+        convert, _ = compute_worklist(
+            head, [("M", "sub-03/meg/sub-03_task-x_events.tsv")], full=False
+        )
+        self.assertEqual(convert, ["sub-03/meg/sub-03_task-x_split-01_meg.fif"])
+
+    def test_delete_non_head_split_rebuilds_head_not_remove(self):
+        # split-02 removed but split-01 remains -> re-read the chain, no store drop.
+        head = ["sub-03/meg/sub-03_task-x_split-01_meg.fif"]
+        convert, remove = compute_worklist(
+            head, [("D", "sub-03/meg/sub-03_task-x_split-02_meg.fif")], full=False
+        )
+        self.assertEqual(convert, ["sub-03/meg/sub-03_task-x_split-01_meg.fif"])
+        self.assertEqual(remove, [])
+
+    def test_delete_head_split_removes_its_store(self):
+        # The whole recording is gone (both splits deleted) -> drop the head store.
+        head: list[str] = []
+        convert, remove = compute_worklist(
+            head,
+            [
+                ("D", "sub-03/meg/sub-03_task-x_split-01_meg.fif"),
+                ("D", "sub-03/meg/sub-03_task-x_split-02_meg.fif"),
+            ],
+            full=False,
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, ["sub-03/meg/sub-03_task-x_split-01_meg.zarr"])
+
+    def test_head_split_reindex_drops_orphaned_old_store(self):
+        # Old head split-01 deleted while split-02 survives as the new head: build the
+        # new head store AND remove the orphaned old-head store (would otherwise linger).
+        head = ["sub-03/meg/sub-03_task-x_split-02_meg.fif"]
+        convert, remove = compute_worklist(
+            head, [("D", "sub-03/meg/sub-03_task-x_split-01_meg.fif")], full=False
+        )
+        self.assertEqual(convert, ["sub-03/meg/sub-03_task-x_split-02_meg.fif"])
+        self.assertEqual(remove, ["sub-03/meg/sub-03_task-x_split-01_meg.zarr"])
+
+    def test_affected_primaries_non_head_split_maps_to_head(self):
+        primaries = ["sub-03/meg/sub-03_task-x_split-01_meg.fif"]
+        bd = by_dir(primaries)
+        m2h = {
+            "sub-03/meg/sub-03_task-x_split-02_meg.fif": "sub-03/meg/sub-03_task-x_split-01_meg.fif"
+        }
+        self.assertEqual(
+            affected_primaries("sub-03/meg/sub-03_task-x_split-02_meg.fif", bd, m2h),
+            {"sub-03/meg/sub-03_task-x_split-01_meg.fif"},
         )
 
 
