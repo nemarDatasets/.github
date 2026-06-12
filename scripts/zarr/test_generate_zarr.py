@@ -23,14 +23,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
+    _recording_size_bytes,
     affected_primaries,
     bids_suffix_modality,
     compute_worklist,
+    ctf_ds_of,
+    ctf_ds_recordings,
     electrode_positions_for,
     embed_attr,
     embed_root_attr,
     event_descriptions_for,
     events_sibling_for,
+    is_ctf_ds,
     is_primary,
     materialize_local,
     merge_index,
@@ -895,6 +899,131 @@ class TestElectrodePositionsFor(unittest.TestCase):
             self.assertAlmostEqual(result["positions"]["FP1"][0], 80.784)
             self.assertEqual(result["coordinate_system"], "EEGLAB")
             self.assertEqual(result["coordinate_units"], "mm")
+
+
+class TestKitAndCtf(unittest.TestCase):
+    """KIT `.con`/`.sqd`/`.kdf` files and CTF `.ds` directory recordings."""
+
+    def test_kit_extensions_are_primary(self):
+        for ext in (".con", ".sqd", ".kdf"):
+            self.assertTrue(is_primary(f"sub-01/meg/sub-01_task-x_meg{ext}"))
+        # And map to MEG by their BIDS suffix.
+        self.assertEqual(bids_suffix_modality("sub-01/meg/sub-01_task-x_meg.con"), "MEG")
+        self.assertEqual(
+            store_rel_for("sub-01/meg/sub-01_task-x_meg.con"),
+            "sub-01/meg/sub-01_task-x_meg.zarr",
+        )
+
+    def test_ctf_ds_of_and_is_ctf_ds(self):
+        inner = "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4"
+        ds = "sub-01/meg/sub-01_task-x_meg.ds"
+        self.assertEqual(ctf_ds_of(inner), ds)
+        self.assertEqual(ctf_ds_of(ds), ds)  # the dir maps to itself
+        self.assertIsNone(ctf_ds_of("sub-01/meg/sub-01_task-x_meg.fif"))
+        self.assertTrue(is_ctf_ds(ds))
+        self.assertFalse(is_ctf_ds(inner))
+
+    def test_ctf_ds_recordings_derived_from_inner_files(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.res4",
+            "sub-01/meg/sub-01_task-x_meg.ds/BadChannels",
+            "sub-02/meg/sub-02_task-y_meg.ds/sub-02_task-y_meg.meg4",
+            "dataset_description.json",
+        ]
+        self.assertEqual(
+            ctf_ds_recordings(head),
+            {"sub-01/meg/sub-01_task-x_meg.ds", "sub-02/meg/sub-02_task-y_meg.ds"},
+        )
+
+    def test_ctf_store_rel_and_events_and_modality(self):
+        ds = "sub-01/meg/sub-01_task-x_meg.ds"
+        self.assertEqual(store_rel_for(ds), "sub-01/meg/sub-01_task-x_meg.zarr")
+        self.assertEqual(
+            events_sibling_for(ds), "sub-01/meg/sub-01_task-x_events.tsv"
+        )
+        self.assertEqual(bids_suffix_modality(ds), "MEG")
+
+    def test_full_converts_ctf_ds_as_one_primary(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.res4",
+            "sub-01/meg/sub-01_task-x_events.tsv",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_meg.ds"])
+        self.assertEqual(remove, [])
+
+    def test_modify_inner_ctf_file_rebuilds_recording(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.res4",
+        ]
+        convert, remove = compute_worklist(
+            head, [("M", "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4")], full=False
+        )
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_meg.ds"])
+        self.assertEqual(remove, [])
+
+    def test_delete_whole_ctf_ds_removes_store(self):
+        # Every inner file deleted, none remain at HEAD -> drop the recording's store.
+        convert, remove = compute_worklist(
+            [],
+            [
+                ("D", "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4"),
+                ("D", "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.res4"),
+            ],
+            full=False,
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, ["sub-01/meg/sub-01_task-x_meg.zarr"])
+
+    def test_delete_one_ctf_file_with_others_remaining_rebuilds(self):
+        head = ["sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4"]
+        convert, remove = compute_worklist(
+            head, [("D", "sub-01/meg/sub-01_task-x_meg.ds/BadChannels")], full=False
+        )
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_meg.ds"])
+        self.assertEqual(remove, [])
+
+    def test_ctf_size_sums_directory_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = os.path.join(d, "sub-01_task-x_meg.ds")
+            os.makedirs(ds)
+            with open(os.path.join(ds, "sub-01_task-x_meg.meg4"), "wb") as fh:
+                fh.write(b"m" * 8000)
+            with open(os.path.join(ds, "sub-01_task-x_meg.res4"), "wb") as fh:
+                fh.write(b"r" * 200)
+            self.assertEqual(_recording_size_bytes(ds), 8200)
+
+
+class TestRecordingSizeBytes(unittest.TestCase):
+    """Streaming gate sizing: primary + same-stem companions, not the whole dir."""
+
+    def test_sums_primary_and_same_stem_companions(self):
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "sub-01", "ieeg")
+            os.makedirs(sub)
+            stem = "sub-01_task-movie_ieeg"
+            # BrainVision triplet: the bulk lives in the .eeg companion.
+            with open(os.path.join(sub, f"{stem}.vhdr"), "wb") as fh:
+                fh.write(b"x" * 100)
+            with open(os.path.join(sub, f"{stem}.eeg"), "wb") as fh:
+                fh.write(b"y" * 5000)
+            with open(os.path.join(sub, f"{stem}.vmrk"), "wb") as fh:
+                fh.write(b"z" * 50)
+            # A different recording in the same dir must NOT be counted.
+            with open(os.path.join(sub, "sub-01_task-rest_ieeg.eeg"), "wb") as fh:
+                fh.write(b"q" * 9999)
+            primary = os.path.join(sub, f"{stem}.vhdr")
+            self.assertEqual(_recording_size_bytes(primary), 100 + 5000 + 50)
+
+    def test_unreadable_dir_forces_streaming(self):
+        # A listdir failure must NOT read as size 0 (which would misroute a large
+        # recording to the OOM-prone in-memory path); it forces the streaming path.
+        self.assertGreater(
+            _recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 2 * 1024**3
+        )
 
 
 if __name__ == "__main__":

@@ -44,10 +44,16 @@ from datetime import datetime, timezone
 
 # Primary recording containers biosigIO reads directly. A change to one of
 # these (or its companion / events sidecar) rebuilds exactly one `.zarr` store.
-PRIMARY_EXTS = (".set", ".edf", ".bdf", ".vhdr", ".fif")
+# KIT/Yokogawa MEG is a single `.con`/`.sqd`/`.kdf` file (its `.mrk`/`.elp`/`.hsp`
+# coregistration sidecars are not needed for the signal serving copy).
+PRIMARY_EXTS = (".set", ".edf", ".bdf", ".vhdr", ".fif", ".con", ".sqd", ".kdf")
 # Companions that share a recording's filename stem and carry its samples or
 # markers; a change confined to one still rebuilds the recording's store.
 COMPANION_EXTS = (".fdt", ".eeg", ".vmrk")
+# CTF MEG is a `.ds` DIRECTORY (`.meg4` data + `.res4`/`.hc`/... headers), not a
+# single file, so it never appears in `git ls-tree` as one path -- it is derived
+# from the files under it and treated as one recording keyed at the `.ds` dir.
+CTF_DS_EXT = ".ds"
 
 INDEX_FORMAT = "nemar-zarr-index"
 INDEX_FORMAT_VERSION = 1
@@ -56,6 +62,17 @@ INDEX_FORMAT_VERSION = 1
 # uppercase modality names; the defaults already match, set explicitly so the
 # NEMAR caps are visible/auditable here rather than implied by the library.
 MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
+
+# Large recordings are converted with biosigIO's STREAMING path (bounded RAM)
+# instead of the in-memory `Recording.from_file -> to_zarr`, which loads the whole
+# recording at float64 2-3x and OOMs on multi-GB iEEG/MEG (e.g. nm000253's 18 GB
+# BrainVision recordings). Gated on (a) size and (b) an MNE-native format, so the
+# streamed read matches the in-memory reader for that format exactly (BrainVision/
+# FIF both go through MNE either way); EDF/EEGLAB stay on the in-memory path.
+# Requires biosigio>=1.1.5. Threshold is env-overridable for the Hallu cron.
+# CTF `.ds` is MNE-native too (large MEG), so it streams as well.
+STREAM_MIN_BYTES = int(os.environ.get("ZARR_STREAM_MIN_BYTES", str(2 * 1024**3)))
+STREAM_EXTS = (".vhdr", ".fif", ".ds")
 
 # The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
 # by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
@@ -105,10 +122,48 @@ def store_rel_for(primary_path: str) -> str:
     """`sub-01/eeg/sub-01_task-x_eeg.set` -> `sub-01/eeg/sub-01_task-x_eeg.zarr`.
 
     Strips the data extension and appends `.zarr`; the BIDS suffix (`_eeg`,
-    `_emg`, ...) is preserved, so the rule is uniform across all primary exts.
+    `_emg`, ...) is preserved, so the rule is uniform across all primary exts and
+    over a CTF `.ds` directory (`..._meg.ds` -> `..._meg.zarr`).
     """
     root, _ = os.path.splitext(primary_path)
     return root + ".zarr"
+
+
+# --- CTF `.ds` directory recordings --------------------------------------
+#
+# A CTF recording is a directory `..._meg.ds/` holding `.meg4` (data) + `.res4`/
+# `.hc`/... headers. git tracks the inner files, never the directory, so the
+# recording is derived from those files and treated as one primary keyed at the
+# `.ds` dir path; biosigIO/MNE reads the directory (`read_raw_ctf`).
+
+
+def ctf_ds_of(path: str) -> str | None:
+    """The `.ds` recording directory a path belongs to, or None.
+
+    `sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4` ->
+    `sub-01/meg/sub-01_task-x_meg.ds`. Returns the `.ds` path itself unchanged.
+    Only the FIRST `.ds` component counts (CTF dirs are not nested)."""
+    parts = path.split("/")
+    for i, comp in enumerate(parts):
+        if comp.lower().endswith(CTF_DS_EXT):
+            return "/".join(parts[: i + 1])
+    return None
+
+
+def is_ctf_ds(path: str) -> bool:
+    """True if `path` is exactly a CTF `.ds` recording directory (not a file in one)."""
+    return path.lower().rstrip("/").endswith(CTF_DS_EXT)
+
+
+def ctf_ds_recordings(head_files) -> set[str]:
+    """Every CTF `.ds` recording directory present in `head_files` (derived from
+    the inner files, since the directory itself is never a tracked path)."""
+    dirs: set[str] = set()
+    for f in head_files:
+        ds = ctf_ds_of(f)
+        if ds is not None:
+            dirs.add(ds)
+    return dirs
 
 
 def events_sibling_for(primary_path: str) -> str:
@@ -242,16 +297,28 @@ def compute_worklist(
     """
     head_set = set(head_files)
     primaries = [p for p in head_files if is_primary(p)]
+    # CTF `.ds` recordings are directories derived from the files under them, not
+    # tracked paths, so they are buildable primaries alongside the file primaries.
+    ctf_dirs = ctf_ds_recordings(head_files)
     by_dir: dict[str, list[str]] = {}
     for p in primaries:
         by_dir.setdefault(os.path.dirname(p), []).append(p)
+    all_primaries = sorted([*primaries, *ctf_dirs])
 
     if full:
-        return sorted(primaries), []
+        return all_primaries, []
 
     convert: set[str] = set()
     remove: set[str] = set()
     for status, path in diff_entries:
+        # A change anywhere inside a CTF `.ds` is a change to that one recording.
+        ds = ctf_ds_of(path)
+        if ds is not None:
+            if ds in ctf_dirs:  # at least one file remains -> rebuild the recording
+                convert.add(ds)
+            elif status == "D":  # the whole `.ds` is gone -> drop its store
+                remove.add(store_rel_for(ds))
+            continue
         if status == "D":
             if is_primary(path):
                 # The recording itself is gone -> drop its store. (If a same-name
@@ -265,7 +332,8 @@ def compute_worklist(
         else:  # "A", "M", "T", ...
             convert |= affected_primaries(path, by_dir)
 
-    convert &= head_set  # never convert something not present at HEAD
+    present = head_set | ctf_dirs  # a `.ds` dir is "present" when it has files at HEAD
+    convert &= present  # never convert something not present at HEAD
     convert_stores = {store_rel_for(p) for p in convert}
     remove -= convert_stores  # a rebuilt store must not also be deleted
     return sorted(convert), sorted(remove)
@@ -425,6 +493,76 @@ def s3_read_json(bucket: str, key: str) -> dict | None:
         raise RuntimeError(f"corrupt JSON at s3://{bucket}/{key}: {exc}") from exc
 
 
+def _fetch_blob(
+    repo_dir: str, bucket: str, dataset_id: str, path: str, head: str, local: str
+) -> tuple[bool, str | None]:
+    """Materialize one tracked path to `local`. Returns (found, annex_key).
+
+    Annex content (locked symlink or unlocked pointer) is pulled from S3 with
+    authenticated `aws s3 cp`; an in-git blob is written directly. `found=False`
+    when the path is absent from `ls-tree head` (caller decides if that is fatal).
+    Reads against the pinned `head` SHA so it matches the worklist's tree.
+    """
+    meta = _run(["git", "-C", repo_dir, "ls-tree", head, "--", path]).strip()
+    if not meta:
+        return False, None
+    mode, _, rest = meta.split(" ", 2)
+    sha = rest.split("\t", 1)[0].strip()
+    blob = subprocess.check_output(["git", "-C", repo_dir, "cat-file", "blob", sha])
+    key = None
+    if mode == "120000" or len(blob) < 1024:
+        key = parse_annex_key(blob.decode("utf-8", "replace"))
+    os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+    if key:
+        aws_cp(f"s3://{bucket}/{dataset_id}/objects/{key}", local)
+    else:
+        with open(local, "wb") as fh:
+            fh.write(blob)
+    return True, key
+
+
+def _materialize_ctf(
+    repo_dir: str,
+    bucket: str,
+    dataset_id: str,
+    ds_path: str,
+    head_files: set[str],
+    head: str,
+    work_dir: str,
+) -> tuple[str, str | None, str | None]:
+    """Download every file under a CTF `.ds` directory into `work_dir`, preserving
+    the `.ds/...` layout MNE's `read_raw_ctf` expects, plus the events sidecar.
+    Returns (local_ds_dir, events_local|None, None)."""
+    local_ds = os.path.join(work_dir, os.path.basename(ds_path))
+    inner = sorted(p for p in head_files if ctf_ds_of(p) == ds_path)
+    if not inner:
+        raise RuntimeError(f"CTF recording {ds_path!r} has no files at ls-tree {head[:8]}")
+    for path in inner:
+        rel = path[len(ds_path) + 1 :]  # path relative to the `.ds` dir
+        found, _ = _fetch_blob(repo_dir, bucket, dataset_id, path, head, os.path.join(local_ds, rel))
+        if not found:
+            # Every inner file came from `ls-tree head`; a missing one means a real
+            # tree/pack desync. A `.ds` is read as a whole (read_raw_ctf needs the
+            # `.meg4` + headers), and we cannot tell a mandatory file from an
+            # optional sidecar, so FAIL rather than convert a partial recording into
+            # a wrong store that would then `aws s3 sync --delete` over a good one.
+            raise RuntimeError(
+                f"CTF file {path!r} absent from ls-tree {head[:8]}; refusing to convert a "
+                "partial .ds recording"
+            )
+    events_path = events_sibling_for(ds_path)
+    events_local = None
+    if events_path in head_files:
+        events_local = os.path.join(work_dir, os.path.basename(events_path))
+        found, _ = _fetch_blob(repo_dir, bucket, dataset_id, events_path, head, events_local)
+        if not found:
+            # Sidecar tracked at HEAD but unfetchable -> don't claim a phantom path
+            # (downstream would silently embed no events); warn and drop it.
+            print(f"::warning::CTF events {events_path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
+            events_local = None
+    return local_ds, events_local, None
+
+
 def materialize_recording(
     repo_dir: str,
     bucket: str,
@@ -438,9 +576,13 @@ def materialize_recording(
 
     Downloads the primary + every same-stem companion (annex content via
     authenticated `aws s3 cp`, in-git blobs written directly) and the BIDS
-    `_events.tsv` sidecar if present. Returns (primary_local_path,
-    events_local_path|None, primary_annex_key|None).
+    `_events.tsv` sidecar if present. A CTF `.ds` recording is a directory, handled
+    by `_materialize_ctf`. Returns (primary_local_path, events_local_path|None,
+    primary_annex_key|None).
     """
+    if is_ctf_ds(primary_path):
+        return _materialize_ctf(repo_dir, bucket, dataset_id, primary_path, head_files, head, work_dir)
+
     d = os.path.dirname(primary_path)
     stem = filename_stem(primary_path)
     siblings = [
@@ -456,11 +598,8 @@ def materialize_recording(
     primary_key: str | None = None
     for path in wanted:
         local = os.path.join(work_dir, os.path.basename(path))
-        # mode tells symlink (120000) vs regular blob; sha addresses the blob.
-        # Read against the pinned `head` SHA (not the symbolic ref) so this sees
-        # the same tree git_ls_files/compute_worklist were built from.
-        meta = _run(["git", "-C", repo_dir, "ls-tree", head, "--", path]).strip()
-        if not meta:
+        found, key = _fetch_blob(repo_dir, bucket, dataset_id, path, head, local)
+        if not found:
             if path == primary_path:
                 raise RuntimeError(
                     f"primary {path!r} in the worklist but absent from ls-tree {head[:8]} "
@@ -468,21 +607,8 @@ def materialize_recording(
                 )
             print(f"::warning::companion {path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
             continue
-        mode, _, rest = meta.split(" ", 2)
-        sha = rest.split("\t", 1)[0].strip()
-        blob = subprocess.check_output(["git", "-C", repo_dir, "cat-file", "blob", sha])
-        key = None
-        if mode == "120000":
-            key = parse_annex_key(blob.decode("utf-8", "replace"))
-        elif len(blob) < 1024:
-            key = parse_annex_key(blob.decode("utf-8", "replace"))
-        if key:
-            aws_cp(f"s3://{bucket}/{dataset_id}/objects/{key}", local)
-            if path == primary_path:
-                primary_key = key
-        else:
-            with open(local, "wb") as fh:
-                fh.write(blob)
+        if path == primary_path:
+            primary_key = key
     return (
         os.path.join(work_dir, os.path.basename(primary_path)),
         os.path.join(work_dir, os.path.basename(events_path))
@@ -766,6 +892,54 @@ def event_descriptions_for(
     return result
 
 
+def _recording_size_bytes(primary_local: str) -> int:
+    """On-disk size of a recording: its primary file + same-stem companions
+    (`.eeg`/`.vmrk` for BrainVision; FIF is single-file), or every file under a CTF
+    `.ds` directory. Drives the streaming decision -- the bulk lives in the `.eeg`
+    companion / `.meg4`, not the tiny `.vhdr` / `.ds` header files.
+
+    On any stat/listing error this returns a value that FORCES the (bounded-memory)
+    streaming path rather than an undercount/zero, which would misroute a large
+    recording to the OOM-prone in-memory path. Only MNE-native exts reach streaming,
+    so over-forcing a small file there is at worst slower, never wrong."""
+    force = 1 << 62  # exceeds any real STREAM_MIN_BYTES -> routes to streaming
+    # CTF `.ds` recording: sum the whole directory tree.
+    if os.path.isdir(primary_local):
+        errored = False
+
+        def _onerr(_exc: OSError) -> None:
+            nonlocal errored
+            errored = True
+
+        total = 0
+        for root, _dirs, files in os.walk(primary_local, onerror=_onerr):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    errored = True
+        if errored:
+            print(f"::warning::could not fully stat CTF dir {primary_local!r}; forcing streaming", flush=True)
+            return force
+        return total
+    d = os.path.dirname(primary_local) or "."
+    stem = filename_stem(primary_local)
+    total = 0
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        print(f"::warning::could not list {d!r}; forcing streaming", flush=True)
+        return force
+    for fn in entries:
+        if os.path.splitext(fn)[0] == stem:
+            try:
+                total += os.path.getsize(os.path.join(d, fn))
+            except OSError:
+                print(f"::warning::could not stat {fn!r}; forcing streaming", flush=True)
+                return force
+    return total
+
+
 def convert_recording(
     primary_local: str,
     events_local: str | None,
@@ -774,19 +948,49 @@ def convert_recording(
     value_descriptions: dict[str, str] | None = None,
     electrode_positions: dict | None = None,
 ) -> None:
-    from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
-
-    rec = Recording.from_file(primary_local)
-    if events_local and os.path.exists(events_local):
-        bids.apply_events_tsv(rec, events_local)
-    # Suffix-driven modality: group + resample the whole recording by its BIDS
-    # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
-    # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
     modality = bids_suffix_modality(primary_local)
-    if modality:
-        for label in rec.channels:
-            rec.channels[label]["modality"] = modality
-    rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
+    # Large MNE-native recordings (multi-GB iEEG/MEG) use the streaming converter so
+    # peak RAM stays bounded; the in-memory path below would load them at float64 2-3x
+    # and OOM. Both paths read BrainVision/FIF through MNE, so the output matches.
+    if lower_ext(primary_local) in STREAM_EXTS and _recording_size_bytes(primary_local) > STREAM_MIN_BYTES:
+        from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
+        from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
+
+        events_df = (
+            read_events_tsv(events_local)
+            if events_local and os.path.exists(events_local)
+            else None
+        )
+        stream_to_zarr(
+            primary_local,
+            store_path,
+            force_modality=modality,
+            modality_rates=MODALITY_RATES,
+            dtype="int16",
+            events_df=events_df,
+            # Keep the temp channel-major memmap on the same (fast) scratch volume as
+            # the store; it is a sibling temp dir, not synced to S3.
+            scratch_dir=os.path.dirname(store_path) or None,
+        )
+    else:
+        from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
+
+        # mixed_rate="resample": a Zarr store is a derived serving copy (viewing + ML),
+        # not the authoritative recording, so for a mixed-sampling-rate EDF/BDF (e.g.
+        # polysomnography: EEG ~200 Hz + SpO2 ~12.5 Hz) upsample the slow channels onto
+        # the fastest channel's grid rather than failing the conversion. biosigIO
+        # defaults to "error" everywhere else so no one gets resampled data unknowingly
+        # (requires biosigio>=1.1.4; ignored for non-EDF formats). See nemar-cli#737.
+        rec = Recording.from_file(primary_local, mixed_rate="resample")
+        if events_local and os.path.exists(events_local):
+            bids.apply_events_tsv(rec, events_local)
+        # Suffix-driven modality: group + resample the whole recording by its BIDS
+        # datatype (an _eeg file -> eeg_250hz), regardless of what the importer guessed
+        # per channel. Without this, EEGLAB's empty chanlocs type -> MISC -> misc_1024hz.
+        if modality:
+            for label in rec.channels:
+                rec.channels[label]["modality"] = modality
+        rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
     if power_line_frequency is not None:
         embed_root_attr(store_path, "power_line_frequency", power_line_frequency)
     if value_descriptions:
