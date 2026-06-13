@@ -23,6 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
+    _AWS_OP_TIMEOUT,
+    _AWS_RM_TIMEOUT,
     _aws,
     _recording_size_bytes,
     affected_primaries,
@@ -1305,6 +1307,12 @@ class TestAwsRunner(unittest.TestCase):
     def test_failing_command_retries_then_raises(self):
         with self.assertRaises(RuntimeError):
             _aws([sys.executable, "-c", "import sys; sys.exit(7)"], timeout=30, retries=2)
+
+    def test_recursive_rm_timeout_far_exceeds_transfer_timeout(self):
+        # A whole-prefix `aws s3 rm --recursive` (millions of chunk objects on a
+        # big dataset) legitimately runs much longer than a single transfer; the
+        # transfer cap was killing real wipes mid-delete.
+        self.assertGreaterEqual(_AWS_RM_TIMEOUT, 4 * _AWS_OP_TIMEOUT)
 
 
 class TestShouldStream(unittest.TestCase):

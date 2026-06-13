@@ -679,11 +679,20 @@ _AWS_RETRIES = int(os.environ.get("ZARR_AWS_RETRIES", "4"))
 # spun 2.5 h at 16% CPU on an already-empty prefix). The wall-clock `timeout` in
 # `_aws` is the real backstop.
 _AWS_TIMEOUTS = ["--cli-connect-timeout", "30", "--cli-read-timeout", "300"]
-# Hard wall-clock cap per aws invocation (seconds). A wedged process is killed and
-# retried rather than hanging a pool worker -- or the whole run -- forever.
-# Generous so a legitimately slow multi-GB transfer or large-prefix delete never
-# trips it; override with ZARR_AWS_TIMEOUT.
+# Hard wall-clock cap per aws invocation (seconds) for transfers (cp/sync). A
+# wedged process is killed and retried rather than hanging a worker forever.
+# Generous so a legitimately slow multi-GB transfer never trips it; override with
+# ZARR_AWS_TIMEOUT.
 _AWS_OP_TIMEOUT = int(os.environ.get("ZARR_AWS_TIMEOUT", "1800"))
+# Recursive deletes (`aws s3 rm --recursive` on a whole `<id>/zarr/` prefix or a
+# store) are a different beast: a big dataset's prefix holds hundreds of stores x
+# thousands of chunk objects = millions of keys, and DeleteObjects batches 1000 at
+# a time, so a legitimate wipe can run far longer than a single transfer. Give it
+# a much larger ceiling (and FEWER retries, so a true wedge fails in bounded time
+# instead of N x the ceiling). The 1800 s transfer cap was killing real wipes of
+# large datasets (e.g. on005261, 318 stores) mid-delete -> rebuild then 404'd.
+_AWS_RM_TIMEOUT = int(os.environ.get("ZARR_AWS_RM_TIMEOUT", str(4 * 3600)))
+_AWS_RM_RETRIES = int(os.environ.get("ZARR_AWS_RM_RETRIES", "2"))
 
 
 def _aws_env() -> dict:
@@ -1470,10 +1479,14 @@ def main() -> int:
     # the convert loop then re-uploads every store into the emptied prefix.
     if args.clean and convert:
         print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
-        _aws([
-            "aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
-            "--recursive", "--only-show-errors",
-        ])
+        _aws(
+            [
+                "aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
+                "--recursive", "--only-show-errors",
+            ],
+            timeout=_AWS_RM_TIMEOUT,
+            retries=_AWS_RM_RETRIES,
+        )
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
@@ -1532,10 +1545,14 @@ def main() -> int:
                     record(r, i)
 
     for rel_store in remove:
-        _aws([
-            "aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
-            "--recursive", "--only-show-errors",
-        ])
+        _aws(
+            [
+                "aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
+                "--recursive", "--only-show-errors",
+            ],
+            timeout=_AWS_RM_TIMEOUT,
+            retries=_AWS_RM_RETRIES,
+        )
         print(f"[zarr] removed store {rel_store}", flush=True)
 
     # Hard fail: every attempted conversion errored and nothing was removed. Do
