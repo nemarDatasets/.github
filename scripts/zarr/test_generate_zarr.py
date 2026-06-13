@@ -28,6 +28,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     affected_primaries,
     annex_key_size,
     bids_suffix_modality,
+    should_stream,
     compute_worklist,
     ctf_ds_of,
     ctf_ds_recordings,
@@ -1234,6 +1235,36 @@ class TestAwsRunner(unittest.TestCase):
     def test_failing_command_retries_then_raises(self):
         with self.assertRaises(RuntimeError):
             _aws([sys.executable, "-c", "import sys; sys.exit(7)"], timeout=30, retries=2)
+
+
+class TestShouldStream(unittest.TestCase):
+    """Which recordings take the bounded-memory streaming path. KIT .con loads
+    fully in memory (~5x float64) and OOMs a worker well below the multi-GB mark,
+    so it streams at a much lower threshold than BrainVision/FIF/CTF."""
+
+    GB = 1024**3
+    MB = 1024**2
+
+    def test_kit_con_streams_above_low_threshold(self):
+        # The ~620 MB task-2 .con that OOM'd the in-memory path must stream.
+        self.assertTrue(should_stream("sub-01/meg/sub-01_task-x_meg.con", 620 * self.MB))
+        self.assertTrue(should_stream("sub-01/meg/sub-01_task-x_meg.sqd", 900 * self.MB))
+
+    def test_small_kit_stays_in_memory(self):
+        # A small (~190 MB task-0) .con is cheap in memory -> faster path.
+        self.assertFalse(should_stream("sub-01/meg/sub-01_task-x_meg.con", 190 * self.MB))
+
+    def test_brainvision_fif_keep_multigb_threshold(self):
+        # MNE-native formats only stream when genuinely large (the in-memory path
+        # is fine for moderate sizes).
+        self.assertFalse(should_stream("sub-01/ieeg/sub-01_task-x_ieeg.vhdr", 500 * self.MB))
+        self.assertTrue(should_stream("sub-01/ieeg/sub-01_task-x_ieeg.vhdr", 3 * self.GB))
+        self.assertTrue(should_stream("sub-01/meg/sub-01_task-x_meg.fif", 3 * self.GB))
+
+    def test_in_memory_only_formats_never_stream(self):
+        # EDF/SET have no streaming reader wired up -> always in-memory.
+        self.assertFalse(should_stream("sub-01/eeg/sub-01_task-x_eeg.edf", 5 * self.GB))
+        self.assertFalse(should_stream("sub-01/eeg/sub-01_task-x_eeg.set", 5 * self.GB))
 
 
 if __name__ == "__main__":
