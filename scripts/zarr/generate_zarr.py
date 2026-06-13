@@ -582,31 +582,56 @@ def validate_store(store_local: str) -> None:
 
 
 _AWS_RETRIES = int(os.environ.get("ZARR_AWS_RETRIES", "4"))
-# Bound every aws transfer so a stuck TCP read can't hang a worker (or the whole
-# run) indefinitely -- a wedged `aws s3 rm --recursive` once sat at 0% CPU for an
-# hour. The read timeout is per-chunk, so it never trips a legitimately slow
-# multi-GB transfer; a genuine stall fails fast and the caller's loop retries.
+# Per-read socket timeouts: a first line of defense against a single stuck TCP
+# read. NOT sufficient alone -- a recursive delete or sync that paginates/loops
+# without any one read stalling slips past these (an `aws s3 rm --recursive` once
+# spun 2.5 h at 16% CPU on an already-empty prefix). The wall-clock `timeout` in
+# `_aws` is the real backstop.
 _AWS_TIMEOUTS = ["--cli-connect-timeout", "30", "--cli-read-timeout", "300"]
+# Hard wall-clock cap per aws invocation (seconds). A wedged process is killed and
+# retried rather than hanging a pool worker -- or the whole run -- forever.
+# Generous so a legitimately slow multi-GB transfer or large-prefix delete never
+# trips it; override with ZARR_AWS_TIMEOUT.
+_AWS_OP_TIMEOUT = int(os.environ.get("ZARR_AWS_TIMEOUT", "1800"))
+
+
+def _aws_env() -> dict:
+    """Environment for an aws subprocess: more internal API retries for transient
+    throttle/5xx (the CLI honors ``AWS_MAX_ATTEMPTS``). The per-process S3
+    transfer concurrency (``s3.max_concurrent_requests``) is config-only and is
+    pinned low on the runner's profile out of band, so JOBS-way parallelism does
+    not fan out to hundreds of concurrent connections (the cause of multipart
+    download races and ``Need to rewind the stream`` upload failures)."""
+    env = dict(os.environ)
+    env.setdefault("AWS_MAX_ATTEMPTS", "10")
+    return env
+
+
+def _aws(
+    cmd: list[str], *, timeout: int = _AWS_OP_TIMEOUT, retries: int = _AWS_RETRIES
+) -> None:
+    """Run an aws CLI command with a wall-clock timeout + backoff retry.
+
+    A transfer that errors (throttle, multipart race) OR wedges past ``timeout``
+    is retried; both `CalledProcessError` and `TimeoutExpired` (the wedge) count
+    as a failed attempt. Raises RuntimeError after the last attempt.
+    """
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            subprocess.run([*cmd, *_AWS_TIMEOUTS], check=True, timeout=timeout, env=_aws_env())
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            last = exc
+            if attempt < retries:
+                time.sleep(min(2**attempt, 30))
+    raise RuntimeError(f"aws {' '.join(cmd[1:3])} failed after {retries} attempts: {last}")
 
 
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
     # --only-show-errors drops the per-file transfer progress meter; with JOBS
-    # workers each streaming a ~100 MB blob, that meter otherwise floods the cron
-    # log to the point of uselessness. Retry with backoff: under JOBS-way
-    # parallelism the AWS CLI intermittently fails a transfer (a vanished
-    # multipart temp -> rename ENOENT, a throttled connection), which `check=True`
-    # would otherwise surface as a hard per-recording failure.
-    cmd = ["aws", "s3", "cp", src, dst, "--only-show-errors", *_AWS_TIMEOUTS, *(extra or [])]
-    last: Exception | None = None
-    for attempt in range(1, _AWS_RETRIES + 1):
-        try:
-            subprocess.run(cmd, check=True)
-            return
-        except subprocess.CalledProcessError as exc:
-            last = exc
-            if attempt < _AWS_RETRIES:
-                time.sleep(min(2**attempt, 30))
-    raise RuntimeError(f"aws s3 cp {src} -> {dst} failed after {_AWS_RETRIES} attempts: {last}")
+    # workers each streaming a blob, that meter otherwise floods the log.
+    _aws(["aws", "s3", "cp", src, dst, "--only-show-errors", *(extra or [])])
 
 
 def annex_key_size(key: str | None) -> int | None:
@@ -636,6 +661,8 @@ def download_blob(src: str, dst: str, expected_size: int | None) -> None:
             subprocess.run(
                 ["aws", "s3", "cp", src, tmp, "--only-show-errors", *_AWS_TIMEOUTS],
                 check=True,
+                timeout=_AWS_OP_TIMEOUT,
+                env=_aws_env(),
             )
             got = os.path.getsize(tmp)
             if expected_size is not None and got != expected_size:
@@ -666,9 +693,11 @@ def s3_read_json(bucket: str, key: str) -> dict | None:
     same reason (absent != corrupt).
     """
     res = subprocess.run(
-        ["aws", "s3", "cp", f"s3://{bucket}/{key}", "-"],
+        ["aws", "s3", "cp", f"s3://{bucket}/{key}", "-", *_AWS_TIMEOUTS],
         capture_output=True,
         text=True,
+        timeout=_AWS_OP_TIMEOUT,
+        env=_aws_env(),
     )
     if res.returncode != 0:
         err = res.stderr.lower()
@@ -1246,15 +1275,16 @@ def convert_one(primary: str) -> dict:
             raise RuntimeError(f"store has no channel groups: {store_local}")
         # Latest-only: --delete drops stale chunk objects a smaller new store no
         # longer needs. Long origin TTL; the callback purges zarr.json/index.json.
-        subprocess.run(
-            [
-                "aws", "s3", "sync", store_local,
-                safe_store_prefix(c["bucket"], c["dataset_id"], rel_store),
-                "--delete", "--only-show-errors",
-                "--cache-control", "public, max-age=86400",
-            ],
-            check=True,
-        )
+        # Through `_aws` for the wall-clock timeout + retry: a store is thousands of
+        # tiny chunk PUTs, which under contention intermittently fail ("Need to
+        # rewind the stream") or wedge; sync is idempotent so a retry just re-PUTs
+        # whatever is missing.
+        _aws([
+            "aws", "s3", "sync", store_local,
+            safe_store_prefix(c["bucket"], c["dataset_id"], rel_store),
+            "--delete", "--only-show-errors",
+            "--cache-control", "public, max-age=86400",
+        ])
         entry = {
             "path": primary,
             "zarr": rel_store,
@@ -1339,18 +1369,10 @@ def main() -> int:
     # the convert loop then re-uploads every store into the emptied prefix.
     if args.clean and convert:
         print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
-        rm_cmd = [
+        _aws([
             "aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
-            "--recursive", "--only-show-errors", *_AWS_TIMEOUTS,
-        ]
-        for attempt in range(1, _AWS_RETRIES + 1):
-            try:
-                subprocess.run(rm_cmd, check=True)
-                break
-            except subprocess.CalledProcessError:
-                if attempt == _AWS_RETRIES:
-                    raise
-                time.sleep(min(2**attempt, 30))
+            "--recursive", "--only-show-errors",
+        ])
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
@@ -1396,11 +1418,10 @@ def main() -> int:
                     record(r, i)
 
     for rel_store in remove:
-        subprocess.run(
-            ["aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
-             "--recursive", "--only-show-errors"],
-            check=True,
-        )
+        _aws([
+            "aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
+            "--recursive", "--only-show-errors",
+        ])
         print(f"[zarr] removed store {rel_store}", flush=True)
 
     # Hard fail: every attempted conversion errored and nothing was removed. Do
