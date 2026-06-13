@@ -74,6 +74,29 @@ MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
 # CTF `.ds` is MNE-native too (large MEG), so it streams as well.
 STREAM_MIN_BYTES = int(os.environ.get("ZARR_STREAM_MIN_BYTES", str(2 * 1024**3)))
 STREAM_EXTS = (".vhdr", ".fif", ".ds")
+# KIT/Yokogawa .con/.sqd/.kdf load FULLY in memory (read_raw_kit has no lazy
+# path), and a many-channel MEG file expands to ~5x its bytes as float64 + the
+# biosigIO DataFrame + the resample copy -- so even a ~600 MB .con OOM-kills a
+# pool worker at JOBS-way concurrency (which then breaks the whole pool). Route
+# them through the streaming converter above a much lower threshold than the
+# multi-GB one: streaming peaks ~3 GB regardless of file size, and small KIT
+# files stay on the faster in-memory path.
+STREAM_KIT_EXTS = (".con", ".sqd", ".kdf")
+STREAM_KIT_MIN_BYTES = int(os.environ.get("ZARR_STREAM_KIT_MIN_BYTES", str(256 * 1024**2)))
+
+
+def should_stream(primary_local: str, size_bytes: int) -> bool:
+    """Whether a recording converts via the bounded-memory streaming path.
+
+    Large MNE-native recordings (multi-GB iEEG/MEG BrainVision/FIF, CTF `.ds`)
+    stream above ``STREAM_MIN_BYTES``; KIT `.con`/`.sqd`/`.kdf` stream above the
+    much lower ``STREAM_KIT_MIN_BYTES`` because their in-memory float64 blow-up
+    OOMs a worker well below the multi-GB mark. Everything else (and small KIT)
+    uses the faster in-memory path."""
+    ext = lower_ext(primary_local)
+    if ext in STREAM_KIT_EXTS:
+        return size_bytes > STREAM_KIT_MIN_BYTES
+    return ext in STREAM_EXTS and size_bytes > STREAM_MIN_BYTES
 
 # The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
 # by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
@@ -1174,10 +1197,11 @@ def convert_recording(
     electrode_positions: dict | None = None,
 ) -> None:
     modality = bids_suffix_modality(primary_local)
-    # Large MNE-native recordings (multi-GB iEEG/MEG) use the streaming converter so
-    # peak RAM stays bounded; the in-memory path below would load them at float64 2-3x
-    # and OOM. Both paths read BrainVision/FIF through MNE, so the output matches.
-    if lower_ext(primary_local) in STREAM_EXTS and _recording_size_bytes(primary_local) > STREAM_MIN_BYTES:
+    # Large MNE-native recordings use the streaming converter so peak RAM stays
+    # bounded; the in-memory path below would load them at float64 2-3x and OOM.
+    # Both paths read through MNE, so the output matches. (multi-GB BrainVision/FIF/
+    # CTF, plus KIT .con above its lower threshold -- see should_stream.)
+    if should_stream(primary_local, _recording_size_bytes(primary_local)):
         from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
         from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
 
