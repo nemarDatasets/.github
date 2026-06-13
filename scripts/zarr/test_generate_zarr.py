@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
+    _aws,
     _recording_size_bytes,
     affected_primaries,
     annex_key_size,
@@ -1213,6 +1214,26 @@ class TestAnnexKeySize(unittest.TestCase):
         self.assertIsNone(annex_key_size("WORM--whatever"))
         self.assertIsNone(annex_key_size(None))
         self.assertIsNone(annex_key_size(""))
+
+
+class TestAwsRunner(unittest.TestCase):
+    """The wall-clock timeout + retry that stops a wedged aws op from hanging a
+    worker -- or the whole run -- forever (the 2.5 h `aws s3 rm` spin on an empty
+    prefix). Real subprocesses, no mocks; python3 stands in for `aws` (the
+    appended --cli-* flags are harmlessly absorbed as argv)."""
+
+    def test_timeout_kills_wedged_command(self):
+        import time as _t
+
+        start = _t.monotonic()
+        with self.assertRaises(RuntimeError):
+            # Sleeps 30 s; the 1 s wall-clock cap must kill it well before that.
+            _aws([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1, retries=1)
+        self.assertLess(_t.monotonic() - start, 10)  # killed, not run to completion
+
+    def test_failing_command_retries_then_raises(self):
+        with self.assertRaises(RuntimeError):
+            _aws([sys.executable, "-c", "import sys; sys.exit(7)"], timeout=30, retries=2)
 
 
 if __name__ == "__main__":
