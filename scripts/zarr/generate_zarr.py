@@ -98,6 +98,42 @@ def should_stream(primary_local: str, size_bytes: int) -> bool:
         return size_bytes > STREAM_KIT_MIN_BYTES
     return ext in STREAM_EXTS and size_bytes > STREAM_MIN_BYTES
 
+
+# Fallback user-facing reasons, keyed by biosigIO error code. The authoritative
+# copy lives in biosigio.exceptions.REASONS (single source of truth); we prefer
+# that at runtime and use this only if the import is unavailable. Keep the codes
+# in sync with biosigio's hierarchy.
+_FALLBACK_REASONS = {
+    "not_continuous": (
+        "This file is a trial-averaged or epoched derivative, not a continuous "
+        "recording, so the time-series viewer is not available."
+    ),
+    "corrupt_or_truncated": (
+        "This recording's data file appears truncated or corrupt, so the viewer "
+        "could not be generated."
+    ),
+    "unsupported_format": "This file format is not yet supported by the viewer.",
+    "empty_recording": "This recording contains no signal channels to display.",
+    "file_read_error": "This recording could not be prepared for viewing.",
+}
+_GENERIC_REASON = _FALLBACK_REASONS["file_read_error"]
+
+
+def reason_for_code(code: str | None) -> str:
+    """User-facing reason for a biosigIO failure code, preferring biosigIO's own
+    REASONS (single source of truth) and falling back to a local copy."""
+    if not code:
+        return _GENERIC_REASON
+    try:
+        from biosigio.exceptions import REASONS  # type: ignore[import-not-found]
+
+        if code in REASONS:
+            return REASONS[code]
+    except Exception:  # noqa: BLE001 - biosigio absent/old: use the local copy
+        pass
+    return _FALLBACK_REASONS.get(code, _GENERIC_REASON)
+
+
 # The serving group + rate are driven by the recording's BIDS datatype SUFFIX, not
 # by per-channel type guessing. A `*_eeg.set` is EEG (250 Hz cap) even when a few
 # EOG/REF/trigger channels ride along; biosigIO's EEGLAB importer can only see an
@@ -492,13 +528,23 @@ def merge_index(
     converted: list[dict],
     removed_store_rels: list[str],
     updated_utc: str,
+    failures: list[dict] | None = None,
 ) -> dict:
     """Fold this run's results into the prior index. Pure.
 
     `converted` is a list of store entries (each carries a `zarr` rel-path key);
     `removed_store_rels` are `*.zarr` rels to drop. Entries for unchanged stores
     are carried over from `prior` verbatim.
+
+    `failures` is this run's typed data failures ({path, zarr, code, reason}) --
+    recordings that could not be converted for a reason the viewer should show.
+    They are merged like stores: prior failures carry over, a path that converted
+    (or whose store was removed) this run drops out, and this run's failures
+    overlay. A path is never in both `stores` and `failures`.
     """
+    failures = failures or []
+    new_fail_paths = {f["path"] for f in failures if f.get("path")}
+
     stores: dict[str, dict] = {}
     if prior and isinstance(prior.get("stores"), list):
         for entry in prior["stores"]:
@@ -508,7 +554,27 @@ def merge_index(
         stores.pop(rel, None)
     for entry in converted:
         stores[entry["zarr"]] = entry
+    # A recording that newly FAILED must not keep a stale store entry.
+    stores = {z: e for z, e in stores.items() if e.get("path") not in new_fail_paths}
     ordered = [stores[k] for k in sorted(stores)]
+
+    fails: dict[str, dict] = {}
+    if prior and isinstance(prior.get("failures"), list):
+        for f in prior["failures"]:
+            if isinstance(f, dict) and f.get("path"):
+                fails[f["path"]] = f
+    converted_paths = {e["path"] for e in converted if e.get("path")}
+    removed_set = set(removed_store_rels)
+    # Drop prior failures that converted this run or whose recording was removed.
+    fails = {
+        p: f
+        for p, f in fails.items()
+        if p not in converted_paths and f.get("zarr") not in removed_set
+    }
+    for f in failures:
+        fails[f["path"]] = f
+    ordered_fails = [fails[k] for k in sorted(fails)]
+
     return {
         "dataset_id": dataset_id,
         "format": INDEX_FORMAT,
@@ -517,6 +583,8 @@ def merge_index(
         "updated_utc": updated_utc,
         "store_count": len(ordered),
         "stores": ordered,
+        "failure_count": len(ordered_fails),
+        "failures": ordered_fails,
     }
 
 
@@ -1323,7 +1391,16 @@ def convert_one(primary: str) -> dict:
             entry["split_members"] = members
         return {"ok": True, "primary": primary, "entry": entry}
     except Exception as exc:  # noqa: BLE001 - isolate one bad recording
-        return {"ok": False, "primary": primary, "error": str(exc)}
+        # biosigIO read failures carry a stable `.code` (not_continuous,
+        # corrupt_or_truncated, ...) so the index can tell the viewer WHY a
+        # recording has no store. Infra failures (a plain RuntimeError, a crashed
+        # worker) have no code -> not surfaced, they retry on the next run.
+        return {
+            "ok": False,
+            "primary": primary,
+            "error": str(exc),
+            "code": getattr(exc, "code", None),
+        }
     finally:
         # Parallel workers share the NVMe scratch; reclaim each recording's copy
         # right after upload so N concurrent stores don't accumulate on disk.
@@ -1406,6 +1483,7 @@ def main() -> int:
     head_set = set(head_files)
     converted_entries: list[dict] = []
     failures: list[str] = []
+    failure_entries: list[dict] = []
 
     n = len(convert)
 
@@ -1417,6 +1495,18 @@ def main() -> int:
             print(f"[zarr] [{i}/{n}] converted {r['primary']} -> {r['entry']['zarr']}", flush=True)
         else:
             failures.append(r["primary"])
+            # A typed biosigIO failure (it carries a .code) is a property of the
+            # DATA -- record WHY in the index so the viewer can explain it. An infra
+            # failure (no code: crashed worker, transient S3) is omitted so it
+            # retries on the next run rather than being shown as a data problem.
+            code = r.get("code")
+            if code:
+                failure_entries.append({
+                    "path": r["primary"],
+                    "zarr": store_rel_for(r["primary"]),
+                    "code": code,
+                    "reason": reason_for_code(code),
+                })
             print(f"::warning::[{i}/{n}] conversion failed for {r['primary']}: {r['error']}", flush=True)
 
     jobs = max(1, args.jobs)
@@ -1456,12 +1546,17 @@ def main() -> int:
         print(f"::error::all {len(convert)} conversion(s) failed; index left untouched", flush=True)
         return 1
 
-    # Advance source_commit to HEAD only on a fully clean run. With any failure,
-    # keep the prior commit ("" when there is no prior -> next run goes full) so
-    # the failed recordings are re-diffed and retried on the next run rather than
-    # being skipped by an advanced checkpoint.
-    index_commit = head if not failures else (prior_commit or "")
-    index = merge_index(prior, dataset_id, index_commit, converted_entries, remove, updated)
+    # Advance source_commit to HEAD unless there are INFRA failures to retry. A
+    # typed data failure (a derivative, a corrupt file) is permanent -- retrying it
+    # never helps and would pin the checkpoint forever on a derivative-heavy
+    # dataset -- so it does not hold the commit back; it's recorded in the index's
+    # `failures` instead. An infra failure (no code: crashed worker, transient S3)
+    # keeps the prior commit ("" -> next run goes full) so it is re-diffed + retried.
+    infra_failures = len(failures) - len(failure_entries)
+    index_commit = head if not infra_failures else (prior_commit or "")
+    index = merge_index(
+        prior, dataset_id, index_commit, converted_entries, remove, updated, failure_entries
+    )
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(index, fh, separators=(",", ":"))
         index_local = fh.name
@@ -1489,6 +1584,9 @@ def main() -> int:
         "removed": remove,
         "errors": len(failures),
         "failed": failures,
+        # Typed data failures (recordings the viewer should explain, not retry).
+        "failure_count": index["failure_count"],
+        "data_failures": failure_entries,
     }
     with open(args.callback_out, "w") as fh:
         json.dump(callback, fh)

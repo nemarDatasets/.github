@@ -44,6 +44,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     merge_index,
     parse_annex_key,
     power_line_frequency_for,
+    reason_for_code,
     safe_store_prefix,
     split_group_key,
     split_heads_and_members,
@@ -1215,6 +1216,75 @@ class TestAnnexKeySize(unittest.TestCase):
         self.assertIsNone(annex_key_size("WORM--whatever"))
         self.assertIsNone(annex_key_size(None))
         self.assertIsNone(annex_key_size(""))
+
+
+class TestFailureReasons(unittest.TestCase):
+    """Typed data failures (recordings the viewer should explain) are carried into
+    index.json `failures`; infra failures are not. Mirrors biosigIO's error codes."""
+
+    def test_reason_for_code_known_and_unknown(self):
+        # Known codes get specific copy; None/unknown get the generic fallback.
+        self.assertIn("derivative", reason_for_code("not_continuous").lower())
+        self.assertIn("truncated", reason_for_code("corrupt_or_truncated").lower())
+        generic = reason_for_code(None)
+        self.assertEqual(reason_for_code("some_future_code"), generic)
+        self.assertTrue(generic)
+
+    def test_merge_index_records_failures(self):
+        index = merge_index(
+            None, "nm000104", "sha", [{"zarr": "a_eeg.zarr", "path": "a_eeg.set"}], [],
+            "2026-06-13T00:00:00Z",
+            [{"path": "b-ave.fif", "zarr": "b-ave.zarr", "code": "not_continuous",
+              "reason": "derivative"}],
+        )
+        self.assertEqual(index["store_count"], 1)
+        self.assertEqual(index["failure_count"], 1)
+        self.assertEqual(index["failures"][0]["code"], "not_continuous")
+        self.assertEqual(index["failures"][0]["path"], "b-ave.fif")
+
+    def test_merge_index_failure_clears_when_path_converts(self):
+        # A path that failed before but converts now drops out of `failures`.
+        prior = {
+            "source_commit": "old",
+            "stores": [],
+            "failures": [{"path": "x_eeg.set", "zarr": "x_eeg.zarr",
+                          "code": "corrupt_or_truncated", "reason": "..."}],
+        }
+        index = merge_index(
+            prior, "nm000104", "new", [{"zarr": "x_eeg.zarr", "path": "x_eeg.set"}], [],
+            "2026-06-13T00:00:00Z", [],
+        )
+        self.assertEqual(index["failure_count"], 0)
+        self.assertEqual(index["store_count"], 1)
+
+    def test_merge_index_path_never_in_both_stores_and_failures(self):
+        # A recording that newly fails drops its stale store entry.
+        prior = {
+            "source_commit": "old",
+            "stores": [{"zarr": "x_eeg.zarr", "path": "x_eeg.set"}],
+            "failures": [],
+        }
+        index = merge_index(
+            prior, "nm000104", "new", [], [], "2026-06-13T00:00:00Z",
+            [{"path": "x_eeg.set", "zarr": "x_eeg.zarr", "code": "not_continuous",
+              "reason": "..."}],
+        )
+        store_paths = {s.get("path") for s in index["stores"]}
+        fail_paths = {f["path"] for f in index["failures"]}
+        self.assertEqual(store_paths & fail_paths, set())
+        self.assertEqual(index["failure_count"], 1)
+        self.assertEqual(index["store_count"], 0)
+
+    def test_merge_index_drops_failure_for_removed_store(self):
+        prior = {
+            "source_commit": "old", "stores": [],
+            "failures": [{"path": "gone_eeg.set", "zarr": "gone_eeg.zarr",
+                          "code": "not_continuous", "reason": "..."}],
+        }
+        index = merge_index(
+            prior, "nm000104", "new", [], ["gone_eeg.zarr"], "2026-06-13T00:00:00Z", [],
+        )
+        self.assertEqual(index["failure_count"], 0)
 
 
 class TestAwsRunner(unittest.TestCase):
