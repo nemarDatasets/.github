@@ -43,6 +43,15 @@ on:
         type: boolean
         default: false
 
+# Serialize enrichment per dataset+ref (nemarOrg/nemar-cli#755). A fresh push
+# (or re-dispatch) cancels an older in-flight run for the same dataset so the
+# LATEST sources win -- avoids two runs racing on the metadata commit and the
+# wasted OpenRouter calls. The in-flight git-push rebase-retry below stays as
+# the belt for any residual server-side (in-process enrichment) contention.
+concurrency:
+  group: run-enrichment-${{ github.event.client_payload.dataset_id || inputs.dataset_id }}-${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+  cancel-in-progress: true
+
 jobs:
   enrich:
     name: Run Enrichment
