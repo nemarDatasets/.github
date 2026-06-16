@@ -156,11 +156,12 @@ jobs:
           DATASET_ID: ${{ matrix.dataset_id }}
           NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
           SHARDS: ${{ env.SHARDS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           on_id="on${DATASET_ID#ds}"
           curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
             -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"copy\",\"status\":\"copying\",\"shards_total\":${SHARDS:-8}}" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"copy\",\"status\":\"copying\",\"shards_total\":${SHARDS:-8},\"workflow_run_url\":\"$RUN_URL\"}" \
             || echo "::warning::import-state copying callback failed for $on_id (non-fatal; sweep covers it)"
 
   copy:
@@ -226,11 +227,12 @@ jobs:
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
           NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           on_id="on${DATASET_ID#ds}"
           curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
             -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"finalizing\"}" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"finalizing\",\"workflow_run_url\":\"$RUN_URL\"}" \
             || echo "::warning::import-state finalizing callback failed for $on_id (non-fatal; sweep covers it)"
       - name: Finalize import
         # --trust-upstream: skip_ci_check fallback at publication time when the
@@ -249,11 +251,12 @@ jobs:
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
           NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           on_id="on${DATASET_ID#ds}"
           curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
             -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"complete\"}" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"complete\",\"workflow_run_url\":\"$RUN_URL\"}" \
             || echo "::warning::import-state complete callback failed for $on_id (non-fatal; report/sweep covers it)"
 
   # Terminal-failure detector (#754). Runs even when copy/finalize were
