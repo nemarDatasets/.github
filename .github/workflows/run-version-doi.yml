@@ -173,6 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE_URL="https://github.com/nemarDatasets/$DATASET_ID/releases/tag/$TAG"
+          API_BASE="https://api.nemar.org"
 
           echo "Publishing DOI for $DATASET_ID version $VERSION"
 
@@ -181,23 +182,27 @@ jobs:
             exit 0
           fi
 
-          # 2 attempts with a brief backoff. The DOI mint is fatal-on-failure
-          # (unlike the enrichment refresh which is best-effort), so a
-          # transient 5xx from EZID/Zenodo or Worker cold-start would
-          # otherwise red the job permanently and require operator rerun.
-          # 4xx remains terminal — that's a config error, not a hiccup.
-          # The Worker's /webhooks/publish-version-doi is idempotent on
-          # duplicate dispatches (EZID catches "already exists";
-          # handleZenodoVersionDoi short-circuits if dataset_versions
-          # already records the DOI — both fixed in nemarOrg/nemar-cli#607),
-          # so retrying after a success-then-network-blip is safe.
-          # Code-review #8.
+          # Enqueue the publish (nemarOrg/nemar-cli#751). The Worker returns:
+          #   - 202 + {accepted:true}      central async flow — the DOI mint +
+          #                                manifest dispatch run off the request
+          #                                path; we then poll for completion so a
+          #                                high-file-count dataset can't blow a
+          #                                60s synchronous curl.
+          #   - 200 + {version_doi}        legacy synchronous flow (prod before
+          #                                the MANIFEST_VIA_CENTRAL_WORKFLOW flip)
+          #                                — already done, nothing to poll.
+          #   - 200 + {skipped:true}       no concept DOI / non-semver — skip.
+          # The enqueue is fast either way, so --max-time 30 is ample. 3 attempts
+          # with backoff for transient 5xx / Worker cold-start; 4xx is terminal.
+          # /webhooks/publish-version-doi is idempotent (EZID "already exists";
+          # an in-flight accepted/dispatched row short-circuits), so re-POST after
+          # a success-then-blip is safe.
           HTTP_CODE=0
           BODY=""
-          for attempt in 1 2; do
+          for attempt in 1 2 3; do
             RESPONSE=$(curl -sS -w "\n%{http_code}" \
-              --connect-timeout 10 --max-time 60 \
-              -X POST "https://api.nemar.org/webhooks/publish-version-doi" \
+              --connect-timeout 10 --max-time 30 \
+              -X POST "$API_BASE/webhooks/publish-version-doi" \
               -H "Content-Type: application/json" \
               -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" \
               -d "{
@@ -207,39 +212,79 @@ jobs:
               }") || RESPONSE=$'\n0'
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
             BODY=$(echo "$RESPONSE" | head -n -1)
-            echo "attempt $attempt: HTTP $HTTP_CODE"
+            echo "enqueue attempt $attempt: HTTP $HTTP_CODE"
             echo "Response: $BODY"
             if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
               break
             fi
-            # 4xx is terminal — no retry. 5xx and curl-level failures get
-            # one retry after a 10s pause.
+            # 4xx is terminal — no retry. 5xx and curl-level failures retry.
             if [ "$HTTP_CODE" -ge 400 ] && [ "$HTTP_CODE" -lt 500 ]; then
               break
             fi
-            if [ "$attempt" -lt 2 ]; then
-              echo "::warning::attempt $attempt: HTTP $HTTP_CODE (transient); retrying in 10s"
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::enqueue attempt $attempt: HTTP $HTTP_CODE (transient); retrying in 10s"
               sleep 10
             fi
           done
 
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            if echo "$BODY" | jq -e '.skipped == true' > /dev/null 2>&1; then
-              echo "Skipped: $(echo "$BODY" | jq -r '.reason // "No concept DOI exists for this dataset"')"
-              exit 0
-            fi
-            echo "::error::Failed to publish DOI (HTTP $HTTP_CODE)"
-            exit 1
+          # Server-side skip short-circuit (no concept DOI / non-semver).
+          if echo "$BODY" | jq -e '.skipped == true' > /dev/null 2>&1; then
+            echo "Skipped: $(echo "$BODY" | jq -r '.reason // .error // "skipped by server"')"
+            exit 0
           fi
-          if [ "$HTTP_CODE" -lt 200 ]; then
-            echo "::error::Failed to publish DOI after 2 attempts (HTTP $HTTP_CODE)"
+          if [ "$HTTP_CODE" -ge 400 ] || [ "$HTTP_CODE" -lt 200 ]; then
+            echo "::error::Failed to enqueue version DOI publish (HTTP $HTTP_CODE)"
             exit 1
           fi
 
+          # Legacy synchronous success: body already carries version_doi and the
+          # manifest was generated in-request. Nothing to poll.
           DOI=$(echo "$BODY" | jq -r '.version_doi // empty')
-          if [ -n "$DOI" ]; then
-            echo "Version DOI published: $DOI"
+          ACCEPTED=$(echo "$BODY" | jq -r '.accepted // empty')
+          if [ -n "$DOI" ] && [ "$ACCEPTED" != "true" ]; then
+            echo "Version DOI published (synchronous): $DOI"
+            exit 0
           fi
+
+          # Async path: poll /webhooks/version-doi-status until the manifest_jobs
+          # row reaches ready (published) or failed. Exponential backoff capped at
+          # 30s, bounded well inside the 15-min job cap. `outcome` is computed
+          # server-side (ready->success, failed->fail, else wait).
+          echo "Publish accepted (202); polling for completion..."
+          DELAY=5
+          DEADLINE=$(( $(date +%s) + 780 ))
+          STATUS=""
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            SRESP=$(curl -sS -w "\n%{http_code}" \
+              --connect-timeout 10 --max-time 30 \
+              -G "$API_BASE/webhooks/version-doi-status" \
+              --data-urlencode "dataset_id=$DATASET_ID" \
+              --data-urlencode "version=$VERSION" \
+              -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN") || SRESP=$'\n0'
+            SCODE=$(echo "$SRESP" | tail -1)
+            SBODY=$(echo "$SRESP" | head -n -1)
+            if [ "$SCODE" -ge 200 ] && [ "$SCODE" -lt 300 ]; then
+              STATUS=$(echo "$SBODY" | jq -r '.status // "unknown"')
+              OUTCOME=$(echo "$SBODY" | jq -r '.outcome // "wait"')
+              echo "status=$STATUS outcome=$OUTCOME"
+              if [ "$OUTCOME" = "success" ]; then
+                DOI=$(echo "$SBODY" | jq -r '.version_doi // empty')
+                echo "Version DOI published: ${DOI:-<none>}"
+                exit 0
+              fi
+              if [ "$OUTCOME" = "fail" ]; then
+                echo "::error::Version DOI publish failed: $(echo "$SBODY" | jq -r '.error_message // "unknown error"')"
+                exit 1
+              fi
+            else
+              echo "::warning::status poll HTTP $SCODE (transient); will retry"
+            fi
+            sleep "$DELAY"
+            DELAY=$(( DELAY * 2 ))
+            if [ "$DELAY" -gt 30 ]; then DELAY=30; fi
+          done
+          echo "::error::Timed out waiting for version DOI publish to reach ready/failed (last status: ${STATUS:-none})"
+          exit 1
 
   trigger-archive:
     name: Trigger Archive Generation
