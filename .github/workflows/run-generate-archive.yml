@@ -44,9 +44,86 @@ on:
         type: string
         default: "https://api.nemar.org/webhooks/archive-ready"
 
+# Dedupe concurrent dispatches for the same (dataset, version). cancel-in-progress
+# false so a duplicate doesn't kill an in-flight build mid-multipart (the partial
+# cleanup + idempotency guard handle a re-run); the duplicate queues behind.
+concurrency:
+  group: generate-archive-${{ github.event.client_payload.dataset_id || inputs.dataset_id }}-${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
 jobs:
+  # Preflight (#752): datasets over the size/file-count policy skip the zip build
+  # entirely and steer users to the range-resumable per-file direct download.
+  # Runs before the expensive checkout/stream job so an oversized set never spins
+  # a 60-min-capped build that can't finish. Mirrors backend archive-policy.ts.
+  preflight:
+    name: Archive size preflight
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      VERSION: ${{ github.event.client_payload.version || inputs.version }}
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check archive size policy
+        id: check
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ] || [ -z "$VERSION" ]; then
+            echo "::error::Missing dataset_id/version"
+            exit 1
+          fi
+          # Mirror backend services/archive-policy.ts (ARCHIVE_MAX_BYTES = 100 GiB,
+          # ARCHIVE_MAX_FILES = 200000). Keep these in lockstep with that module.
+          MAX_BYTES=$((100 * 1024 * 1024 * 1024))
+          MAX_FILES=200000
+          MANIFEST_URL="https://data.nemar.org/${DATASET_ID}/v${VERSION}/manifest.json"
+          # Fail OPEN: if the manifest can't be read, build anyway (the 60-min cap
+          # is the backstop) rather than skip every archive on a transient blip.
+          if ! curl -fsS --connect-timeout 10 --max-time 120 "$MANIFEST_URL" -o /tmp/manifest.json; then
+            echo "::warning::manifest unavailable at $MANIFEST_URL; proceeding to build"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BYTES=$(jq '[.[].size // 0] | add // 0' /tmp/manifest.json)
+          FILES=$(jq 'length' /tmp/manifest.json)
+          echo "total: ${BYTES} bytes, ${FILES} files (limits ${MAX_BYTES} bytes / ${MAX_FILES} files)"
+          REASON=""
+          if [ "$BYTES" -gt "$MAX_BYTES" ]; then
+            GB=$(awk "BEGIN{printf \"%.1f\", ${BYTES}/1073741824}")
+            REASON="dataset ${GB} GB exceeds 100.0 GB archive limit; use direct download"
+          elif [ "$FILES" -gt "$MAX_FILES" ]; then
+            REASON="dataset ${FILES} files exceeds ${MAX_FILES} archive limit; use direct download"
+          fi
+          if [ -z "$REASON" ]; then
+            echo "Under archive limits; building zip."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::notice::Skipping archive build: ${REASON}"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          if [ -z "$CALLBACK_TOKEN" ]; then
+            echo "::warning::NEMAR_WEBHOOK_TOKEN unset; cannot record skipped state"
+            exit 0
+          fi
+          jq -nc --arg id "$DATASET_ID" --arg v "$VERSION" --arg r "$REASON" \
+            '{dataset_id:$id,status:"skipped",version:$v,reason:$r}' > /tmp/skip.json
+          HTTP=$(curl -sS -o /tmp/skip-resp.json -w "%{http_code}" --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+            -H "X-Webhook-Token: $CALLBACK_TOKEN" -d @/tmp/skip.json) || HTTP=0
+          echo "skip callback HTTP ${HTTP}: $(cat /tmp/skip-resp.json 2>/dev/null || true)"
+          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+            echo "::warning::skip callback failed (HTTP ${HTTP}); archive_skip_reason may lag"
+          fi
+
   archive:
     name: Generate Dataset Archive
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # Streaming archive completes in single-digit minutes for typical
     # datasets; even a 250 GB upload finishes well under 30. Cap at 60
@@ -246,7 +323,10 @@ jobs:
                 Body: passThrough,
                 ContentType: "application/zip",
               },
-              queueSize: 4,
+              // 6 parts in flight x 100 MB = ~600 MB buffered, comfortably under
+              // the runner's memory; modestly faster than 4 for sub-threshold sets
+              // now that >100 GB sets skip the build entirely (#752).
+              queueSize: 6,
               partSize: 100 * 1024 * 1024,
             });
 
