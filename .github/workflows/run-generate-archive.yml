@@ -84,8 +84,18 @@ jobs:
           MANIFEST_URL="https://data.nemar.org/${DATASET_ID}/v${VERSION}/manifest.json"
           # Fail OPEN: if the manifest can't be read, build anyway (the 60-min cap
           # is the backstop) rather than skip every archive on a transient blip.
+          # ::error:: (not warning) so a transient 404 that lets a doomed build
+          # through is VISIBLE in the run, even though the job itself succeeds.
           if ! curl -fsS --connect-timeout 10 --max-time 120 "$MANIFEST_URL" -o /tmp/manifest.json; then
-            echo "::warning::manifest unavailable at $MANIFEST_URL; proceeding to build"
+            echo "::error::manifest unavailable at $MANIFEST_URL; proceeding to build (size guard skipped)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Guard the jq sums against an unexpected manifest shape: a non-array
+          # would make `length`/`.[].size` silently yield 0 -> under-threshold ->
+          # the very build we meant to skip. Fail OPEN + visibly instead.
+          if [ "$(jq -r 'type' /tmp/manifest.json 2>/dev/null || echo invalid)" != "array" ]; then
+            echo "::error::manifest is not a JSON array; proceeding to build (size guard skipped)"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -117,7 +127,13 @@ jobs:
             -H "X-Webhook-Token: $CALLBACK_TOKEN" -d @/tmp/skip.json) || HTTP=0
           echo "skip callback HTTP ${HTTP}: $(cat /tmp/skip-resp.json 2>/dev/null || true)"
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
-            echo "::warning::skip callback failed (HTTP ${HTTP}); archive_skip_reason may lag"
+            # FAIL the job (don't exit 0): if we skip the build but never record
+            # archive_skip_reason, the dataset is a silent dead-end (NULL status +
+            # NULL reason = "missing archive" forever). A red preflight is visible
+            # and re-runnable; the gated archive job is skipped on a failed dep, so
+            # there's no doomed build. Re-run is idempotent (re-skips, re-POSTs).
+            echo "::error::skip callback failed (HTTP ${HTTP}); failing so archive_skip_reason is not silently dropped"
+            exit 1
           fi
 
   archive:
