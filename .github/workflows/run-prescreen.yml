@@ -132,7 +132,7 @@ jobs:
           KEYRE='(SHA256E|SHA512E|SHA1E|MD5E)-s[0-9]+'
           KEYS=$(
             {
-              grep -rhoE "$KEYRE" . 2>/dev/null
+              grep -rhoE --exclude-dir='.git' "$KEYRE" . 2>/dev/null
               find . -type l ! -path './.git/*' -exec readlink {} + 2>/dev/null \
                 | awk -v re="$KEYRE" 'match($0, re){print substr($0, RSTART, RLENGTH)}'
             } || true
