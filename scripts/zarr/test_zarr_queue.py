@@ -116,6 +116,57 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(backoff_seconds(3, 100), 400)
         self.assertEqual(backoff_seconds(100, 100), 6 * 3600)
 
+    # --- #774: deterministic data failures are terminal, don't re-queue --------
+
+    def test_deterministic_fail_is_terminal_data_failed(self):
+        reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        claim_next(self.conn)
+        # One deterministic failure -> terminal data_failed immediately, even
+        # though max_attempts is high (no retry).
+        self.assertEqual(
+            mark_fail(self.conn, "nm000001", "MaxShield .fif", 5, 1800, deterministic=True),
+            "data_failed",
+        )
+        self.assertEqual(self.status("nm000001"), "data_failed")
+
+    def test_reconcile_does_not_requeue_terminal_same_version(self):
+        # The bug #774 fixes: a failed/data_failed row was re-queued on every
+        # reconcile (converted_version is NULL != latest), wedging the queue.
+        reconcile(self.conn, [("nm000001", "1.0.0"), ("nm000002", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000001", "boom", 1, 1800)  # -> failed (infra, exhausted)
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000002", "unreadable", 5, 1800, deterministic=True)  # -> data_failed
+        res = reconcile(self.conn, [("nm000001", "1.0.0"), ("nm000002", "1.0.0")], 3600)
+        self.assertEqual(res["enqueued"], 0)
+        self.assertEqual(self.status("nm000001"), "failed")
+        self.assertEqual(self.status("nm000002"), "data_failed")
+
+    def test_reconcile_requeues_terminal_on_new_version(self):
+        # A genuinely new snapshot DOES retry a terminal failure from scratch.
+        reconcile(self.conn, [("nm000001", "1.0.0"), ("nm000002", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000001", "boom", 1, 1800)  # -> failed
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000002", "unreadable", 5, 1800, deterministic=True)  # -> data_failed
+        res = reconcile(self.conn, [("nm000001", "2.0.0"), ("nm000002", "2.0.0")], 3600)
+        self.assertEqual(res["enqueued"], 2)
+        self.assertEqual(self.status("nm000001"), "pending")
+        self.assertEqual(self.status("nm000002"), "pending")
+        # attempts reset so the new version gets its full retry budget.
+        row = self.conn.execute(
+            "SELECT attempts, last_error FROM jobs WHERE dataset_id='nm000001'"
+        ).fetchone()
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["last_error"])
+
+    def test_data_failed_not_claimable(self):
+        reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_fail(self.conn, "nm000001", "unreadable", 5, 1800, deterministic=True)
+        # terminal -> never handed back out by claim_next
+        self.assertIsNone(claim_next(self.conn))
+
 
 if __name__ == "__main__":
     unittest.main()

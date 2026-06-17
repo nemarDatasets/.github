@@ -1555,12 +1555,39 @@ def main() -> int:
         )
         print(f"[zarr] removed store {rel_store}", flush=True)
 
+    # `deterministic` = every failure is a typed DATA failure (biosigIO carries a
+    # `.code`); none are infra (crashed worker / transient S3). The driver uses
+    # this to mark a total failure terminal (`data_failed`, no retry) vs infra
+    # (bounded retry) — and the backend records it for the failures dashboard.
+    # See nemarOrg/nemar-cli#774.
+    infra_failures = len(failures) - len(failure_entries)
+    deterministic = bool(failures) and infra_failures == 0
+
     # Hard fail: every attempted conversion errored and nothing was removed. Do
     # NOT advance the checkpoint or rewrite the index (that would strand the
-    # failed recordings); return non-zero so the workflow's failure callback
-    # flips zarr_status to 'failed' and the prior index is left intact.
+    # failed recordings); return non-zero. Still write the callback (status
+    # "failed") so the driver can classify data-vs-infra and the backend records
+    # WHAT failed even on a total failure (#774 — previously no callback was
+    # written here, so total failures were invisible).
     if convert and not converted_entries and not remove:
         print(f"::error::all {len(convert)} conversion(s) failed; index left untouched", flush=True)
+        with open(args.callback_out, "w") as fh:
+            json.dump(
+                {
+                    "dataset_id": dataset_id,
+                    "status": "failed",
+                    "store_count": int((prior or {}).get("store_count", 0) or 0),
+                    "commit": head,
+                    "converted": [],
+                    "removed": [],
+                    "errors": len(failures),
+                    "failed": failures,
+                    "failure_count": len(failure_entries),
+                    "data_failures": failure_entries,
+                    "deterministic": deterministic,
+                },
+                fh,
+            )
         return 1
 
     # Advance source_commit to HEAD unless there are INFRA failures to retry. A
@@ -1569,7 +1596,7 @@ def main() -> int:
     # dataset -- so it does not hold the commit back; it's recorded in the index's
     # `failures` instead. An infra failure (no code: crashed worker, transient S3)
     # keeps the prior commit ("" -> next run goes full) so it is re-diffed + retried.
-    infra_failures = len(failures) - len(failure_entries)
+    # (`infra_failures` / `deterministic` computed above, before the total-fail path.)
     index_commit = head if not infra_failures else (prior_commit or "")
     index = merge_index(
         prior, dataset_id, index_commit, converted_entries, remove, updated, failure_entries
@@ -1604,6 +1631,10 @@ def main() -> int:
         # Typed data failures (recordings the viewer should explain, not retry).
         "failure_count": index["failure_count"],
         "data_failures": failure_entries,
+        # On a partial run the dataset is still `done` (the index has what
+        # converted); `deterministic` only tells the backend whether the skipped
+        # recordings are data (won't retry) vs infra. See #774.
+        "deterministic": deterministic,
     }
     with open(args.callback_out, "w") as fh:
         json.dump(callback, fh)
