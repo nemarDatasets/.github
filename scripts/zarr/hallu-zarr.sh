@@ -141,6 +141,11 @@ convert_dataset() {
   local id="$1" version="${2:-}"
   local dir="$WORK_DIR/$id"
   local cb="$WORK_DIR/$id.callback.json"
+  # Reset BEFORE any early return so the drain loop never reads an unbound (set -u
+  # aborts) or stale value: a clone-failure early-return below must NOT inherit
+  # the previous dataset's `deterministic` and get mis-marked terminal. Set from
+  # the callback further down on a real conversion run.
+  LAST_DETERMINISTIC=false
   log "[$id] start (version=${version:-?})"
 
   # Metadata-only clone (git history + annex pointers, no content -- seconds, not
@@ -167,8 +172,8 @@ convert_dataset() {
   # Read the driver's classification BEFORE the scratch is reclaimed. The
   # converter now writes the callback on EVERY outcome (incl. a total failure),
   # carrying `deterministic` = all failures are typed DATA failures. The drain
-  # loop uses it to mark a total failure terminal (data_failed) vs retry (#774).
-  LAST_DETERMINISTIC=false
+  # loop only consults LAST_DETERMINISTIC in the failure (rc!=0) branch: a
+  # partial success returns rc=0 -> `done` regardless of this value (#774).
   if [[ -f "$cb" ]]; then
     LAST_DETERMINISTIC="$(jq -r '.deterministic // false' "$cb" 2>/dev/null || echo false)"
     # POST on every outcome (not just rc==0) so the backend records failures too.
