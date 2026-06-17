@@ -3,12 +3,21 @@
 # This workflow imports OpenNeuro datasets into NEMAR.
 # Deploy to: nemarDatasets/.github/workflows/onboard-openneuro.yml
 #
-# Creates the NEMAR dataset record, GitHub repo, copies annexed data
-# directly from OpenNeuro S3 to NEMAR S3 (no local download), seeds
-# .nemar/metadata.json, and pushes to nemarDatasets.
+# Three phases per dataset (nemarOrg/nemar-cli#750):
+#   prepare  - clone OpenNeuro, create the NEMAR record + repo, build the
+#              key->source manifest (staged to S3), seed metadata, push main.
+#   copy     - server-side copy OpenNeuro S3 -> NEMAR S3, SHARDED across N
+#              parallel jobs and resumable (already-copied objects are skipped).
+#              Bytes stay on AWS's backbone; the runner is not the bottleneck,
+#              so multi-TB datasets finish well within the per-job timeout.
+#   finalize - verify all objects landed, register git-annex keys, push the
+#              git-annex branch, deploy CI, and publish.
+#
+# copy/finalize run with `if: ${{ !cancelled() }}` so a failure for one dataset
+# (or one shard) doesn't block the others; finalize's re-list verification gates
+# correctness per dataset.
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
-# Each dataset is processed in parallel via matrix strategy.
 
 name: Onboard OpenNeuro Dataset
 
@@ -20,18 +29,30 @@ on:
         required: true
         type: string
 
+# Prevent two simultaneous dispatches from clobbering each other's S3 staging.
+concurrency:
+  group: onboard-openneuro-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SHARDS: "8"
+
 jobs:
   parse-ids:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
+      shards: ${{ steps.parse.outputs.shards }}
     steps:
-      - name: Parse dataset IDs into matrix
+      - name: Parse dataset IDs and dedup against existing nemarDatasets repos
         id: parse
         env:
           INPUT_IDS: ${{ inputs.openneuro_ids }}
+          # PAT (not GITHUB_TOKEN) because nemarDatasets dataset repos are
+          # private and outside the org this workflow runs in.
+          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
         run: |
-          # Validate all IDs match ds###### format
+          # Step 1: validate format.
           for id in $(echo "$INPUT_IDS" | tr ',' ' '); do
             id=$(echo "$id" | xargs)
             if ! echo "$id" | grep -qE '^ds[0-9]{6}$'; then
@@ -39,49 +60,241 @@ jobs:
               exit 1
             fi
           done
-          # Convert comma-separated to JSON array
-          JSON=$(echo "$INPUT_IDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -s -c .)
-          echo "matrix={\"dataset_id\":$JSON}" >> "$GITHUB_OUTPUT"
-          echo "Parsed datasets: $JSON"
 
-  onboard:
+          # Step 2: dedup against existing on* repos on nemarDatasets.
+          # Until nemarOrg/nemar-cli#448 (proper "update existing OpenNeuro
+          # dataset" command) lands, re-importing a live dataset would
+          # clobber state. Skip any ds###### whose on###### counterpart
+          # already exists with non-empty contents. Empty shells (size==0,
+          # e.g. the nemarOrg/nemar-cli#450 recovery state) are kept so
+          # operators can re-import after deleting them.
+          kept=()
+          skipped=()
+          for ds in $(echo "$INPUT_IDS" | tr ',' ' '); do
+            ds=$(echo "$ds" | xargs)
+            on="on${ds#ds}"
+            http_status=$(curl -fsSL -o /tmp/repo.json -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: nemar-onboard-openneuro" \
+              "https://api.github.com/repos/nemarDatasets/$on" || true)
+            if [ "$http_status" = "404" ]; then
+              kept+=("$ds")
+              continue
+            fi
+            if [ "$http_status" != "200" ]; then
+              echo "::error::Unexpected HTTP $http_status checking nemarDatasets/$on; aborting to avoid duplicate imports"
+              cat /tmp/repo.json || true
+              exit 1
+            fi
+            size=$(jq -r '.size // 0' /tmp/repo.json)
+            if [ "$size" -gt 0 ]; then
+              skipped+=("$ds")
+              echo "::warning::Skipping $ds: nemarDatasets/$on already exists (size=${size}KB). Run 'nemar admin delete-dataset $on --force' first if you intend to re-import. See nemarOrg/nemar-cli#448 for the proper update workflow."
+            else
+              # Empty shell — almost certainly a #450 leftover. Importer
+              # will hit "Dataset already exists, continuing..." and
+              # re-populate cleanly.
+              kept+=("$ds")
+            fi
+          done
+
+          if [ ${#kept[@]} -eq 0 ]; then
+            echo "::error::All input IDs already exist on nemarDatasets with non-empty contents. Nothing to import."
+            exit 1
+          fi
+
+          JSON=$(printf '%s\n' "${kept[@]}" | jq -R . | jq -s -c .)
+          echo "matrix={\"dataset_id\":$JSON}" >> "$GITHUB_OUTPUT"
+
+          # Emit the shard index list [0..SHARDS-1] derived from env.SHARDS, so
+          # the copy matrix and the --shard denominator share ONE source of truth.
+          SHARD_JSON=$(seq 0 $((SHARDS - 1)) | jq -R 'tonumber' | jq -s -c .)
+          echo "shards=$SHARD_JSON" >> "$GITHUB_OUTPUT"
+
+          echo "Will import (${#kept[@]}): ${kept[*]} across ${SHARDS} copy shards"
+          if [ ${#skipped[@]} -gt 0 ]; then
+            echo "Skipped (${#skipped[@]}, already on nemarDatasets): ${skipped[*]}"
+          fi
+
+  prepare:
     needs: parse-ids
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix: ${{ fromJson(needs.parse-ids.outputs.matrix) }}
       fail-fast: false
     steps:
       - name: Install git-annex
         run: sudo apt-get update && sudo apt-get install -y git-annex
-
       - name: Configure git
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-
       - name: Install bun
         uses: oven-sh/setup-bun@v2
-
       - name: Install nemar CLI
         run: bun install -g nemar-cli
-
       - name: Authenticate nemar CLI
         env:
           NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
         run: nemar auth login --key "$NEMAR_API_KEY"
-
-      - name: Import dataset
+      - name: Prepare import
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        # --local: run import in-process. --trust-upstream: skip_ci_check
-        # fallback at publication time when the bounded poll observes the
-        # CI was deployed but no validation workflow_run registered within
-        # the window. Safe for OpenNeuro because data is already BIDS-
-        # validated upstream. The flag does NOT bypass:
-        #   - CI deploy failure (still aborts; missing workflows == no safety net)
-        #   - persistent polling errors (still aborts; never observed state)
-        # See nemarOrg/nemar-cli#431 for the design rationale.
-        run: nemar admin import-openneuro "$DATASET_ID" --local --trust-upstream
+        run: nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream
+      # Import-state tracking (#754). The `preparing` row is seeded server-side
+      # by /admin/datasets/import; here we record the copy transition. All
+      # callbacks are best-effort -- the scheduled sweep + report job are the
+      # backstops, so a callback hiccup never fails the import.
+      - name: Mark import copying
+        if: success()
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          SHARDS: ${{ env.SHARDS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          on_id="on${DATASET_ID#ds}"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"copy\",\"status\":\"copying\",\"shards_total\":${SHARDS:-8},\"workflow_run_url\":\"$RUN_URL\"}" \
+            || echo "::warning::import-state copying callback failed for $on_id (non-fatal; sweep covers it)"
+
+  copy:
+    needs: [parse-ids, prepare]
+    # Run even if a prepare leg failed: per-dataset isolation. copyShard reads
+    # the manifest from S3; datasets whose prepare failed have none and that
+    # shard fails harmlessly while the rest proceed.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    # Server-side copies stay on AWS's backbone; 350 min (< the 360 hard cap)
+    # is ample headroom per shard for even multi-TB datasets.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        dataset_id: ${{ fromJson(needs.parse-ids.outputs.matrix).dataset_id }}
+        # Shard index list derived from env.SHARDS by parse-ids (single source of
+        # truth with the --shard denominator below). Each leg copies its slice.
+        shard: ${{ fromJson(needs.parse-ids.outputs.shards) }}
+    steps:
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install nemar CLI
+        run: bun install -g nemar-cli
+      - name: Authenticate nemar CLI
+        env:
+          NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
+        run: nemar auth login --key "$NEMAR_API_KEY"
+      - name: Copy shard
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: nemar admin import-openneuro "$DATASET_ID" --phase copy --shard "${{ matrix.shard }}/${{ env.SHARDS }}" --trust-upstream
+
+  finalize:
+    needs: [parse-ids, copy]
+    # Run even if some copy shards failed: finalize's re-list verification gates
+    # each dataset independently, so complete datasets still publish.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      matrix: ${{ fromJson(needs.parse-ids.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Install git-annex
+        run: sudo apt-get update && sudo apt-get install -y git-annex
+      - name: Configure git
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install nemar CLI
+        run: bun install -g nemar-cli
+      - name: Authenticate nemar CLI
+        env:
+          NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
+        run: nemar auth login --key "$NEMAR_API_KEY"
+      - name: Mark import finalizing
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          on_id="on${DATASET_ID#ds}"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"finalizing\",\"workflow_run_url\":\"$RUN_URL\"}" \
+            || echo "::warning::import-state finalizing callback failed for $on_id (non-fatal; sweep covers it)"
+      - name: Finalize import
+        # --trust-upstream: skip_ci_check fallback at publication time when the
+        # bounded poll observes CI deployed but no validation workflow_run
+        # registered within the window. Safe for OpenNeuro (BIDS-validated
+        # upstream). Does NOT bypass CI deploy failure or persistent poll errors.
+        # See nemarOrg/nemar-cli#431.
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: nemar admin import-openneuro "$DATASET_ID" --phase finalize --trust-upstream
+      - name: Mark import complete
+        if: success()
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          on_id="on${DATASET_ID#ds}"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"finalize\",\"status\":\"complete\",\"workflow_run_url\":\"$RUN_URL\"}" \
+            || echo "::warning::import-state complete callback failed for $on_id (non-fatal; report/sweep covers it)"
+
+  # Terminal-failure detector (#754). Runs even when copy/finalize were
+  # cancelled (the 6h-cap incident) or skipped, which the per-job success steps
+  # above cannot. POSTs `failed` for every attempted dataset; the backend's
+  # monotonic sticky upsert makes that a no-op for any dataset that already
+  # reached `complete`, so only genuinely-stuck imports are failed (and then
+  # quarantined / rolled back). Skipped entirely on a fully-finalized run.
+  report:
+    needs: [parse-ids, prepare, copy, finalize]
+    if: ${{ always() && needs.parse-ids.result == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.parse-ids.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Report terminal import state
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          PREP: ${{ needs.prepare.result }}
+          COPY: ${{ needs.copy.result }}
+          FIN: ${{ needs.finalize.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$FIN" = "success" ]; then
+            echo "All datasets finalized (finalize=success); no terminal report needed."
+            exit 0
+          fi
+          on_id="on${DATASET_ID#ds}"
+          # Coarse stage label from the aggregate job results. The pass/fail
+          # decision is the backend's: this `failed` no-ops for any dataset that
+          # already reached `complete` via the monotonic sticky upsert.
+          if   [ "$PREP" != "success" ]; then stage=prepare
+          elif [ "$COPY" != "success" ]; then stage=copy
+          else stage=finalize
+          fi
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"$stage\",\"status\":\"failed\",\"error_message\":\"terminal: prepare=$PREP copy=$COPY finalize=$FIN\",\"workflow_run_url\":\"$RUN_URL\"}" \
+            || echo "::warning::import-state report callback failed for $on_id (non-fatal; sweep covers it)"
