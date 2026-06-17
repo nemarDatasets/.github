@@ -148,6 +148,18 @@ convert_dataset() {
   LAST_DETERMINISTIC=false
   log "[$id] start (version=${version:-?})"
 
+  # In-progress signal so the observability dashboard's "Processing" tile reflects
+  # live conversions (the cron has no Actions dispatch to set zarr_status=pending;
+  # #774). Best-effort: a failed/skipped POST never blocks the conversion -- the
+  # terminal ready/failed callback below is the authoritative state.
+  if [[ -n "$NEMAR_WEBHOOK_TOKEN" ]]; then
+    curl -sS --connect-timeout 10 --max-time 30 -X POST "$CALLBACK_URL" \
+      -H "Content-Type: application/json" \
+      -H "X-Webhook-Token: ${NEMAR_WEBHOOK_TOKEN}" \
+      --data "{\"dataset_id\":\"$id\",\"status\":\"converting\"}" >>"$LOG_FILE" 2>&1 \
+      || err "[$id] converting callback failed (non-fatal)"
+  fi
+
   # Metadata-only clone (git history + annex pointers, no content -- seconds, not
   # the whole 18 GB). The driver then STREAMS each recording's annex blob from
   # s3://nemar/<id>/objects/<key> just-in-time, converts, pushes, and moves on,
