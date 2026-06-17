@@ -10,12 +10,15 @@ name: Run Pre-screen
 #      data size from git-annex pointer keys, file-type/subject summary),
 #   3. runs `claude -p --model haiku` to judge the publisher minimum
 #      (real data present, README says what/how, Name + Authors present),
-#   4. on a block verdict, opens/updates a GitHub issue on the dataset repo
-#      (via the NEMAR_GITHUB_PAT, Issues:write),
-#   5. POSTs the verdict to the Worker (/webhooks/prescreen-result) with the
+#   4. POSTs the verdict to the Worker (/webhooks/prescreen-result) with the
 #      one-shot HMAC callback token. The Worker independently re-checks S3
-#      object presence (it has the AWS creds), then blocks + emails the
-#      requester or marks the screen passed.
+#      object presence (it has the AWS creds), then records a non-blocking
+#      ADVISORY (prescreen_status='concern') or marks the screen passed.
+#
+# The pre-screen is ADVISORY (nemarOrg/nemar-cli#756): it does NOT block
+# publication and no longer opens a GitHub issue on the dataset repo (that red
+# flag masked real BIDS/CI failures and admins overrode the block anyway). The
+# concern + reasons surface in `nemar dataset/admin publish status`.
 #
 # Lives on nemarDatasets/.github so its Actions minutes bill against the
 # dataset org's Team allowance (same accounting as the enrichment/manifest
@@ -24,7 +27,6 @@ name: Run Pre-screen
 # Required secrets on nemarDatasets/.github:
 #   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY  - per-repo checkout token
 #   CLAUDE_CODE_OAUTH_TOKEN              - Claude Code auth for `claude -p`
-#   NEMAR_GITHUB_PAT                     - PAT with Issues:write that opens the issue
 
 on:
   repository_dispatch:
@@ -52,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Zero default GITHUB_TOKEN scope. Checkout uses a per-repo App token;
-    # the issue is opened with NEMAR_GITHUB_PAT; the callback is HMAC-auth'd.
+    # the callback is HMAC-auth'd. (Advisory pre-screen opens no issue, #756.)
     permissions: {}
     env:
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
@@ -196,37 +198,12 @@ jobs:
           echo "verdict=$(jq -r '.verdict' /tmp/verdict.json)" >> "$GITHUB_OUTPUT"
           echo "Verdict: $(jq -rc '{verdict,reasons}' /tmp/verdict.json)"
 
-      - name: Open / update issue on block
-        id: issue
-        if: steps.screen.outputs.verdict == 'block'
-        env:
-          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
-        run: |
-          set -euo pipefail
-          # Sanitize the model-supplied title: strip control chars/newlines and
-          # cap length. (Passing it as a quoted "$TITLE" argv to gh is already
-          # safe from command substitution -- bash does not re-evaluate $() that
-          # lives in a variable's value -- but this keeps the title tidy.)
-          TITLE=$(jq -r '.issue_title // "Publication on hold: missing essentials"' /tmp/verdict.json | tr -d '\000-\037' | head -c 180)
-          [ -n "$TITLE" ] || TITLE="Publication on hold: missing essentials"
-          jq -r '.issue_body // "The automated pre-screen found missing publication essentials."' /tmp/verdict.json > /tmp/issue_body.md
-          # Idempotent: reuse an existing open pre-screen issue rather than
-          # spamming a new one on every re-request.
-          EXISTING=$(gh issue list --repo "nemarDatasets/$DATASET_ID" --state open \
-            --search 'Publication on hold in:title' --json number,url --jq '.[0].url // empty' || true)
-          if [ -n "$EXISTING" ]; then
-            {
-              echo "Re-screened $(date -u +%FT%TZ): still blocked."
-              echo
-              jq -r '.reasons[]? | "- \(.)"' /tmp/verdict.json
-            } > /tmp/comment.md
-            gh issue comment "$EXISTING" --body-file /tmp/comment.md
-            URL="$EXISTING"
-          else
-            URL=$(gh issue create --repo "nemarDatasets/$DATASET_ID" --title "$TITLE" --body-file /tmp/issue_body.md)
-          fi
-          echo "issue_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "Issue: $URL"
+      # Pre-screen is advisory (nemarOrg/nemar-cli#756): it no longer opens a
+      # "Block:" issue on the dataset repo (that red flag masked real BIDS/CI
+      # failures and the block was overridden anyway). The reasons flow to the
+      # Worker in the callback below and are recorded as a non-blocking advisory
+      # (prescreen_status='concern'), surfaced in `nemar dataset/admin publish
+      # status`. This also drops the NEMAR_GITHUB_PAT issue-write usage here.
 
       - name: Post verdict callback
         if: always() && steps.screen.outputs.verdict != ''
@@ -236,7 +213,7 @@ jobs:
           if [ -z "${CALLBACK_TOKEN:-}" ]; then echo "::error::callback_url set but callback_token missing"; exit 1; fi
           VERDICT=$(jq -r '.verdict' /tmp/verdict.json)
           REASONS=$(jq -c '.reasons // []' /tmp/verdict.json)
-          ISSUE_URL="${{ steps.issue.outputs.issue_url }}"
+          ISSUE_URL=""  # advisory pre-screen no longer opens a repo issue (#756)
           BODY=$(jq -nc \
             --arg d "$DATASET_ID" --argjson rid "${REQUEST_ID:-0}" --arg v "$VERDICT" \
             --argjson reasons "$REASONS" --arg iu "$ISSUE_URL" --arg run "${GITHUB_RUN_ID}" \
