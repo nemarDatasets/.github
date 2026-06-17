@@ -10,9 +10,17 @@ fires and the queue picks up exactly where it left off.
 
 One row per dataset:
     jobs(dataset_id PK, latest_version, converted_version,
-         status,            -- pending | inprogress | done | failed
+         status,            -- pending | inprogress | done | failed | data_failed
          attempts, last_error, next_retry_at (epoch),
          enqueued_at (ISO), updated_at (epoch))
+
+`failed` is an INFRA failure that exhausted its bounded retries (transient: a
+crashed worker / S3 blip — could be re-tried manually). `data_failed` is a
+deterministic DATA failure (a recording biosigIO can't read, e.g. a MaxShield
+MEG `.fif`); it fails identically every run, so it is terminal immediately and
+is NOT re-queued by reconcile until a genuinely new dataset version appears
+(nemarOrg/nemar-cli#774 — previously every reconcile re-queued failed rows from
+scratch, which wedged the queue on a single unconvertible dataset).
 
 Subcommands (all take --db):
     reconcile --api-base URL [--stale-seconds N]
@@ -99,7 +107,8 @@ def reconcile(conn: sqlite3.Connection, datasets: list[tuple[str, str]], stale_s
         if not DATASET_ID_RE.match(dataset_id) or dataset_id == "nm099999":
             continue
         row = conn.execute(
-            "SELECT status, converted_version FROM jobs WHERE dataset_id=?", (dataset_id,)
+            "SELECT status, converted_version, latest_version FROM jobs WHERE dataset_id=?",
+            (dataset_id,),
         ).fetchone()
         if row is None:
             conn.execute(
@@ -108,19 +117,36 @@ def reconcile(conn: sqlite3.Connection, datasets: list[tuple[str, str]], stale_s
                 (dataset_id, latest, now_iso, now),
             )
             enq += 1
-        elif latest and latest != (row["converted_version"] or ""):
-            if row["status"] in ("done", "failed"):
-                # New version available (or a failed one to retry from scratch).
+            continue
+        status = row["status"]
+        if status == "done":
+            # Re-convert only when a version newer than the one we converted
+            # appears.
+            if latest and latest != (row["converted_version"] or ""):
                 conn.execute(
                     "UPDATE jobs SET latest_version=?, status='pending', attempts=0,"
                     " next_retry_at=0, updated_at=? WHERE dataset_id=?",
                     (latest, now, dataset_id),
                 )
                 enq += 1
-            else:
-                # Already pending/inprogress -- refresh the target version only.
-                # Do NOT touch updated_at: it is the inprogress heartbeat the
-                # stale-recovery sweep below relies on.
+        elif status in ("failed", "data_failed"):
+            # Terminal for THIS version (#774). Only a genuinely NEW snapshot
+            # (latest != the version we already gave up on) retries -- compare
+            # against latest_version, NOT converted_version (which is NULL on a
+            # failure, so the old check re-queued every reconcile and wedged the
+            # queue on one unconvertible dataset).
+            if latest and latest != (row["latest_version"] or ""):
+                conn.execute(
+                    "UPDATE jobs SET latest_version=?, status='pending', attempts=0,"
+                    " next_retry_at=0, last_error=NULL, updated_at=? WHERE dataset_id=?",
+                    (latest, now, dataset_id),
+                )
+                enq += 1
+        else:
+            # pending / inprogress -- refresh the target version only. Do NOT
+            # touch updated_at: it is the inprogress heartbeat the stale-recovery
+            # sweep below relies on.
+            if latest and latest != (row["latest_version"] or ""):
                 conn.execute(
                     "UPDATE jobs SET latest_version=? WHERE dataset_id=?",
                     (latest, dataset_id),
@@ -164,13 +190,26 @@ def mark_done(conn: sqlite3.Connection, dataset_id: str, version: str) -> None:
 
 
 def mark_fail(
-    conn: sqlite3.Connection, dataset_id: str, error: str, max_attempts: int, backoff_base: int
+    conn: sqlite3.Connection,
+    dataset_id: str,
+    error: str,
+    max_attempts: int,
+    backoff_base: int,
+    deterministic: bool = False,
 ) -> str:
-    """Record a failure. Reschedule (pending + next_retry_at) until max_attempts,
-    then terminal `failed`. Returns the resulting status."""
+    """Record a failure and return the resulting status.
+
+    `deterministic=True` (a typed DATA failure — biosigIO can't read the
+    recording) is terminal **immediately** as `data_failed`: it would fail
+    identically on every retry, so retrying only wedges the queue (#774). An
+    infra failure reschedules (pending + backoff) until max_attempts, then
+    terminal `failed`.
+    """
     row = conn.execute("SELECT attempts FROM jobs WHERE dataset_id=?", (dataset_id,)).fetchone()
     attempts = (row["attempts"] if row else 0) + 1
-    if attempts >= max_attempts:
+    if deterministic:
+        status, next_retry = "data_failed", 0
+    elif attempts >= max_attempts:
         status, next_retry = "failed", 0
     else:
         status, next_retry = "pending", _now() + backoff_seconds(attempts, backoff_base)
@@ -236,6 +275,11 @@ def main() -> int:
     p.add_argument("error")
     p.add_argument("--max-attempts", type=int, default=5)
     p.add_argument("--backoff-base", type=int, default=1800)
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="typed DATA failure: terminal `data_failed` now, no retry/requeue (#774)",
+    )
 
     sub.add_parser("stats")
 
@@ -262,7 +306,14 @@ def main() -> int:
         return 0
 
     if args.cmd == "fail":
-        status = mark_fail(conn, args.dataset, args.error, args.max_attempts, args.backoff_base)
+        status = mark_fail(
+            conn,
+            args.dataset,
+            args.error,
+            args.max_attempts,
+            args.backoff_base,
+            deterministic=args.deterministic,
+        )
         print(f"{args.dataset} -> {status}")
         return 0
 
@@ -270,11 +321,15 @@ def main() -> int:
         rows = conn.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status").fetchall()
         print("status: " + (", ".join(f"{r['status']}={r['n']}" for r in rows) or "(empty)"))
         fails = conn.execute(
-            "SELECT dataset_id, attempts, last_error FROM jobs WHERE status='failed'"
+            "SELECT dataset_id, status, attempts, last_error FROM jobs"
+            " WHERE status IN ('failed', 'data_failed')"
             " ORDER BY updated_at DESC LIMIT 5"
         ).fetchall()
         for r in fails:
-            print(f"  failed {r['dataset_id']} attempts={r['attempts']}: {(r['last_error'] or '')[:120]}")
+            print(
+                f"  {r['status']} {r['dataset_id']} attempts={r['attempts']}:"
+                f" {(r['last_error'] or '')[:120]}"
+            )
         return 0
 
     return 2
