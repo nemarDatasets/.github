@@ -28,6 +28,10 @@ on:
         description: "Comma-separated OpenNeuro dataset IDs (e.g., ds007262,ds007263)"
         required: true
         type: string
+  # Automatic dispatch from api.nemar.org's auto-import tick (nemarOrg/nemar-cli
+  # #775). client_payload.openneuro_ids carries the (already D1-deduped) id(s).
+  repository_dispatch:
+    types: [onboard-openneuro]
 
 # Prevent two simultaneous dispatches from clobbering each other's S3 staging.
 concurrency:
@@ -44,63 +48,38 @@ jobs:
       matrix: ${{ steps.parse.outputs.matrix }}
       shards: ${{ steps.parse.outputs.shards }}
     steps:
-      - name: Parse dataset IDs and dedup against existing nemarDatasets repos
+      - name: Parse and validate dataset IDs
         id: parse
         env:
-          INPUT_IDS: ${{ inputs.openneuro_ids }}
-          # PAT (not GITHUB_TOKEN) because nemarDatasets dataset repos are
-          # private and outside the org this workflow runs in.
-          GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
+          # workflow_dispatch -> inputs; repository_dispatch (auto-import #775) ->
+          # client_payload. The auto-import tick already deduped against D1
+          # (datasets.source_id + import_jobs) so it never re-sends an imported
+          # dataset; this step therefore validates shape only and drops the
+          # per-repo GitHub check that tripped the secondary rate limit (#775).
+          # NOTE: re-dispatching an ALREADY-IMPORTED dataset on the manual
+          # workflow_dispatch path is data-safe (importDataset returns 409, no
+          # clobber) but the prepare leg then fails and the report job marks it
+          # quarantined -- noise, not damage. Delete the on###### repo first to
+          # re-import (the proper update flow is nemarOrg/nemar-cli#448).
+          INPUT_IDS: ${{ github.event.client_payload.openneuro_ids || inputs.openneuro_ids }}
         run: |
-          # Step 1: validate format.
+          if [ -z "$INPUT_IDS" ]; then
+            echo "::error::No openneuro_ids provided (inputs.openneuro_ids / client_payload.openneuro_ids empty)"
+            exit 1
+          fi
+          kept=()
           for id in $(echo "$INPUT_IDS" | tr ',' ' '); do
             id=$(echo "$id" | xargs)
+            [ -z "$id" ] && continue
             if ! echo "$id" | grep -qE '^ds[0-9]{6}$'; then
               echo "::error::Invalid OpenNeuro ID: '$id'. Expected format: ds###### (e.g., ds007262)"
               exit 1
             fi
-          done
-
-          # Step 2: dedup against existing on* repos on nemarDatasets.
-          # Until nemarOrg/nemar-cli#448 (proper "update existing OpenNeuro
-          # dataset" command) lands, re-importing a live dataset would
-          # clobber state. Skip any ds###### whose on###### counterpart
-          # already exists with non-empty contents. Empty shells (size==0,
-          # e.g. the nemarOrg/nemar-cli#450 recovery state) are kept so
-          # operators can re-import after deleting them.
-          kept=()
-          skipped=()
-          for ds in $(echo "$INPUT_IDS" | tr ',' ' '); do
-            ds=$(echo "$ds" | xargs)
-            on="on${ds#ds}"
-            http_status=$(curl -fsSL -o /tmp/repo.json -w "%{http_code}" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "User-Agent: nemar-onboard-openneuro" \
-              "https://api.github.com/repos/nemarDatasets/$on" || true)
-            if [ "$http_status" = "404" ]; then
-              kept+=("$ds")
-              continue
-            fi
-            if [ "$http_status" != "200" ]; then
-              echo "::error::Unexpected HTTP $http_status checking nemarDatasets/$on; aborting to avoid duplicate imports"
-              cat /tmp/repo.json || true
-              exit 1
-            fi
-            size=$(jq -r '.size // 0' /tmp/repo.json)
-            if [ "$size" -gt 0 ]; then
-              skipped+=("$ds")
-              echo "::warning::Skipping $ds: nemarDatasets/$on already exists (size=${size}KB). Run 'nemar admin delete-dataset $on --force' first if you intend to re-import. See nemarOrg/nemar-cli#448 for the proper update workflow."
-            else
-              # Empty shell — almost certainly a #450 leftover. Importer
-              # will hit "Dataset already exists, continuing..." and
-              # re-populate cleanly.
-              kept+=("$ds")
-            fi
+            kept+=("$id")
           done
 
           if [ ${#kept[@]} -eq 0 ]; then
-            echo "::error::All input IDs already exist on nemarDatasets with non-empty contents. Nothing to import."
+            echo "::error::No valid OpenNeuro IDs to import."
             exit 1
           fi
 
@@ -113,9 +92,6 @@ jobs:
           echo "shards=$SHARD_JSON" >> "$GITHUB_OUTPUT"
 
           echo "Will import (${#kept[@]}): ${kept[*]} across ${SHARDS} copy shards"
-          if [ ${#skipped[@]} -gt 0 ]; then
-            echo "Skipped (${#skipped[@]}, already on nemarDatasets): ${skipped[*]}"
-          fi
 
   prepare:
     needs: parse-ids
