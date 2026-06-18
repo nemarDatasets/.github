@@ -53,9 +53,14 @@ jobs:
         env:
           # workflow_dispatch -> inputs; repository_dispatch (auto-import #775) ->
           # client_payload. The auto-import tick already deduped against D1
-          # (datasets.source_id + import_jobs), and importDataset no-ops on
-          # "already exists", so this no longer does the per-repo GitHub check
-          # that tripped the secondary rate limit (#775). Validate shape only.
+          # (datasets.source_id + import_jobs) so it never re-sends an imported
+          # dataset; this step therefore validates shape only and drops the
+          # per-repo GitHub check that tripped the secondary rate limit (#775).
+          # NOTE: re-dispatching an ALREADY-IMPORTED dataset on the manual
+          # workflow_dispatch path is data-safe (importDataset returns 409, no
+          # clobber) but the prepare leg then fails and the report job marks it
+          # quarantined -- noise, not damage. Delete the on###### repo first to
+          # re-import (the proper update flow is nemarOrg/nemar-cli#448).
           INPUT_IDS: ${{ github.event.client_payload.openneuro_ids || inputs.openneuro_ids }}
         run: |
           if [ -z "$INPUT_IDS" ]; then
