@@ -121,7 +121,32 @@ jobs:
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream
+        # Tee the output so the failure step below can classify the cause.
+        # pipefail keeps the step's exit code the CLI's (not tee's).
+        run: |
+          set -o pipefail
+          nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream 2>&1 \
+            | tee "/tmp/prepare-${DATASET_ID}.log"
+      # If prepare failed because OpenNeuro's own data is unreachable (objects
+      # not anonymously public + NEMAR has no signed OpenNeuro login), forward the
+      # CLI's marker into the import-state callback so the backend records a
+      # distinct, listable `upstream_inaccessible` quarantine instead of a generic
+      # prepare miss (#808). Best-effort; the report job's terminal POST backstops.
+      - name: Report upstream-inaccessible (prepare)
+        if: failure()
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          log="/tmp/prepare-${DATASET_ID}.log"
+          if [ -f "$log" ] && grep -qF "[openneuro-upstream-inaccessible]" "$log"; then
+            on_id="on${DATASET_ID#ds}"
+            curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+              -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"prepare\",\"status\":\"failed\",\"error_message\":\"[openneuro-upstream-inaccessible] OpenNeuro objects not anonymously readable; NEMAR has no signed OpenNeuro login (see run log)\",\"workflow_run_url\":\"$RUN_URL\"}" \
+              || echo "::warning::upstream-inaccessible callback failed for $on_id (non-fatal; report job backstops)"
+          fi
       # Import-state tracking (#754). The `preparing` row is seeded server-side
       # by /admin/datasets/import; here we record the copy transition. All
       # callbacks are best-effort -- the scheduled sweep + report job are the
