@@ -217,8 +217,8 @@ jobs:
           BODY=$(jq -nc \
             --arg d "$DATASET_ID" --argjson rid "${REQUEST_ID:-0}" --arg v "$VERDICT" \
             --argjson reasons "$REASONS" --arg iu "$ISSUE_URL" --arg run "${GITHUB_RUN_ID}" \
-            '{dataset_id:$d, request_id:$rid, verdict:$v, reasons:$reasons,
-              issue_url:(if $iu=="" then null else $iu end), workflow_run_id:$run}')
+            '{dataset_id:$d, request_id:$rid, verdict:$v, reasons:$reasons, workflow_run_id:$run} +
+              (if $iu=="" then {} else {issue_url:$iu} end)')
           for attempt in 1 2 3; do
             CODE=$(curl -sS -o /tmp/cb.out -w '%{http_code}' --connect-timeout 10 --max-time 30 \
               -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
