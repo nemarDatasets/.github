@@ -71,6 +71,21 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(res["enqueued"], 1)
         self.assertEqual(self.status("nm000001"), "pending")
 
+    def test_bare_vs_tagged_same_version_does_not_requeue(self):
+        # A done row converted at the bare "1.0.0"; nemar-cli #899 flips the
+        # catalog latest_version to the tag "v1.0.0". These are the SAME version
+        # and must NOT re-queue (else the queue re-drains every already-converted
+        # dataset). Guards against the format-flip compute burst.
+        reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_done(self.conn, "nm000001", "1.0.0")
+        res = reconcile(self.conn, [("nm000001", "v1.0.0")], 3600)
+        self.assertEqual(res["enqueued"], 0)
+        self.assertEqual(self.status("nm000001"), "done")
+        # And the reverse (tagged converted, bare latest) is likewise a no-op.
+        res2 = reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        self.assertEqual(res2["enqueued"], 0)
+
     def test_claim_marks_inprogress_then_empty(self):
         reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
         row = claim_next(self.conn)
