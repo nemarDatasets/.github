@@ -25,10 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
     _AWS_OP_TIMEOUT,
     _AWS_RM_TIMEOUT,
+    _AWS_TIMEOUTS,
     INMEM_MEM_FACTOR,
     STREAM_PEAK_BYTES,
     RecordingTooLarge,
     _aws,
+    _s3_prefix_empty,
     _recording_size_bytes,
     affected_primaries,
     annex_key_size,
@@ -1385,6 +1387,54 @@ class TestAwsRunner(unittest.TestCase):
         # big dataset) legitimately runs much longer than a single transfer; the
         # transfer cap was killing real wipes mid-delete.
         self.assertGreaterEqual(_AWS_RM_TIMEOUT, 4 * _AWS_OP_TIMEOUT)
+
+    def test_read_timeout_is_short_enough_to_reap_a_wedge(self):
+        # A wedged S3 socket delivers ZERO response bytes; the per-read timeout is
+        # what reaps it so botocore reconnects to a healthy IP. It must stay short
+        # -- 300 s let an empty-prefix `aws s3 rm` spin for minutes per wedge. A
+        # live transfer streams body continuously, so a short cap never trips it.
+        i = _AWS_TIMEOUTS.index("--cli-read-timeout")
+        self.assertLessEqual(int(_AWS_TIMEOUTS[i + 1]), 60)
+
+
+class TestS3PrefixEmpty(unittest.TestCase):
+    """The empty-prefix probe that lets `--clean` skip a pointless (wedge-prone)
+    recursive rm. Real subprocess, no mocks: a fake `aws` on PATH emulates
+    `s3api list-objects-v2 --query Contents[0].Key --output text`, which prints the
+    first key or the literal `None` when the prefix is empty."""
+
+    def _probe(self, stdout: str, rc: int = 0) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "aws"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                f"sys.stdout.write({stdout!r})\n"
+                f"sys.exit({rc})\n"
+            )
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{tmp}{os.pathsep}{old}"
+            try:
+                return _s3_prefix_empty("nemar", "nm000228/zarr/")
+            finally:
+                os.environ["PATH"] = old
+
+    def test_empty_prefix_is_skippable(self):
+        # `--output text` prints "None" for an empty query; a blank line is treated
+        # the same. Both -> True (skip the wipe).
+        self.assertTrue(self._probe("None\n"))
+        self.assertTrue(self._probe("\n"))
+
+    def test_nonempty_prefix_is_not_skipped(self):
+        self.assertFalse(
+            self._probe("nm000228/zarr/sub-01/ses-01/eeg/x.zarr/eeg_250hz/0/c/0/0\n")
+        )
+
+    def test_error_falls_through_to_real_wipe(self):
+        # A nonzero exit (creds/network) must NOT skip -- returning False makes the
+        # caller run the real rm rather than silently leaving a stale prefix.
+        self.assertFalse(self._probe("some error\n", rc=1))
 
 
 class TestShouldStream(unittest.TestCase):
