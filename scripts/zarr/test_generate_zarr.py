@@ -25,11 +25,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (sibling module via sys.path)
     _AWS_OP_TIMEOUT,
     _AWS_RM_TIMEOUT,
+    INMEM_MEM_FACTOR,
+    STREAM_PEAK_BYTES,
+    RecordingTooLarge,
     _aws,
     _recording_size_bytes,
     affected_primaries,
     annex_key_size,
     bids_suffix_modality,
+    convert_recording,
+    projected_peak_bytes,
+    recording_mem_budget_bytes,
     should_stream,
     compute_worklist,
     ctf_ds_of,
@@ -1042,6 +1048,71 @@ class TestRecordingSizeBytes(unittest.TestCase):
         self.assertGreater(
             _recording_size_bytes("/no/such/dir/sub-01_eeg.vhdr"), 2 * 1024**3
         )
+
+    def test_split_fif_sums_the_whole_chain(self):
+        # #909: split-02.. carry DIFFERENT stems (`_split-02_meg`); summing only
+        # split-01's same-stem companions undercounts the chain, so should_stream
+        # misroutes a multi-GB recording to the in-memory path and OOMs. The size
+        # must be the whole split group, not just split-01.
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "sub-01", "meg")
+            os.makedirs(sub)
+            base = "sub-01_task-rest"
+            for idx, size in ((1, 1000), (2, 2000), (3, 500)):
+                with open(os.path.join(sub, f"{base}_split-0{idx}_meg.fif"), "wb") as fh:
+                    fh.write(b"f" * size)
+            # A non-member file in the same dir must NOT be counted.
+            with open(os.path.join(sub, "sub-01_task-other_meg.fif"), "wb") as fh:
+                fh.write(b"x" * 9999)
+            primary = os.path.join(sub, f"{base}_split-01_meg.fif")
+            self.assertEqual(_recording_size_bytes(primary), 3500)
+
+
+class TestMemoryGuard(unittest.TestCase):
+    """Per-recording memory guard (#909): projection, budget, deterministic skip."""
+
+    def test_projected_peak_streaming_is_bounded(self):
+        # A large .fif streams -> peak is bounded regardless of on-disk size.
+        self.assertEqual(
+            projected_peak_bytes("sub-01_task-x_meg.fif", 50 * 1024**3), STREAM_PEAK_BYTES
+        )
+
+    def test_projected_peak_inmemory_scales_with_size(self):
+        # An EDF has no streaming reader -> float64 blow-up scales with size.
+        size = 3 * 1024**3
+        self.assertEqual(
+            projected_peak_bytes("sub-01_task-x_eeg.edf", size), int(size * INMEM_MEM_FACTOR)
+        )
+
+    def test_budget_scales_with_jobs(self):
+        os.environ.pop("ZARR_REC_MEM_BUDGET_BYTES", None)
+        serial = recording_mem_budget_bytes(1)
+        parallel = recording_mem_budget_bytes(8)
+        # Serial gets the whole node; 8-way gets ~1/8 -> a large in-memory recording
+        # the cron skips is convertible on a `--jobs 1` re-run.
+        self.assertEqual(parallel, serial // 8)
+        self.assertGreater(serial, parallel)
+
+    def test_budget_explicit_override_wins(self):
+        os.environ["ZARR_REC_MEM_BUDGET_BYTES"] = str(123 * 1024**2)
+        try:
+            self.assertEqual(recording_mem_budget_bytes(4), 123 * 1024**2)
+        finally:
+            os.environ.pop("ZARR_REC_MEM_BUDGET_BYTES", None)
+
+    def test_preflight_skips_oversized_with_deterministic_code(self):
+        # A tiny budget forces a skip BEFORE any load (no biosigIO import, no OOM);
+        # the exception carries the code so it surfaces as a deterministic skip.
+        with tempfile.TemporaryDirectory() as d:
+            rec = os.path.join(d, "sub-01_task-x_eeg.edf")
+            with open(rec, "wb") as fh:
+                fh.write(b"e" * 100_000)
+            with self.assertRaises(RecordingTooLarge) as cm:
+                convert_recording(rec, None, os.path.join(d, "store"), mem_budget_bytes=1)
+            self.assertEqual(cm.exception.code, "recording_too_large")
+
+    def test_reason_for_code_too_large_is_user_facing(self):
+        self.assertIn("too large", reason_for_code("recording_too_large").lower())
 
 
 class TestSplitFif(unittest.TestCase):

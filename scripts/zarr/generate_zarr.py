@@ -99,6 +99,67 @@ def should_stream(primary_local: str, size_bytes: int) -> bool:
     return ext in STREAM_EXTS and size_bytes > STREAM_MIN_BYTES
 
 
+# --- Per-recording memory guard (#909) ----------------------------------------
+# The in-memory path (`Recording.from_file`) loads a recording at float64 (~4x
+# its int16 on-disk bytes) plus a resample copy, so a large EDF/BDF/EEGLAB
+# recording -- which has no streaming reader -- OOM-kills its pool worker (and,
+# via BrokenProcessPool, its concurrently-running siblings), then reruns as an
+# infra failure and burns retries. The streaming path peaks ~STREAM_PEAK_BYTES
+# regardless of size. We PROJECT each recording's peak RAM and skip (cleanly,
+# with a deterministic reason surfaced in the index) anything that won't fit the
+# per-recording budget for this run -- BEFORE the load, so no OOM ever happens.
+# The budget scales with --jobs (usable_RAM / jobs) in main(), so the 8-way cron
+# skips a large in-memory recording that a manual `--jobs 1` re-run would convert.
+STREAM_PEAK_BYTES = int(os.environ.get("ZARR_STREAM_PEAK_BYTES", str(4 * 1024**3)))
+# float64 blow-up + resample copy for the in-memory path (int16 -> float64 = 4x).
+INMEM_MEM_FACTOR = float(os.environ.get("ZARR_INMEM_MEM_FACTOR", "6"))
+
+
+class RecordingTooLarge(Exception):
+    """A recording whose projected peak RAM exceeds this run's per-recording
+    budget. Carries `.code` so convert_one surfaces it as a DETERMINISTIC skip
+    (recorded in the index, no infra retry) -- exactly like a biosigIO data
+    failure -- instead of OOM-crashing the worker. #909"""
+
+    code = "recording_too_large"
+
+
+def projected_peak_bytes(primary_local: str, size_bytes: int) -> int:
+    """Estimated peak RAM to convert this recording: bounded for the streaming
+    path, ~float64 blow-up for the in-memory path. Drives the skip guard (#909)."""
+    if should_stream(primary_local, size_bytes):
+        return STREAM_PEAK_BYTES
+    return int(size_bytes * INMEM_MEM_FACTOR)
+
+
+def usable_ram_bytes() -> int:
+    """Convertible RAM: MemTotal (Linux /proc/meminfo) minus a headroom fraction.
+    A conservative fallback keeps the guard active off-Linux / in tests."""
+    frac = float(os.environ.get("ZARR_MEM_HEADROOM_FRAC", "0.8"))
+    total: int | None = None
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) * 1024  # kB -> bytes
+                    break
+    except OSError:
+        total = None
+    if total is None:
+        total = int(os.environ.get("ZARR_NODE_RAM_BYTES", str(32 * 1024**3)))
+    return int(total * frac)
+
+
+def recording_mem_budget_bytes(jobs: int) -> int:
+    """Per-recording RAM budget for a run at this concurrency. Explicit override
+    wins; else usable RAM split across the workers (so serial runs get the whole
+    node and can convert a recording the parallel cron must skip). #909"""
+    override = os.environ.get("ZARR_REC_MEM_BUDGET_BYTES")
+    if override:
+        return int(override)
+    return usable_ram_bytes() // max(1, jobs)
+
+
 # Fallback user-facing reasons, keyed by biosigIO error code. The authoritative
 # copy lives in biosigio.exceptions.REASONS (single source of truth); we prefer
 # that at runtime and use this only if the import is unavailable. Keep the codes
@@ -115,6 +176,14 @@ _FALLBACK_REASONS = {
     "unsupported_format": "This file format is not yet supported by the viewer.",
     "empty_recording": "This recording contains no signal channels to display.",
     "file_read_error": "This recording could not be prepared for viewing.",
+    # NEMAR-side (not a biosigIO code): a recording too large to convert on the
+    # conversion node within memory limits (#909). The streaming path handles
+    # multi-GB BrainVision/FIF/CTF; this is hit by a very large EDF/BDF/EEGLAB
+    # recording, which has no streaming reader yet and would load fully in memory.
+    "recording_too_large": (
+        "This recording is too large to convert to an interactive viewer copy "
+        "within the conversion node's memory limits."
+    ),
 }
 _GENERIC_REASON = _FALLBACK_REASONS["file_read_error"]
 
@@ -1248,13 +1317,30 @@ def _recording_size_bytes(primary_local: str) -> int:
             return force
         return total
     d = os.path.dirname(primary_local) or "."
-    stem = filename_stem(primary_local)
-    total = 0
     try:
         entries = os.listdir(d)
     except OSError:
         print(f"::warning::could not list {d!r}; forcing streaming", flush=True)
         return force
+    # A split FIF's bulk lives in split-02.., which carry DIFFERENT stems
+    # (`_split-02_meg` vs `_split-01_meg`); summing only split-01's same-stem
+    # companions undercounts the chain, so should_stream misroutes a multi-GB
+    # recording onto the OOM-prone in-memory path (read_raw_fif follows the whole
+    # chain on disk). Sum every local member of the split group instead. #909
+    if is_split_fif(primary_local):
+        gkey = split_group_key(primary_local)
+        total = 0
+        for fn in entries:
+            full = os.path.join(d, fn)  # split_group_key keeps the dir; compare on full paths
+            if is_split_fif(full) and split_group_key(full) == gkey:
+                try:
+                    total += os.path.getsize(full)
+                except OSError:
+                    print(f"::warning::could not stat split member {fn!r}; forcing streaming", flush=True)
+                    return force
+        return total
+    stem = filename_stem(primary_local)
+    total = 0
     for fn in entries:
         if os.path.splitext(fn)[0] == stem:
             try:
@@ -1272,13 +1358,30 @@ def convert_recording(
     power_line_frequency: float | None = None,
     value_descriptions: dict[str, str] | None = None,
     electrode_positions: dict | None = None,
+    mem_budget_bytes: int | None = None,
 ) -> None:
     modality = bids_suffix_modality(primary_local)
+    size_bytes = _recording_size_bytes(primary_local)
+    streaming = should_stream(primary_local, size_bytes)
+    # Preflight (#909): skip -- BEFORE any load -- a recording whose projected
+    # peak RAM won't fit this run's budget, so it can never OOM-crash the worker
+    # and BrokenProcessPool-cascade its siblings. Raised as a typed, coded failure
+    # -> a DETERMINISTIC skip surfaced in the index, not an infra retry.
+    if mem_budget_bytes is not None:
+        peak = projected_peak_bytes(primary_local, size_bytes)
+        if peak > mem_budget_bytes:
+            raise RecordingTooLarge(
+                f"projected peak ~{peak // 1024**3} GiB exceeds the "
+                f"~{mem_budget_bytes // 1024**3} GiB per-recording budget for this run "
+                f"(on-disk {size_bytes // 1024**3} GiB via the "
+                f"{'streaming' if streaming else 'in-memory'} path; "
+                "re-run with fewer --jobs to raise the budget)"
+            )
     # Large MNE-native recordings use the streaming converter so peak RAM stays
     # bounded; the in-memory path below would load them at float64 2-3x and OOM.
     # Both paths read through MNE, so the output matches. (multi-GB BrainVision/FIF/
     # CTF, plus KIT .con above its lower threshold -- see should_stream.)
-    if should_stream(primary_local, _recording_size_bytes(primary_local)):
+    if streaming:
         from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
         from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
 
@@ -1367,7 +1470,10 @@ def convert_one(primary: str) -> dict:
         plf = power_line_frequency_for(c["repo"], primary, c["head_files"], c["head"])
         descs = event_descriptions_for(c["repo"], primary, c["head_files"], c["head"])
         elec = electrode_positions_for(c["repo"], primary, c["head_files"], c["head"])
-        convert_recording(primary_local, events_local, store_local, plf, descs or None, elec)
+        convert_recording(
+            primary_local, events_local, store_local, plf, descs or None, elec,
+            mem_budget_bytes=c.get("mem_budget"),
+        )
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.
         validate_store(store_local)
@@ -1523,10 +1629,17 @@ def main() -> int:
             print(f"::warning::[{i}/{n}] conversion failed for {r['primary']}: {r['error']}", flush=True)
 
     jobs = max(1, args.jobs)
+    mem_budget = recording_mem_budget_bytes(jobs)
+    print(
+        f"[zarr] per-recording memory budget ~{mem_budget // 1024**3} GiB "
+        f"(usable RAM / {jobs} job(s)); recordings projected above it are skipped (#909)",
+        flush=True,
+    )
     with tempfile.TemporaryDirectory() as tmp:
         ctx = {
             "repo": repo, "bucket": bucket, "dataset_id": dataset_id, "head": head,
             "head_files": head_set, "local": args.local, "tmp": tmp, "updated": updated,
+            "mem_budget": mem_budget,
         }
         if jobs == 1 or n <= 1:
             _init_worker(ctx)
