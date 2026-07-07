@@ -84,18 +84,46 @@ STREAM_EXTS = (".vhdr", ".fif", ".ds")
 STREAM_KIT_EXTS = (".con", ".sqd", ".kdf")
 STREAM_KIT_MIN_BYTES = int(os.environ.get("ZARR_STREAM_KIT_MIN_BYTES", str(256 * 1024**2)))
 
+# EDF/BDF have no lazy MNE reader parity: the in-memory path reads them via
+# pyedflib and MNE rescales EDF to SI volts, so streaming EDF via MNE would NOT
+# match a re-run on the in-memory path. biosigIO >= 1.2.0 streams EDF/BDF via
+# pyedflib (importer parity), so ONLY then may we route them to the streamer;
+# on an older lib EDF stays in-memory (and is #909-skipped when too large).
+# Threshold is low (like KIT) because in-memory EDF blows up ~6x and OOMs early.
+STREAM_EDF_EXTS = (".edf", ".bdf")
+STREAM_EDF_MIN_BYTES = int(os.environ.get("ZARR_STREAM_EDF_MIN_BYTES", str(256 * 1024**2)))
+
+
+def _biosigio_streams_edf() -> bool:
+    """True if the installed biosigIO streams EDF/BDF via pyedflib (>= 1.2.0,
+    nemar-cli#944). Older builds read EDF via MNE in stream_to_zarr, which
+    disagrees with the in-memory pyedflib units, so EDF must stay in-memory."""
+    try:
+        from importlib.metadata import version
+
+        major_minor = tuple(int(p) for p in version("biosigio").split(".")[:2])
+        return major_minor >= (1, 2)
+    except Exception:  # noqa: BLE001 - absent/odd version string: assume no EDF streaming
+        return False
+
+
+# Resolved once at import; a recording-format decision must not re-probe per call.
+_EDF_STREAMABLE = _biosigio_streams_edf()
+
 
 def should_stream(primary_local: str, size_bytes: int) -> bool:
     """Whether a recording converts via the bounded-memory streaming path.
 
     Large MNE-native recordings (multi-GB iEEG/MEG BrainVision/FIF, CTF `.ds`)
-    stream above ``STREAM_MIN_BYTES``; KIT `.con`/`.sqd`/`.kdf` stream above the
-    much lower ``STREAM_KIT_MIN_BYTES`` because their in-memory float64 blow-up
-    OOMs a worker well below the multi-GB mark. Everything else (and small KIT)
-    uses the faster in-memory path."""
+    stream above ``STREAM_MIN_BYTES``; KIT `.con`/`.sqd`/`.kdf` and -- when
+    biosigIO >= 1.2.0 -- EDF/BDF stream above the much lower KIT/EDF thresholds
+    because their in-memory float64 blow-up OOMs a worker well below the multi-GB
+    mark. Everything else (and small KIT/EDF) uses the faster in-memory path."""
     ext = lower_ext(primary_local)
     if ext in STREAM_KIT_EXTS:
         return size_bytes > STREAM_KIT_MIN_BYTES
+    if _EDF_STREAMABLE and ext in STREAM_EDF_EXTS:
+        return size_bytes > STREAM_EDF_MIN_BYTES
     return ext in STREAM_EXTS and size_bytes > STREAM_MIN_BYTES
 
 
@@ -1377,31 +1405,7 @@ def convert_recording(
                 f"{'streaming' if streaming else 'in-memory'} path; "
                 "re-run with fewer --jobs to raise the budget)"
             )
-    # Large MNE-native recordings use the streaming converter so peak RAM stays
-    # bounded; the in-memory path below would load them at float64 2-3x and OOM.
-    # Both paths read through MNE, so the output matches. (multi-GB BrainVision/FIF/
-    # CTF, plus KIT .con above its lower threshold -- see should_stream.)
-    if streaming:
-        from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
-        from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
-
-        events_df = (
-            read_events_tsv(events_local)
-            if events_local and os.path.exists(events_local)
-            else None
-        )
-        stream_to_zarr(
-            primary_local,
-            store_path,
-            force_modality=modality,
-            modality_rates=MODALITY_RATES,
-            dtype="int16",
-            events_df=events_df,
-            # Keep the temp channel-major memmap on the same (fast) scratch volume as
-            # the store; it is a sibling temp dir, not synced to S3.
-            scratch_dir=os.path.dirname(store_path) or None,
-        )
-    else:
+    def _convert_in_memory() -> None:
         from biosigio import Recording, bids  # type: ignore[import-not-found]  # lazy: runtime-only dep
 
         # mixed_rate="resample": a Zarr store is a derived serving copy (viewing + ML),
@@ -1420,6 +1424,49 @@ def convert_recording(
             for label in rec.channels:
                 rec.channels[label]["modality"] = modality
         rec.to_zarr(store_path, dtype="int16", modality_rates=MODALITY_RATES)
+
+    # Large recordings use the streaming converter so peak RAM stays bounded; the
+    # in-memory path would load them at float64 2-3x and OOM. (multi-GB BrainVision/
+    # FIF/CTF, KIT above its lower threshold, and EDF/BDF via pyedflib on
+    # biosigio>=1.2.0 -- see should_stream.)
+    if streaming:
+        from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
+        from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
+        from biosigio.exceptions import MixedSamplingRateError  # type: ignore[import-not-found]
+
+        events_df = (
+            read_events_tsv(events_local)
+            if events_local and os.path.exists(events_local)
+            else None
+        )
+        try:
+            stream_to_zarr(
+                primary_local,
+                store_path,
+                force_modality=modality,
+                modality_rates=MODALITY_RATES,
+                dtype="int16",
+                events_df=events_df,
+                # Keep the temp channel-major memmap on the same (fast) scratch volume as
+                # the store; it is a sibling temp dir, not synced to S3.
+                scratch_dir=os.path.dirname(store_path) or None,
+            )
+        except MixedSamplingRateError:
+            # A mixed per-channel-rate EDF can't stream on a single grid; the
+            # in-memory path resamples it (mixed_rate="resample"). Re-check the
+            # (larger) in-memory budget before the full-load fallback so a big
+            # mixed-rate EDF is #909-skipped rather than OOMing.
+            if mem_budget_bytes is not None:
+                inmem_peak = int(size_bytes * INMEM_MEM_FACTOR)
+                if inmem_peak > mem_budget_bytes:
+                    raise RecordingTooLarge(
+                        f"mixed-rate EDF needs the in-memory resample path "
+                        f"(projected ~{inmem_peak // 1024**3} GiB > "
+                        f"~{mem_budget_bytes // 1024**3} GiB budget); re-run with fewer --jobs"
+                    ) from None
+            _convert_in_memory()
+    else:
+        _convert_in_memory()
     if power_line_frequency is not None:
         embed_root_attr(store_path, "power_line_frequency", power_line_frequency)
     if value_descriptions:

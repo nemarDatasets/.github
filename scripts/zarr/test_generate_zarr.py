@@ -37,6 +37,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     projected_peak_bytes,
     recording_mem_budget_bytes,
     should_stream,
+    STREAM_EDF_MIN_BYTES,
     compute_worklist,
     ctf_ds_of,
     ctf_ds_recordings,
@@ -1410,10 +1411,31 @@ class TestShouldStream(unittest.TestCase):
         self.assertTrue(should_stream("sub-01/ieeg/sub-01_task-x_ieeg.vhdr", 3 * self.GB))
         self.assertTrue(should_stream("sub-01/meg/sub-01_task-x_meg.fif", 3 * self.GB))
 
-    def test_in_memory_only_formats_never_stream(self):
-        # EDF/SET have no streaming reader wired up -> always in-memory.
-        self.assertFalse(should_stream("sub-01/eeg/sub-01_task-x_eeg.edf", 5 * self.GB))
+    def test_eeglab_set_never_streams(self):
+        # EEGLAB .set has no streaming reader -> always in-memory.
         self.assertFalse(should_stream("sub-01/eeg/sub-01_task-x_eeg.set", 5 * self.GB))
+
+    def test_edf_streaming_gated_on_biosigio_capability(self):
+        # EDF/BDF stream ONLY when the installed biosigIO does it via pyedflib
+        # (>=1.2.0, #944); on an older lib they stay in-memory (MNE would rescale
+        # EDF units and not match the in-memory path). The gate is a module global.
+        import generate_zarr  # type: ignore[import-not-found]
+
+        big = STREAM_EDF_MIN_BYTES + 1
+        orig = generate_zarr._EDF_STREAMABLE
+        try:
+            generate_zarr._EDF_STREAMABLE = True
+            self.assertTrue(should_stream("sub-01/eeg/sub-01_task-x_eeg.edf", big))
+            self.assertTrue(should_stream("sub-01/emg/sub-01_task-x_emg.bdf", big))
+            # A small EDF stays on the faster in-memory path.
+            self.assertFalse(
+                should_stream("sub-01/eeg/sub-01_task-x_eeg.edf", STREAM_EDF_MIN_BYTES - 1)
+            )
+            generate_zarr._EDF_STREAMABLE = False
+            self.assertFalse(should_stream("sub-01/eeg/sub-01_task-x_eeg.edf", big))
+            self.assertFalse(should_stream("sub-01/emg/sub-01_task-x_emg.bdf", big))
+        finally:
+            generate_zarr._EDF_STREAMABLE = orig
 
 
 if __name__ == "__main__":
