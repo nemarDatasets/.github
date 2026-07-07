@@ -121,14 +121,29 @@ setup() {
   fi
   # Install biosigIO from the driver repo's manifest so the pin is single-sourced
   # with the Actions workflow (scripts/zarr/requirements.txt). Fall back to the
-  # inline spec if an older clone predates the manifest. Idempotent: uv pip
-  # install is a no-op when already satisfied.
+  # inline spec if an older clone predates the manifest.
+  #
+  # --refresh-package/--upgrade-package biosigio are REQUIRED, not cosmetic: a
+  # plain `uv pip install` reuses uv's cached index, so right after a biosigIO
+  # release the cache still lists the old version and the pin bump silently no-ops
+  # (the venv keeps the stale wheel, and the `|| true` below hides the resolution
+  # miss). That shipped a run converting on the OLD library. Forcing a refresh +
+  # upgrade of just biosigIO makes a pin bump take effect on the very next run
+  # (deps are untouched). Verify afterward and fail loud if the pin is still unmet,
+  # rather than silently converting with the wrong version.
   local req="$DRIVER_REPO/scripts/zarr/requirements.txt"
   if [[ -f "$req" ]]; then
-    VIRTUAL_ENV="$VENV_DIR" uv pip install -q -r "$req" 2>&1 | tail -2 || true
+    VIRTUAL_ENV="$VENV_DIR" uv pip install -q --refresh-package biosigio --upgrade-package biosigio -r "$req" 2>&1 | tail -2 || true
   else
-    VIRTUAL_ENV="$VENV_DIR" uv pip install -q "$BIOSIGIO_SPEC" 2>&1 | tail -2 || true
+    VIRTUAL_ENV="$VENV_DIR" uv pip install -q --refresh-package biosigio --upgrade-package biosigio "$BIOSIGIO_SPEC" 2>&1 | tail -2 || true
   fi
+  # Guard: the pinned biosigIO must actually be importable, else abort setup so the
+  # cron does not convert a whole batch on a stale library.
+  if ! VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" -c "import biosigio" 2>/dev/null; then
+    echo "[setup] FATAL: biosigio not importable after install ($BIOSIGIO_SPEC)" >&2
+    exit 1
+  fi
+  VIRTUAL_ENV="$VENV_DIR" "$VENV_DIR/bin/python" -c "import biosigio; print(f'[setup] biosigio {biosigio.__version__}')"
 }
 
 DRIVER="$DRIVER_REPO/scripts/zarr/generate_zarr.py"
