@@ -10,5 +10,9 @@
 # .vhdr importers). Core biosigIO covers .set/.fdt/.edf/.bdf.
 # >=1.2.0: streams EDF/BDF via pyedflib (importer parity), so generate_zarr.py's
 # _biosigio_streams_edf() gate flips on and large EDF converts instead of OOMing
-# (nemar-cli#944). Bumping the pin forces the idempotent cron install to upgrade.
-biosigio[zarr,meg]>=1.2.0
+# (nemar-cli#944).
+# >=1.2.1: int16 export zero-fills non-finite (NaN/inf) samples and flags the
+# channel instead of failing the whole recording -- a NaN in one MISC/aux channel
+# (MoBI accelerometer/force/sync) no longer sinks a dataset's EEG coverage
+# (biosigio#107). Bumping the pin forces the idempotent cron install to upgrade.
+biosigio[zarr,meg]>=1.2.1
