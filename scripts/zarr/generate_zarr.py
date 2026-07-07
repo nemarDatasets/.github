@@ -770,12 +770,21 @@ def validate_store(store_local: str) -> None:
 
 
 _AWS_RETRIES = int(os.environ.get("ZARR_AWS_RETRIES", "4"))
-# Per-read socket timeouts: a first line of defense against a single stuck TCP
-# read. NOT sufficient alone -- a recursive delete or sync that paginates/loops
-# without any one read stalling slips past these (an `aws s3 rm --recursive` once
-# spun 2.5 h at 16% CPU on an already-empty prefix). The wall-clock `timeout` in
-# `_aws` is the real backstop.
-_AWS_TIMEOUTS = ["--cli-connect-timeout", "30", "--cli-read-timeout", "300"]
+# Per-read socket timeout: the PRIMARY defense against a wedged S3 connection.
+# Symptom (observed repeatedly from Hallu): aws opens several sockets to S3, the
+# TCP handshakes complete, then a signed request stalls -- Send-Q backs up, no
+# response bytes ever arrive, and the op sits burning a trickle of CPU on retries
+# that reuse the dead socket. A SHORT read timeout is the cure: botocore abandons
+# the wedged socket and reconnects (AWS_MAX_ATTEMPTS, below), and a fresh
+# connection to a healthy S3 IP answers in ~200 ms, so the op recovers in seconds.
+# The old 300 s made every wedge cost 5 minutes, so a recursive rm of an
+# already-empty prefix could spin for hours before landing a good socket. 30 s
+# reaps the wedge fast while far exceeding any healthy read gap -- a live transfer
+# streams body bytes continuously, so 30 s of total silence is always a stall,
+# never a legitimately slow-but-progressing read. Override with
+# ZARR_AWS_READ_TIMEOUT.
+_AWS_READ_TIMEOUT = os.environ.get("ZARR_AWS_READ_TIMEOUT", "30")
+_AWS_TIMEOUTS = ["--cli-connect-timeout", "30", "--cli-read-timeout", _AWS_READ_TIMEOUT]
 # Hard wall-clock cap per aws invocation (seconds) for transfers (cp/sync). A
 # wedged process is killed and retried rather than hanging a worker forever.
 # Generous so a legitimately slow multi-GB transfer never trips it; override with
@@ -823,6 +832,35 @@ def _aws(
             if attempt < retries:
                 time.sleep(min(2**attempt, 30))
     raise RuntimeError(f"aws {' '.join(cmd[1:3])} failed after {retries} attempts: {last}")
+
+
+def _s3_prefix_empty(bucket: str, prefix: str) -> bool:
+    """True only when a LIST of ``s3://bucket/prefix`` confirmably returns 0 keys.
+
+    Lets the ``--clean`` wipe skip ``aws s3 rm --recursive`` when the serving
+    prefix is already empty -- the common first-conversion / backfill case. The
+    recursive rm still opens sockets and, if one wedges, spins on a prefix with
+    nothing to delete; a single cheap LIST (short read timeout, so a wedge is
+    reaped fast) sidesteps that entirely. Any error or ambiguity returns False so
+    the caller falls through to the real rm rather than skipping a needed wipe.
+    """
+    try:
+        res = subprocess.run(
+            [
+                "aws", "s3api", "list-objects-v2", "--bucket", bucket,
+                "--prefix", prefix, "--max-items", "1",
+                "--query", "Contents[0].Key", "--output", "text",
+                *_AWS_TIMEOUTS,
+            ],
+            capture_output=True, text=True, timeout=_AWS_OP_TIMEOUT, env=_aws_env(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    if res.returncode != 0:
+        return False
+    # `--query Contents[0].Key --output text` prints the first key, or "None" when
+    # the prefix holds no objects.
+    return res.stdout.strip() in ("", "None")
 
 
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
@@ -1631,15 +1669,19 @@ def main() -> int:
     # worklist so a transient "no recordings" read can never nuke a good copy;
     # the convert loop then re-uploads every store into the emptied prefix.
     if args.clean and convert:
-        print(f"[zarr] --clean: wiping s3://{bucket}/{dataset_id}/zarr/ before full rebuild", flush=True)
-        _aws(
-            [
-                "aws", "s3", "rm", f"s3://{bucket}/{dataset_id}/zarr/",
-                "--recursive", "--only-show-errors",
-            ],
-            timeout=_AWS_RM_TIMEOUT,
-            retries=_AWS_RM_RETRIES,
-        )
+        prefix = f"{dataset_id}/zarr/"
+        if _s3_prefix_empty(bucket, prefix):
+            print(f"[zarr] --clean: s3://{bucket}/{prefix} already empty; skipping wipe", flush=True)
+        else:
+            print(f"[zarr] --clean: wiping s3://{bucket}/{prefix} before full rebuild", flush=True)
+            _aws(
+                [
+                    "aws", "s3", "rm", f"s3://{bucket}/{prefix}",
+                    "--recursive", "--only-show-errors",
+                ],
+                timeout=_AWS_RM_TIMEOUT,
+                retries=_AWS_RM_RETRIES,
+            )
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
