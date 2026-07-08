@@ -37,7 +37,10 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     bids_suffix_modality,
     convert_recording,
     projected_peak_bytes,
-    recording_mem_budget_bytes,
+    per_recording_ceiling_bytes,
+    recording_size_from_pointers,
+    usable_ram_bytes,
+    _next_admission,
     should_stream,
     STREAM_EDF_MIN_BYTES,
     compute_worklist,
@@ -1087,19 +1090,17 @@ class TestMemoryGuard(unittest.TestCase):
             projected_peak_bytes("sub-01_task-x_eeg.edf", size), int(size * INMEM_MEM_FACTOR)
         )
 
-    def test_budget_scales_with_jobs(self):
+    def test_ceiling_is_the_whole_usable_node_and_jobs_independent(self):
+        # The per-recording ceiling no longer shrinks with --jobs: it is the whole
+        # usable node, so raising concurrency never skips a recording it otherwise
+        # would convert (admission control bounds the SUM, not each recording).
         os.environ.pop("ZARR_REC_MEM_BUDGET_BYTES", None)
-        serial = recording_mem_budget_bytes(1)
-        parallel = recording_mem_budget_bytes(8)
-        # Serial gets the whole node; 8-way gets ~1/8 -> a large in-memory recording
-        # the cron skips is convertible on a `--jobs 1` re-run.
-        self.assertEqual(parallel, serial // 8)
-        self.assertGreater(serial, parallel)
+        self.assertEqual(per_recording_ceiling_bytes(), usable_ram_bytes())
 
-    def test_budget_explicit_override_wins(self):
+    def test_ceiling_explicit_override_wins(self):
         os.environ["ZARR_REC_MEM_BUDGET_BYTES"] = str(123 * 1024**2)
         try:
-            self.assertEqual(recording_mem_budget_bytes(4), 123 * 1024**2)
+            self.assertEqual(per_recording_ceiling_bytes(), 123 * 1024**2)
         finally:
             os.environ.pop("ZARR_REC_MEM_BUDGET_BYTES", None)
 
@@ -1486,6 +1487,79 @@ class TestShouldStream(unittest.TestCase):
             self.assertFalse(should_stream("sub-01/emg/sub-01_task-x_emg.bdf", big))
         finally:
             generate_zarr._EDF_STREAMABLE = orig
+
+
+class TestNextAdmission(unittest.TestCase):
+    def test_admits_first_fitting_when_slot_free(self):
+        # slot free, running 50 of a 100 ceiling: the 30 fits -> index 0.
+        self.assertEqual(_next_admission([30, 10], 1, 50, 4, 100), 0)
+
+    def test_waits_when_cpu_cap_reached(self):
+        self.assertIsNone(_next_admission([1, 1], 4, 0, 4, 100))
+
+    def test_waits_when_nothing_pending_fits(self):
+        # something in flight (running 95); neither pending peak fits under 100.
+        self.assertIsNone(_next_admission([100, 20], 2, 95, 8, 100))
+
+    def test_idle_admits_head_even_if_oversized(self):
+        # nothing in flight -> the head runs ALONE regardless of size (the worker
+        # #909-skips it if it truly can't fit); guarantees forward progress.
+        self.assertEqual(_next_admission([10**12], 0, 0, 4, 100), 0)
+
+    def test_skips_head_of_line_giant_for_a_smaller_one(self):
+        # running 50/100: the 100 giant can't fit, but the 10 behind it can.
+        self.assertEqual(_next_admission([100, 10], 1, 50, 4, 100), 1)
+
+    def test_simulation_never_exceeds_ceiling_except_lone_job(self):
+        # Drive a full drain via _next_admission, completing the oldest in-flight
+        # job each step; assert the concurrent peak SUM stays within the ceiling
+        # whenever more than one job runs (a lone job may exceed it, by design).
+        cpu_cap, ceiling = 4, 100
+        peaks = [30, 30, 30, 30, 90, 5, 5, 200]  # incl. a lone-only 200 (> ceiling)
+        pending = list(peaks)
+        in_flight: list[int] = []  # FIFO of running peaks
+        max_multi = 0
+        guard = 0
+        while pending or in_flight:
+            guard += 1
+            self.assertLess(guard, 1000, "admission simulation did not converge")
+            idx = _next_admission(pending, len(in_flight), sum(in_flight), cpu_cap, ceiling)
+            if idx is not None:
+                in_flight.append(pending.pop(idx))
+                if len(in_flight) > 1:
+                    max_multi = max(max_multi, sum(in_flight))
+                continue
+            # nothing admittable -> a running job completes (oldest first)
+            self.assertTrue(in_flight, "deadlock: nothing running and nothing admittable")
+            in_flight.pop(0)
+        self.assertLessEqual(max_multi, ceiling)
+
+
+class TestRecordingSizeFromPointers(unittest.TestCase):
+    def _git(self, repo: str, *args: str) -> None:
+        subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+
+    def test_sums_primary_and_companion_annex_sizes_at_head(self):
+        # A real git repo with committed annex-style pointers (locked symlinks):
+        # the recording's on-disk size is read from the keys' -s fields, no S3.
+        primary = "sub-01/eeg/sub-01_task-x_eeg.set"
+        companion = "sub-01/eeg/sub-01_task-x_eeg.fdt"
+        pkey = "SHA256E-s5000--aaaa.set"
+        ckey = "SHA256E-s2000000--bbbb.fdt"
+        with tempfile.TemporaryDirectory() as repo:
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "t@t")
+            self._git(repo, "config", "user.name", "t")
+            os.makedirs(os.path.join(repo, "sub-01", "eeg"))
+            os.symlink(f"../../.git/annex/objects/aa/bb/{pkey}/{pkey}", os.path.join(repo, primary))
+            os.symlink(f"../../.git/annex/objects/cc/dd/{ckey}/{ckey}", os.path.join(repo, companion))
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-qm", "fixture")
+            head = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+            ).strip()
+            total = recording_size_from_pointers(repo, primary, {primary, companion}, head)
+            self.assertEqual(total, 5000 + 2000000)
 
 
 if __name__ == "__main__":

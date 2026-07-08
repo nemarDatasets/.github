@@ -38,7 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
 
 # --- Path classification -------------------------------------------------
@@ -135,9 +135,10 @@ def should_stream(primary_local: str, size_bytes: int) -> bool:
 # infra failure and burns retries. The streaming path peaks ~STREAM_PEAK_BYTES
 # regardless of size. We PROJECT each recording's peak RAM and skip (cleanly,
 # with a deterministic reason surfaced in the index) anything that won't fit the
-# per-recording budget for this run -- BEFORE the load, so no OOM ever happens.
-# The budget scales with --jobs (usable_RAM / jobs) in main(), so the 8-way cron
-# skips a large in-memory recording that a manual `--jobs 1` re-run would convert.
+# node's usable RAM -- BEFORE the load, so no OOM ever happens. The ceiling is the
+# whole usable node (not usable_RAM / jobs): main() admits recordings so the SUM
+# of in-flight peaks stays within it, so raising --jobs adds concurrency without
+# shrinking the budget or skipping more recordings.
 STREAM_PEAK_BYTES = int(os.environ.get("ZARR_STREAM_PEAK_BYTES", str(4 * 1024**3)))
 # float64 blow-up + resample copy for the in-memory path (int16 -> float64 = 4x).
 INMEM_MEM_FACTOR = float(os.environ.get("ZARR_INMEM_MEM_FACTOR", "6"))
@@ -178,14 +179,17 @@ def usable_ram_bytes() -> int:
     return int(total * frac)
 
 
-def recording_mem_budget_bytes(jobs: int) -> int:
-    """Per-recording RAM budget for a run at this concurrency. Explicit override
-    wins; else usable RAM split across the workers (so serial runs get the whole
-    node and can convert a recording the parallel cron must skip). #909"""
+def per_recording_ceiling_bytes() -> int:
+    """Largest projected peak a SINGLE recording may use: the whole usable node.
+    Admission control in ``main`` keeps the SUM of concurrently-converting
+    recordings within this, so a recording is #909-skipped only when it can't fit
+    the node even alone -- independent of ``--jobs`` (unlike the old RAM/jobs
+    split, where raising jobs shrank the budget and skipped more recordings).
+    Explicit override still wins. #909"""
     override = os.environ.get("ZARR_REC_MEM_BUDGET_BYTES")
     if override:
         return int(override)
-    return usable_ram_bytes() // max(1, jobs)
+    return usable_ram_bytes()
 
 
 # Fallback user-facing reasons, keyed by biosigIO error code. The authoritative
@@ -875,6 +879,51 @@ def annex_key_size(key: str | None) -> int | None:
     carries no size (e.g. a URL/WORM key)."""
     m = re.search(r"-s(\d+)", key or "")
     return int(m.group(1)) if m else None
+
+
+def _blob_key_and_size(repo_dir: str, path: str, head: str) -> tuple[str | None, int]:
+    """For a tracked path at ``head``: ``(annex_key, in_git_blob_bytes)``. An
+    annexed path returns ``(key, 0)`` -- its size lives in the key's ``-s`` field;
+    a small in-git blob returns ``(None, len(blob))``. Reads pointers only, never
+    downloads S3 content. Mirrors ``_fetch_blob``'s annex-vs-in-git decision."""
+    meta = _run(["git", "-C", repo_dir, "ls-tree", head, "--", path]).strip()
+    if not meta:
+        return None, 0
+    mode, _, rest = meta.split(" ", 2)
+    sha = rest.split("\t", 1)[0].strip()
+    blob = subprocess.check_output(["git", "-C", repo_dir, "cat-file", "blob", sha])
+    if mode == "120000" or len(blob) < 1024:
+        key = parse_annex_key(blob.decode("utf-8", "replace"))
+        if key:
+            return key, 0
+    return None, len(blob)
+
+
+def recording_size_from_pointers(
+    repo_dir: str, primary_path: str, head_files: set[str], head: str
+) -> int:
+    """On-disk bytes of a recording's whole file set, read from git-annex pointers
+    at ``head`` WITHOUT downloading: primary + same-stem companions + FIF split
+    members, or every file under a CTF ``.ds``. Mirrors ``materialize_recording``'s
+    wanted set and ``_recording_size_bytes`` so the parent's admission estimate
+    (main) lines up with the worker's #909 preflight."""
+    if is_ctf_ds(primary_path):
+        members: list[str] = [p for p in head_files if ctf_ds_of(p) == primary_path]
+    else:
+        d = os.path.dirname(primary_path)
+        stem = filename_stem(primary_path)
+        siblings = [
+            p for p in head_files
+            if os.path.dirname(p) == d and filename_stem(p) == stem
+        ]
+        members = list(
+            dict.fromkeys([primary_path, *siblings, *split_members_for(primary_path, head_files)])
+        )
+    total = 0
+    for path in members:
+        key, blob_size = _blob_key_and_size(repo_dir, path, head)
+        total += (annex_key_size(key) or 0) if key else blob_size
+    return total
 
 
 def download_blob(src: str, dst: str, expected_size: int | None) -> None:
@@ -1608,6 +1657,66 @@ def convert_one(primary: str) -> dict:
             shutil.rmtree(d, ignore_errors=True)
 
 
+def _next_admission(
+    pending_peaks: list[int], in_flight_count: int, running_peak: int,
+    cpu_cap: int, ram_ceiling: int,
+) -> int | None:
+    """Index into ``pending_peaks`` of the next recording to dispatch, or ``None``
+    to wait for a running one to finish. Admittable when a worker slot is free AND
+    either nothing is in flight (it runs alone, guaranteeing progress) or it fits
+    the remaining RAM ceiling. Picks the first pending recording that fits, so a
+    head-of-line giant doesn't starve smaller ones behind it."""
+    if in_flight_count >= cpu_cap:
+        return None
+    idle = in_flight_count == 0
+    return next(
+        (j for j, pk in enumerate(pending_peaks)
+         if idle or running_peak + pk <= ram_ceiling),
+        None,
+    )
+
+
+def _drain_with_admission(convert, peaks, cpu_cap, ram_ceiling, ctx, record) -> None:
+    """Run ``convert_one`` over ``convert`` in a pool of up to ``cpu_cap`` workers,
+    dispatching a recording only while the SUM of in-flight projected peaks stays
+    within ``ram_ceiling`` (see ``_next_admission``). Results are reported via
+    ``record(r, i)`` in completion order; a crashed worker is a non-coded (infra)
+    failure that retries next run."""
+    pending = list(convert)
+    in_flight: dict = {}  # future -> (primary, peak)
+    running_peak = 0
+    done = 0
+    with ProcessPoolExecutor(
+        max_workers=cpu_cap, initializer=_init_worker, initargs=(ctx,)
+    ) as ex:
+        def admit() -> None:
+            nonlocal running_peak
+            while pending:
+                idx = _next_admission(
+                    [peaks[p] for p in pending], len(in_flight), running_peak,
+                    cpu_cap, ram_ceiling,
+                )
+                if idx is None:
+                    break
+                p = pending.pop(idx)
+                in_flight[ex.submit(convert_one, p)] = (p, peaks[p])
+                running_peak += peaks[p]
+
+        admit()
+        while in_flight:
+            finished, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+            for fut in finished:
+                p, peak = in_flight.pop(fut)
+                running_peak -= peak
+                done += 1
+                try:
+                    r = fut.result()
+                except Exception as exc:  # worker process died (OOM/segfault)
+                    r = {"ok": False, "primary": p, "error": f"worker crashed: {exc}"}
+                record(r, done)
+            admit()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate NEMAR Zarr serving copies")
     ap.add_argument("--dataset-id", required=True)
@@ -1717,34 +1826,37 @@ def main() -> int:
                 })
             print(f"::warning::[{i}/{n}] conversion failed for {r['primary']}: {r['error']}", flush=True)
 
-    jobs = max(1, args.jobs)
-    mem_budget = recording_mem_budget_bytes(jobs)
+    cpu_cap = max(1, args.jobs)
+    ram_ceiling = per_recording_ceiling_bytes()
+    # RAM-admission control: workers are sized to CPU (cpu_cap), but a recording is
+    # dispatched only while the SUM of in-flight projected peaks stays within the
+    # node's usable RAM. Small (EEG) recordings pack many-wide -> cores stay busy;
+    # large (MEG) ones self-limit concurrency -> no OOM; and a recording is
+    # #909-skipped only when it can't fit the node even alone (independent of jobs).
+    # Peaks are projected from git-annex pointers (no download) so the estimate is
+    # cheap and matches the worker's preflight.
+    peaks = {
+        p: projected_peak_bytes(p, recording_size_from_pointers(repo, p, head_set, head))
+        for p in convert
+    }
     print(
-        f"[zarr] per-recording memory budget ~{mem_budget // 1024**3} GiB "
-        f"(usable RAM / {jobs} job(s)); recordings projected above it are skipped (#909)",
+        f"[zarr] admission: up to {cpu_cap} worker(s), RAM ceiling "
+        f"~{ram_ceiling // 1024**3} GiB; a recording projected above it alone is "
+        f"skipped (#909)",
         flush=True,
     )
     with tempfile.TemporaryDirectory() as tmp:
         ctx = {
             "repo": repo, "bucket": bucket, "dataset_id": dataset_id, "head": head,
             "head_files": head_set, "local": args.local, "tmp": tmp, "updated": updated,
-            "mem_budget": mem_budget,
+            "mem_budget": ram_ceiling,
         }
-        if jobs == 1 or n <= 1:
+        if cpu_cap == 1 or n <= 1:
             _init_worker(ctx)
             for i, p in enumerate(convert, 1):
                 record(convert_one(p), i)
         else:
-            with ProcessPoolExecutor(
-                max_workers=jobs, initializer=_init_worker, initargs=(ctx,)
-            ) as ex:
-                futs = {ex.submit(convert_one, p): p for p in convert}
-                for i, fut in enumerate(as_completed(futs), 1):
-                    try:
-                        r = fut.result()
-                    except Exception as exc:  # worker process died (OOM/segfault)
-                        r = {"ok": False, "primary": futs[fut], "error": f"worker crashed: {exc}"}
-                    record(r, i)
+            _drain_with_admission(convert, peaks, cpu_cap, ram_ceiling, ctx, record)
 
     for rel_store in remove:
         _aws(
