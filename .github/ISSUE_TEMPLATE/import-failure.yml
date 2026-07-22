@@ -1,0 +1,67 @@
+name: Import failure
+description: Track an OpenNeuro import or recovery failure for a dataset
+title: "Import failure: on###### (ds######)"
+labels: ["import-failure"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this to record and triage a dataset that did not reach a complete
+        import/recovery state. The hardened `finalize` gate never publishes
+        incomplete data, so a failed dataset keeps its real (partial) state --
+        nothing empty is published. See `docs/import-failure-procedure.md`.
+  - type: input
+    id: dataset_id
+    attributes:
+      label: NEMAR dataset id
+      placeholder: on######
+    validations:
+      required: true
+  - type: input
+    id: source_id
+    attributes:
+      label: OpenNeuro source id
+      placeholder: ds######
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Failure stage
+      options:
+        - prepare
+        - copy
+        - finalize
+        - unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: failure_class
+    attributes:
+      label: Failure class
+      description: See the triage doc for what each class means and its action.
+      options:
+        - git-divergence (re-import push conflict)
+        - upstream-403 (specific files 403 from OpenNeuro; unrecoverable)
+        - shard-gap (transient copy shard failure; re-runnable)
+        - no-import-row (no import_jobs row; imported pre-tracking)
+        - matrix-cap (batch exceeded the 256-job matrix cap; re-size <=30)
+        - other
+    validations:
+      required: true
+  - type: input
+    id: missing
+    attributes:
+      label: Missing / total objects
+      description: From `nemar admin import verify <id>`.
+      placeholder: N/M
+  - type: input
+    id: run_url
+    attributes:
+      label: Workflow run URL
+      placeholder: https://github.com/nemarDatasets/.github/actions/runs/...
+  - type: textarea
+    id: triage
+    attributes:
+      label: Triage / action
+      description: What needs to happen to resolve (fix, re-run, withdraw, or accept-incomplete).
