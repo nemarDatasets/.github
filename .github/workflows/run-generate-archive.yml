@@ -55,7 +55,7 @@ jobs:
   # Preflight (#752): datasets over the size/file-count policy skip the zip build
   # entirely and steer users to the range-resumable per-file direct download.
   # Runs before the expensive checkout/stream job so an oversized set never spins
-  # a 60-min-capped build that can't finish. Mirrors backend archive-policy.ts.
+  # up a build that can't finish. Mirrors backend archive-policy.ts.
   preflight:
     name: Archive size preflight
     runs-on: ubuntu-latest
@@ -141,10 +141,22 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # Streaming archive completes in single-digit minutes for typical
-    # datasets; even a 250 GB upload finishes well under 30. Cap at 60
-    # so a hung S3 multipart can't pin the runner indefinitely.
-    timeout-minutes: 60
+    # Streaming archive completes in single-digit minutes for typical datasets;
+    # even a 250 GB upload finishes well under 30. The cap exists so a hung S3
+    # multipart cannot pin the runner indefinitely.
+    #
+    # Raised from 60 (nemarOrg/nemar-cli#1038). 60 was calibrated on BYTES, and
+    # file-count is the axis that actually binds: on004624 is only 19.3 GB but
+    # 66,426 files, and at the old serial fetch rate needed ~3.4 h. It was killed
+    # at 60 min on every attempt, and the delete-on-failure guard then removed
+    # the partial, so the dataset had no archive at all. The prefetch window in
+    # the stream script is the real fix; this raise is the backstop behind it.
+    #
+    # 330 is under GitHub's 360-minute hosted-runner ceiling with margin. Nothing
+    # should approach it: with prefetching, the 200,000-file preflight limit is
+    # roughly 80 minutes, which is why that limit needs no change here — it was
+    # honest all along against a cap this size, and dishonest only against 60.
+    timeout-minutes: 330
     # Defense-in-depth — every authenticated call goes through the
     # per-repo App token or the AWS credentials. The default
     # GITHUB_TOKEN is never used.
@@ -271,9 +283,18 @@ jobs:
           //
           // The retry covers connect-time/HTTP errors (throttle, 5xx, 403/404)
           // since the body is not consumed until after this returns; a mid-
-          // stream I/O error after archiver starts reading resp.Body instead
-          // surfaces on the archive-level "error" handler (sets exitCode 1, job
-          // fails red) rather than the per-file skip path.
+          // stream I/O error after archiver starts reading resp.Body is not
+          // retried here at all.
+          //
+          // Such an error surfaces on BOTH handlers, not either/or: the
+          // permanent archive.on("error") sets exitCode 1 directly, and the
+          // per-file archive.once("error") rejects that entry's `entryDone`,
+          // which is awaited inside the per-file try/catch and so also lands in
+          // the skip path — counted `unreadable`, which independently fails the
+          // build. Every listener on an EventEmitter fires for one emit; `once`
+          // only means auto-removal. Both routes agree on the outcome (fail
+          // red), so the redundancy is harmless, but do not read either handler
+          // as the exclusive one.
           async function getAnnexObject(s3, key) {
             var lastErr;
             for (var attempt = 1; attempt <= 3; attempt++) {
@@ -281,6 +302,12 @@ jobs:
                 return await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
               } catch (e) {
                 lastErr = e;
+                // A 404 is authoritative: retrying cannot change the answer.
+                // Since nemarOrg/nemar-cli#1038 an absent object is an expected,
+                // permanent state for datasets whose upstream no longer holds
+                // every declared file, so looping here would burn up to 1.5 s of
+                // backoff per absent file on exactly the common case.
+                if (isAbsentError(e)) throw e;
                 if (attempt < 3) {
                   await new Promise(function (r) {
                     setTimeout(r, 500 * attempt);
@@ -289,6 +316,58 @@ jobs:
               }
             }
             throw lastErr;
+          }
+
+          // git-annex keys embed the content's byte size: MD5E-s11878096--<hash>.nii.gz,
+          // SHA256E-s6488064--<hash>.fif. Returns null when no size can be read,
+          // which disables the size check for that file (fail-open: an unparsed
+          // key must not make a present object look hollow).
+          //
+          // Two distinct reasons a key yields null, deliberately handled the
+          // same way. URL keys carry no size at all. WORM keys DO carry one, but
+          // as WORM-s<size>-m<mtime>--<name> — the -m<mtime> sits between the
+          // size and the --, so this regex does not match them either. Reading
+          // WORM sizes would need its own pattern; not worth it, since NEMAR
+          // content is MD5E/SHA256E and WORM appears only in hand-built repos.
+          function declaredKeySize(key) {
+            var m = /-s(\d+)--/.exec(key);
+            if (!m) return null;
+            var n = Number(m[1]);
+            return Number.isFinite(n) ? n : null;
+          }
+
+          // The object at this key is not the content the key describes, so it
+          // must not go into the archive under that name.
+          //
+          // git-annex keys are content-addressed: the size is part of the
+          // identity, not metadata about it. Any mismatch means the bytes on
+          // hand are some other content, whatever the cause, so the check is
+          // deliberately a plain inequality rather than a 0-byte test.
+          //
+          // The motivating case is undersized: a failed import leaves a 0-byte
+          // object at a valid key (the nemarOrg/nemar-cli#967 empty-PUT
+          // signature — curl wrote an empty file on a 403 and it was uploaded
+          // anyway), GetObject SUCCEEDS, and archiver writes a 0-byte entry, so
+          // the zip ships `ready` carrying silently empty files. on003574's
+          // published archive has four 0-byte T1w scans exactly this way.
+          //
+          // But oversize happens too, and the first live run proved it: on004624
+          // carries a stray upstream temp file whose object is 6,520,832 bytes
+          // against a key declaring 6,488,064. Same verdict, same handling — the
+          // content is not what was asked for and no rebuild will change that.
+          function hollowObjectError(key, expected, actual) {
+            var e = new Error("object is " + actual + " bytes; key declares " + expected);
+            e.nemarAbsent = true;
+            return e;
+          }
+
+          // S3 answered authoritatively that the object is not there, or we
+          // proved the object present is not the content its key declares.
+          // Anything else means we never got a usable answer.
+          function isAbsentError(err) {
+            if (!err) return false;
+            var status = (err.$metadata && err.$metadata.httpStatusCode) || 0;
+            return err.nemarAbsent === true || err.name === "NoSuchKey" || err.Code === "NoSuchKey" || status === 404;
           }
 
           function walkDir(dir, base) {
@@ -357,12 +436,91 @@ jobs:
 
             var annexed = 0;
             var regular = 0;
-            var skipped = 0;
+            // Content this build cannot obtain and no rebuild ever will. Two
+            // sources, not one: objects the bucket positively reported it does
+            // not have (404/NoSuchKey), AND objects it returned 200 for whose
+            // ContentLength contradicts the size in their annex key — content
+            // that is not what the key describes, in either direction (0-byte
+            // per nemarOrg/nemar-cli#967, or oversized as on004624's stray temp
+            // file turned out to be). The second kind is exactly as unrecoverable
+            // as the first but arrives looking like a success. Both are an
+            // expected, permanent state for datasets imported from upstream
+            // archives that no longer hold every file they declare, rather than
+            // a build fault (nemarOrg/nemar-cli#1038).
+            var absent = 0;
+            // Everything else: throttling, 403s, 5xx, mid-stream read errors.
+            // Transient and retryable, so these MUST still fail the build.
+            var unreadable = 0;
+
+            // Prefetch window. The build was latency-bound, not bandwidth-bound:
+            // one GetObject round trip per file, strictly in series. Measured on
+            // on004624 (66,426 files / 19.3 GB) at ~5.5 files/s = ~183 ms each,
+            // moving only ~1.6 MB/s — nowhere near what S3 will serve. A 60-min
+            // cap buys ~19,800 files that way, so the dataset needed ~3.4 h and
+            // was killed mid-build every time, producing no archive at all. The
+            // dataset is not big, it is numerous.
+            //
+            // So: issue the GETs ahead of the writer while still appending in
+            // strict file order (zip entry order must match, and archiver takes
+            // one entry at a time). Each in-flight request's latency overlaps
+            // the previous entries' write time instead of adding to it.
+            //
+            // Bounded on BOTH axes deliberately. Count alone is not enough: an
+            // unconsumed response Body is an open socket holding buffered data,
+            // so a window of 12 multi-GB files would sit on 12 stalled sockets
+            // for minutes while the writer works through what came before. The
+            // byte budget keeps large files effectively just-in-time (they are
+            // bandwidth-bound anyway, so prefetching them wins nothing) and
+            // spends the window where it actually pays: the many small files.
+            var PREFETCH_MAX = 12;
+            var PREFETCH_MAX_BYTES = 256 * 1024 * 1024;
+
+            var pending = [];
+            var nextToStart = 0;
+            var pendingBytes = 0;
+
+            function startNext() {
+              var f = files[nextToStart++];
+              var annexKey = resolveAnnexKey(f.full);
+              var size = 0;
+              var item = { rel: f.rel, full: f.full, annexKey: annexKey, size: 0, p: null };
+              if (annexKey) {
+                size = declaredKeySize(annexKey) || 0;
+                item.size = size;
+                // Settle rejections HERE rather than letting them ride as an
+                // unhandled rejection until the writer catches up: the process
+                // has an unhandledRejection handler that fails the build, and a
+                // 404 on a prefetched file is an ordinary, expected outcome. The
+                // error is carried as a value and rethrown in file order below,
+                // so classification and ordering are unchanged.
+                item.p = getAnnexObject(s3, DATASET_ID + "/objects/" + annexKey).then(
+                  function (resp) {
+                    return { resp: resp };
+                  },
+                  function (err) {
+                    return { err: err };
+                  },
+                );
+                pendingBytes += size;
+              }
+              pending.push(item);
+            }
 
             for (var i = 0; i < files.length; i++) {
-              var rel = files[i].rel;
-              var full = files[i].full;
-              var annexKey = resolveAnnexKey(full);
+              // Top up the window before consuming, so the next request is
+              // already in flight while this entry is being written.
+              while (
+                nextToStart < files.length &&
+                pending.length < PREFETCH_MAX &&
+                (pendingBytes < PREFETCH_MAX_BYTES || pending.length === 0)
+              ) {
+                startNext();
+              }
+
+              var item = pending.shift();
+              var rel = item.rel;
+              var annexKey = item.annexKey;
+              if (annexKey) pendingBytes -= item.size;
 
               try {
                 var entryDone = new Promise(function (resolve, reject) {
@@ -370,45 +528,90 @@ jobs:
                   archive.once("error", reject);
                 });
                 if (annexKey) {
-                  var resp = await getAnnexObject(s3, DATASET_ID + "/objects/" + annexKey);
+                  var settled = await item.p;
+                  if (settled.err) throw settled.err;
+                  var resp = settled.resp;
+                  var expected = declaredKeySize(annexKey);
+                  if (expected !== null && typeof resp.ContentLength === "number" && resp.ContentLength !== expected) {
+                    // Release the socket; we are not going to read this body.
+                    if (resp.Body && typeof resp.Body.destroy === "function") resp.Body.destroy();
+                    throw hollowObjectError(annexKey, expected, resp.ContentLength);
+                  }
                   archive.append(resp.Body, { name: rel });
                 } else {
-                  archive.append(fs.createReadStream(full), { name: rel });
+                  archive.append(fs.createReadStream(item.full), { name: rel });
                 }
                 await entryDone;
                 if (annexKey) annexed++;
                 else regular++;
               } catch (err) {
-                skipped++;
-                if (skipped <= 10) {
-                  console.warn("  Skipping " + rel + ": " + err.message);
-                } else if (skipped === 11) {
+                var isAbsent = isAbsentError(err);
+                var skipped = absent + unreadable;
+                if (isAbsent) absent++;
+                else unreadable++;
+                if (skipped < 10) {
+                  console.warn("  Skipping " + rel + " (" + (isAbsent ? "absent" : "unreadable") + "): " + err.message);
+                } else if (skipped === 10) {
                   console.warn("  (suppressing further skip warnings)");
                 }
               }
 
-              if ((annexed + regular + skipped) % 100 === 0) {
-                console.log("  Progress: " + (annexed + regular + skipped) + "/" + files.length);
+              if ((annexed + regular + absent + unreadable) % 100 === 0) {
+                console.log("  Progress: " + (annexed + regular + absent + unreadable) + "/" + files.length);
               }
             }
 
             await archive.finalize();
             await uploadDone;
 
-            console.log("Archive complete: " + annexed + " annexed + " + regular + " regular + " + skipped + " skipped");
+            console.log("Archive complete: " + annexed + " annexed + " + regular + " regular + " + absent + " absent + " + unreadable + " unreadable");
             console.log("Uploaded to s3://" + BUCKET + "/" + s3Key);
-            if (skipped > 0) {
-              // A partial archive shouldn't silently become the
-              // downloadable artifact for a published dataset version.
-              // The fire-and-forget dispatch pattern means no callback
-              // validates archive completeness — exit non-zero so the
-              // Actions UI flags the run red and an operator investigates.
-              // The S3 upload itself already finalized above (the
-              // multipart Upload.done() returned), so the partial zip
-              // IS on S3; the operator can choose to keep it or rerun
-              // after fixing the missing annex objects. Code-review #10.
-              console.error("::error::" + skipped + " annexed files were not found in S3; archive is incomplete");
+
+            // Record the tally for the callback step, which reports completeness
+            // alongside the archive's ready state.
+            fs.writeFileSync("/tmp/archive-stats.json", JSON.stringify({
+              annexed: annexed, regular: regular, absent: absent, unreadable: unreadable,
+              declared: files.length
+            }));
+
+            // Sanity floor. A partial archive is legitimate — on006159 is ~70%
+            // absent upstream and must still publish — but an archive where
+            // essentially NOTHING was readable is not a partial dataset, it is a
+            // failed build wearing a partial's clothes. That is the on007721
+            // shape: a 2.3 MB zip served `ready` for a 23.6 GB dataset. A
+            // read-path misconfiguration produces exactly this and would
+            // otherwise exit 0 — note an IAM policy lacking s3:ListBucket makes
+            // S3 answer NoSuchKey (not 403) for objects that DO exist, so no
+            // amount of tightening isAbsentError catches it; only the magnitude
+            // does. Deliberately set at near-total absence so a real partial can
+            // never trip it. Ratio is over annexed objects only: `declared`
+            // counts non-annexed metadata files that are always present and
+            // would dilute it.
+            var attempted = annexed + absent;
+            var absentRatio = attempted > 0 ? absent / attempted : 0;
+
+            if (unreadable > 0) {
+              // We could not read objects the bucket may well still hold, so the
+              // zip is unreliable. Fail: the wrapper deletes the partial and the
+              // retry path rebuilds it.
+              console.error("::error::" + unreadable + " annexed files could not be read from S3 (not 404); archive is unreliable");
               process.exitCode = 1;
+            } else if (attempted > 0 && absentRatio >= 0.9) {
+              console.error("::error::" + absent + " of " + attempted + " annexed objects (" + Math.round(absentRatio * 100) + "%) were absent from S3; that is a failed read path, not a partial dataset. Archive rejected.");
+              process.exitCode = 1;
+            } else if (absent > 0) {
+              // Previously this also failed the build and the wrapper deleted the
+              // zip, so a dataset missing one stray upstream file served no
+              // archive at all. Availability is reported, not a precondition for
+              // serving: keep the zip and publish it. Missing files are OMITTED
+              // from the archive rather than written as 0-byte entries, so the
+              // zip never lists content it does not carry. What is missing is
+              // recorded out-of-band — the counts POSTed in the archive-ready
+              // callback below, and the per-dataset
+              // .nemar/availability-report.json (nemarOrg/nemar-cli#999). That
+              // report is NOT in the zip: it is committed to the repo's `main`
+              // branch, while this job checks out the immutable version tag.
+              console.warn("::warning::" + absent + " of " + files.length + " files are absent upstream; archive is partial but usable");
             }
           }
 
@@ -460,7 +663,7 @@ jobs:
           fi
           # Delete-on-failure (nemarOrg/nemar-cli#739): the streaming script
           # finalizes whatever it managed to append and completes the multipart
-          # upload BEFORE it exits non-zero on an incomplete build, so a failed
+          # upload BEFORE it exits non-zero on an unreliable build, so a failed
           # run leaves a partial zip at the canonical key. Combined with the
           # idempotency guard above, that partial would make every subsequent
           # dispatch a no-op until a human passes force=true. Remove it on any
@@ -468,6 +671,13 @@ jobs:
           # path is protected by the skip-if-exists guard (it never overwrites a
           # good archive); only an explicit force=true rebuild can reach here
           # with a prior good object, and that is a deliberate recovery action.
+          #
+          # Since nemarOrg/nemar-cli#1038 a build whose ONLY gaps are objects S3
+          # reported absent (404) exits 0 and is kept: those files are gone
+          # upstream, so deleting the zip and retrying can never recover them and
+          # only leaves the dataset with no archive at all. Unreadable objects
+          # (403/5xx/throttle) still exit non-zero and still delete, because the
+          # content may well be there and a rebuild can succeed.
           set +e
           node /tmp/stream-archive.js
           rc=$?
@@ -507,6 +717,28 @@ jobs:
             printf '{"dataset_id":"%s","status":"ready","version":"%s","size":%s}' "$DATASET_ID" "$VERSION" "$SIZE" > /tmp/archive-callback.json
           else
             printf '{"dataset_id":"%s","status":"ready","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/archive-callback.json
+          fi
+          # Send the completeness tally with the ready state so D1 can tell a
+          # partial archive from a complete one (nemarOrg/nemar-cli#1038).
+          # Without this the two are indistinguishable downstream and the only
+          # trace of a partial build is a warning in a green Actions log. The
+          # per-file breakdown stays in the dataset's own
+          # .nemar/availability-report.json; these are just the counts.
+          #
+          # The stats file is absent on the idempotent skip path, where the
+          # stream script never ran — then the base payload goes as-is and the
+          # Worker leaves the existing completeness columns untouched.
+          if [ -f /tmp/archive-stats.json ]; then
+            echo "archive completeness: $(cat /tmp/archive-stats.json)"
+            # A merge failure must not cost us the callback entirely: the zip is
+            # already on S3, so fall back to the base payload and warn.
+            if jq -c --slurpfile s /tmp/archive-stats.json \
+              '. + {annexed: $s[0].annexed, absent: $s[0].absent, unreadable: $s[0].unreadable, declared: $s[0].declared, complete: (($s[0].absent + $s[0].unreadable) == 0)}' \
+              /tmp/archive-callback.json > /tmp/archive-callback-merged.json 2>/dev/null; then
+              mv /tmp/archive-callback-merged.json /tmp/archive-callback.json
+            else
+              echo "::warning::could not merge completeness into the callback payload; sending base payload"
+            fi
           fi
           # --connect-timeout/--max-time cap a hung Worker. On non-2xx capture the
           # body so the failure is unambiguous: the zip IS on S3, the Worker
