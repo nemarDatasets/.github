@@ -336,13 +336,25 @@ jobs:
             return Number.isFinite(n) ? n : null;
           }
 
-          // A failed import can leave a 0-byte object at the right key (the
-          // nemarOrg/nemar-cli#967 empty-PUT signature: curl wrote an empty file
-          // on a 403 and it was uploaded anyway). GetObject then SUCCEEDS and
-          // archiver happily writes a 0-byte entry, so the published zip carried
-          // silently hollow files — on003574's archive shipped `ready` with four
-          // 0-byte T1w scans in it. Comparing against the size in the key turns
-          // that silent corruption into an explicit, countable absence.
+          // The object at this key is not the content the key describes, so it
+          // must not go into the archive under that name.
+          //
+          // git-annex keys are content-addressed: the size is part of the
+          // identity, not metadata about it. Any mismatch means the bytes on
+          // hand are some other content, whatever the cause, so the check is
+          // deliberately a plain inequality rather than a 0-byte test.
+          //
+          // The motivating case is undersized: a failed import leaves a 0-byte
+          // object at a valid key (the nemarOrg/nemar-cli#967 empty-PUT
+          // signature — curl wrote an empty file on a 403 and it was uploaded
+          // anyway), GetObject SUCCEEDS, and archiver writes a 0-byte entry, so
+          // the zip ships `ready` carrying silently empty files. on003574's
+          // published archive has four 0-byte T1w scans exactly this way.
+          //
+          // But oversize happens too, and the first live run proved it: on004624
+          // carries a stray upstream temp file whose object is 6,520,832 bytes
+          // against a key declaring 6,488,064. Same verdict, same handling — the
+          // content is not what was asked for and no rebuild will change that.
           function hollowObjectError(key, expected, actual) {
             var e = new Error("object is " + actual + " bytes; key declares " + expected);
             e.nemarAbsent = true;
@@ -427,9 +439,11 @@ jobs:
             // Content this build cannot obtain and no rebuild ever will. Two
             // sources, not one: objects the bucket positively reported it does
             // not have (404/NoSuchKey), AND objects it returned 200 for whose
-            // ContentLength contradicts the size in their annex key — the
-            // nemarOrg/nemar-cli#967 hollow-object case, which is exactly as
-            // unrecoverable here but arrives looking like a success. Both are an
+            // ContentLength contradicts the size in their annex key — content
+            // that is not what the key describes, in either direction (0-byte
+            // per nemarOrg/nemar-cli#967, or oversized as on004624's stray temp
+            // file turned out to be). The second kind is exactly as unrecoverable
+            // as the first but arrives looking like a success. Both are an
             // expected, permanent state for datasets imported from upstream
             // archives that no longer hold every file they declare, rather than
             // a build fault (nemarOrg/nemar-cli#1038).
