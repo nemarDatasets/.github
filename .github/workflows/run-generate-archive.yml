@@ -271,9 +271,18 @@ jobs:
           //
           // The retry covers connect-time/HTTP errors (throttle, 5xx, 403/404)
           // since the body is not consumed until after this returns; a mid-
-          // stream I/O error after archiver starts reading resp.Body instead
-          // surfaces on the archive-level "error" handler (sets exitCode 1, job
-          // fails red) rather than the per-file skip path.
+          // stream I/O error after archiver starts reading resp.Body is not
+          // retried here at all.
+          //
+          // Such an error surfaces on BOTH handlers, not either/or: the
+          // permanent archive.on("error") sets exitCode 1 directly, and the
+          // per-file archive.once("error") rejects that entry's `entryDone`,
+          // which is awaited inside the per-file try/catch and so also lands in
+          // the skip path — counted `unreadable`, which independently fails the
+          // build. Every listener on an EventEmitter fires for one emit; `once`
+          // only means auto-removal. Both routes agree on the outcome (fail
+          // red), so the redundancy is harmless, but do not read either handler
+          // as the exclusive one.
           async function getAnnexObject(s3, key) {
             var lastErr;
             for (var attempt = 1; attempt <= 3; attempt++) {
@@ -298,8 +307,16 @@ jobs:
           }
 
           // git-annex keys embed the content's byte size: MD5E-s11878096--<hash>.nii.gz,
-          // SHA256E-s6488064--<hash>.fif. Returns null for backends that don't
-          // (URL, WORM), which disables the size check for that file.
+          // SHA256E-s6488064--<hash>.fif. Returns null when no size can be read,
+          // which disables the size check for that file (fail-open: an unparsed
+          // key must not make a present object look hollow).
+          //
+          // Two distinct reasons a key yields null, deliberately handled the
+          // same way. URL keys carry no size at all. WORM keys DO carry one, but
+          // as WORM-s<size>-m<mtime>--<name> — the -m<mtime> sits between the
+          // size and the --, so this regex does not match them either. Reading
+          // WORM sizes would need its own pattern; not worth it, since NEMAR
+          // content is MD5E/SHA256E and WORM appears only in hand-built repos.
           function declaredKeySize(key) {
             var m = /-s(\d+)--/.exec(key);
             if (!m) return null;
@@ -395,10 +412,15 @@ jobs:
 
             var annexed = 0;
             var regular = 0;
-            // Objects the bucket positively reported it does not have. Some
-            // NEMAR datasets are imported from upstream archives that no longer
-            // hold every file they declare, so this is an expected, permanent
-            // state for them rather than a build fault (nemarOrg/nemar-cli#1038).
+            // Content this build cannot obtain and no rebuild ever will. Two
+            // sources, not one: objects the bucket positively reported it does
+            // not have (404/NoSuchKey), AND objects it returned 200 for whose
+            // ContentLength contradicts the size in their annex key — the
+            // nemarOrg/nemar-cli#967 hollow-object case, which is exactly as
+            // unrecoverable here but arrives looking like a success. Both are an
+            // expected, permanent state for datasets imported from upstream
+            // archives that no longer hold every file they declare, rather than
+            // a build fault (nemarOrg/nemar-cli#1038).
             var absent = 0;
             // Everything else: throttling, 403s, 5xx, mid-stream read errors.
             // Transient and retryable, so these MUST still fail the build.
