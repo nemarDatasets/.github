@@ -55,7 +55,7 @@ jobs:
   # Preflight (#752): datasets over the size/file-count policy skip the zip build
   # entirely and steer users to the range-resumable per-file direct download.
   # Runs before the expensive checkout/stream job so an oversized set never spins
-  # a 60-min-capped build that can't finish. Mirrors backend archive-policy.ts.
+  # up a build that can't finish. Mirrors backend archive-policy.ts.
   preflight:
     name: Archive size preflight
     runs-on: ubuntu-latest
@@ -141,10 +141,22 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # Streaming archive completes in single-digit minutes for typical
-    # datasets; even a 250 GB upload finishes well under 30. Cap at 60
-    # so a hung S3 multipart can't pin the runner indefinitely.
-    timeout-minutes: 60
+    # Streaming archive completes in single-digit minutes for typical datasets;
+    # even a 250 GB upload finishes well under 30. The cap exists so a hung S3
+    # multipart cannot pin the runner indefinitely.
+    #
+    # Raised from 60 (nemarOrg/nemar-cli#1038). 60 was calibrated on BYTES, and
+    # file-count is the axis that actually binds: on004624 is only 19.3 GB but
+    # 66,426 files, and at the old serial fetch rate needed ~3.4 h. It was killed
+    # at 60 min on every attempt, and the delete-on-failure guard then removed
+    # the partial, so the dataset had no archive at all. The prefetch window in
+    # the stream script is the real fix; this raise is the backstop behind it.
+    #
+    # 330 is under GitHub's 360-minute hosted-runner ceiling with margin. Nothing
+    # should approach it: with prefetching, the 200,000-file preflight limit is
+    # roughly 80 minutes, which is why that limit needs no change here — it was
+    # honest all along against a cap this size, and dishonest only against 60.
+    timeout-minutes: 330
     # Defense-in-depth — every authenticated call goes through the
     # per-repo App token or the AWS credentials. The default
     # GITHUB_TOKEN is never used.
@@ -426,10 +438,75 @@ jobs:
             // Transient and retryable, so these MUST still fail the build.
             var unreadable = 0;
 
+            // Prefetch window. The build was latency-bound, not bandwidth-bound:
+            // one GetObject round trip per file, strictly in series. Measured on
+            // on004624 (66,426 files / 19.3 GB) at ~5.5 files/s = ~183 ms each,
+            // moving only ~1.6 MB/s — nowhere near what S3 will serve. A 60-min
+            // cap buys ~19,800 files that way, so the dataset needed ~3.4 h and
+            // was killed mid-build every time, producing no archive at all. The
+            // dataset is not big, it is numerous.
+            //
+            // So: issue the GETs ahead of the writer while still appending in
+            // strict file order (zip entry order must match, and archiver takes
+            // one entry at a time). Each in-flight request's latency overlaps
+            // the previous entries' write time instead of adding to it.
+            //
+            // Bounded on BOTH axes deliberately. Count alone is not enough: an
+            // unconsumed response Body is an open socket holding buffered data,
+            // so a window of 12 multi-GB files would sit on 12 stalled sockets
+            // for minutes while the writer works through what came before. The
+            // byte budget keeps large files effectively just-in-time (they are
+            // bandwidth-bound anyway, so prefetching them wins nothing) and
+            // spends the window where it actually pays: the many small files.
+            var PREFETCH_MAX = 12;
+            var PREFETCH_MAX_BYTES = 256 * 1024 * 1024;
+
+            var pending = [];
+            var nextToStart = 0;
+            var pendingBytes = 0;
+
+            function startNext() {
+              var f = files[nextToStart++];
+              var annexKey = resolveAnnexKey(f.full);
+              var size = 0;
+              var item = { rel: f.rel, full: f.full, annexKey: annexKey, size: 0, p: null };
+              if (annexKey) {
+                size = declaredKeySize(annexKey) || 0;
+                item.size = size;
+                // Settle rejections HERE rather than letting them ride as an
+                // unhandled rejection until the writer catches up: the process
+                // has an unhandledRejection handler that fails the build, and a
+                // 404 on a prefetched file is an ordinary, expected outcome. The
+                // error is carried as a value and rethrown in file order below,
+                // so classification and ordering are unchanged.
+                item.p = getAnnexObject(s3, DATASET_ID + "/objects/" + annexKey).then(
+                  function (resp) {
+                    return { resp: resp };
+                  },
+                  function (err) {
+                    return { err: err };
+                  },
+                );
+                pendingBytes += size;
+              }
+              pending.push(item);
+            }
+
             for (var i = 0; i < files.length; i++) {
-              var rel = files[i].rel;
-              var full = files[i].full;
-              var annexKey = resolveAnnexKey(full);
+              // Top up the window before consuming, so the next request is
+              // already in flight while this entry is being written.
+              while (
+                nextToStart < files.length &&
+                pending.length < PREFETCH_MAX &&
+                (pendingBytes < PREFETCH_MAX_BYTES || pending.length === 0)
+              ) {
+                startNext();
+              }
+
+              var item = pending.shift();
+              var rel = item.rel;
+              var annexKey = item.annexKey;
+              if (annexKey) pendingBytes -= item.size;
 
               try {
                 var entryDone = new Promise(function (resolve, reject) {
@@ -437,7 +514,9 @@ jobs:
                   archive.once("error", reject);
                 });
                 if (annexKey) {
-                  var resp = await getAnnexObject(s3, DATASET_ID + "/objects/" + annexKey);
+                  var settled = await item.p;
+                  if (settled.err) throw settled.err;
+                  var resp = settled.resp;
                   var expected = declaredKeySize(annexKey);
                   if (expected !== null && typeof resp.ContentLength === "number" && resp.ContentLength !== expected) {
                     // Release the socket; we are not going to read this body.
@@ -446,7 +525,7 @@ jobs:
                   }
                   archive.append(resp.Body, { name: rel });
                 } else {
-                  archive.append(fs.createReadStream(full), { name: rel });
+                  archive.append(fs.createReadStream(item.full), { name: rel });
                 }
                 await entryDone;
                 if (annexKey) annexed++;
