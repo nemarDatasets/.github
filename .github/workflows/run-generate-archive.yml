@@ -459,19 +459,43 @@ jobs:
               declared: files.length
             }));
 
+            // Sanity floor. A partial archive is legitimate — on006159 is ~70%
+            // absent upstream and must still publish — but an archive where
+            // essentially NOTHING was readable is not a partial dataset, it is a
+            // failed build wearing a partial's clothes. That is the on007721
+            // shape: a 2.3 MB zip served `ready` for a 23.6 GB dataset. A
+            // read-path misconfiguration produces exactly this and would
+            // otherwise exit 0 — note an IAM policy lacking s3:ListBucket makes
+            // S3 answer NoSuchKey (not 403) for objects that DO exist, so no
+            // amount of tightening isAbsentError catches it; only the magnitude
+            // does. Deliberately set at near-total absence so a real partial can
+            // never trip it. Ratio is over annexed objects only: `declared`
+            // counts non-annexed metadata files that are always present and
+            // would dilute it.
+            var attempted = annexed + absent;
+            var absentRatio = attempted > 0 ? absent / attempted : 0;
+
             if (unreadable > 0) {
               // We could not read objects the bucket may well still hold, so the
               // zip is unreliable. Fail: the wrapper deletes the partial and the
               // retry path rebuilds it.
               console.error("::error::" + unreadable + " annexed files could not be read from S3 (not 404); archive is unreliable");
               process.exitCode = 1;
+            } else if (attempted > 0 && absentRatio >= 0.9) {
+              console.error("::error::" + absent + " of " + attempted + " annexed objects (" + Math.round(absentRatio * 100) + "%) were absent from S3; that is a failed read path, not a partial dataset. Archive rejected.");
+              process.exitCode = 1;
             } else if (absent > 0) {
               // Previously this also failed the build and the wrapper deleted the
               // zip, so a dataset missing one stray upstream file served no
               // archive at all. Availability is reported, not a precondition for
-              // serving: keep the zip, publish it, and let the per-dataset
-              // .nemar/availability-report.json (nemarOrg/nemar-cli#999) — which
-              // is itself included in the zip — say what is missing and why.
+              // serving: keep the zip and publish it. Missing files are OMITTED
+              // from the archive rather than written as 0-byte entries, so the
+              // zip never lists content it does not carry. What is missing is
+              // recorded out-of-band — the counts POSTed in the archive-ready
+              // callback below, and the per-dataset
+              // .nemar/availability-report.json (nemarOrg/nemar-cli#999). That
+              // report is NOT in the zip: it is committed to the repo's `main`
+              // branch, while this job checks out the immutable version tag.
               console.warn("::warning::" + absent + " of " + files.length + " files are absent upstream; archive is partial but usable");
             }
           }
@@ -579,13 +603,27 @@ jobs:
           else
             printf '{"dataset_id":"%s","status":"ready","version":"%s"}' "$DATASET_ID" "$VERSION" > /tmp/archive-callback.json
           fi
-          # Restate completeness in the run log next to the ready state, so an
-          # operator reading a green run can still see the archive is partial
-          # (nemarOrg/nemar-cli#1038). The authoritative per-file breakdown is
-          # the dataset's own .nemar/availability-report.json; this is not sent
-          # to the Worker, which tracks completeness from that report instead.
+          # Send the completeness tally with the ready state so D1 can tell a
+          # partial archive from a complete one (nemarOrg/nemar-cli#1038).
+          # Without this the two are indistinguishable downstream and the only
+          # trace of a partial build is a warning in a green Actions log. The
+          # per-file breakdown stays in the dataset's own
+          # .nemar/availability-report.json; these are just the counts.
+          #
+          # The stats file is absent on the idempotent skip path, where the
+          # stream script never ran — then the base payload goes as-is and the
+          # Worker leaves the existing completeness columns untouched.
           if [ -f /tmp/archive-stats.json ]; then
             echo "archive completeness: $(cat /tmp/archive-stats.json)"
+            # A merge failure must not cost us the callback entirely: the zip is
+            # already on S3, so fall back to the base payload and warn.
+            if jq -c --slurpfile s /tmp/archive-stats.json \
+              '. + {annexed: $s[0].annexed, absent: $s[0].absent, unreadable: $s[0].unreadable, declared: $s[0].declared, complete: (($s[0].absent + $s[0].unreadable) == 0)}' \
+              /tmp/archive-callback.json > /tmp/archive-callback-merged.json 2>/dev/null; then
+              mv /tmp/archive-callback-merged.json /tmp/archive-callback.json
+            else
+              echo "::warning::could not merge completeness into the callback payload; sending base payload"
+            fi
           fi
           # --connect-timeout/--max-time cap a hung Worker. On non-2xx capture the
           # body so the failure is unambiguous: the zip IS on S3, the Worker
