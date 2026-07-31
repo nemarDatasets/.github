@@ -74,6 +74,22 @@ def _now() -> int:
     return int(time.time())
 
 
+def _vtag(v: str | None) -> str:
+    """Canonical ``v``-prefixed version tag ("" for empty/None).
+
+    Makes reconcile's version comparisons agnostic to whether the catalog API
+    emits a bare version ("1.0.0") or the canonical tag ("v1.0.0"). nemarOrg/
+    nemar-cli epic #896 (#899) normalized the catalog ``latest_version`` to the
+    tag form; without this, every dataset whose ``converted_version`` was stored
+    bare would read as a new version on the first post-#899 reconcile, flip back
+    to ``pending``, and re-drain the whole queue -- a full, needless Zarr rebuild
+    of every already-converted public dataset.
+    """
+    if not v:
+        return ""
+    return v if v.startswith("v") else f"v{v}"
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
@@ -122,7 +138,7 @@ def reconcile(conn: sqlite3.Connection, datasets: list[tuple[str, str]], stale_s
         if status == "done":
             # Re-convert only when a version newer than the one we converted
             # appears.
-            if latest and latest != (row["converted_version"] or ""):
+            if latest and _vtag(latest) != _vtag(row["converted_version"]):
                 conn.execute(
                     "UPDATE jobs SET latest_version=?, status='pending', attempts=0,"
                     " next_retry_at=0, updated_at=? WHERE dataset_id=?",
@@ -135,7 +151,7 @@ def reconcile(conn: sqlite3.Connection, datasets: list[tuple[str, str]], stale_s
             # against latest_version, NOT converted_version (which is NULL on a
             # failure, so the old check re-queued every reconcile and wedged the
             # queue on one unconvertible dataset).
-            if latest and latest != (row["latest_version"] or ""):
+            if latest and _vtag(latest) != _vtag(row["latest_version"]):
                 conn.execute(
                     "UPDATE jobs SET latest_version=?, status='pending', attempts=0,"
                     " next_retry_at=0, last_error=NULL, updated_at=? WHERE dataset_id=?",
@@ -146,7 +162,7 @@ def reconcile(conn: sqlite3.Connection, datasets: list[tuple[str, str]], stale_s
             # pending / inprogress -- refresh the target version only. Do NOT
             # touch updated_at: it is the inprogress heartbeat the stale-recovery
             # sweep below relies on.
-            if latest and latest != (row["latest_version"] or ""):
+            if latest and _vtag(latest) != _vtag(row["latest_version"]):
                 conn.execute(
                     "UPDATE jobs SET latest_version=? WHERE dataset_id=?",
                     (latest, dataset_id),
