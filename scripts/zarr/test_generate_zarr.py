@@ -44,9 +44,11 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     should_stream,
     STREAM_EDF_MIN_BYTES,
     compute_worklist,
+    ChannelCountMismatch,
     ctf_ds_of,
     ctf_ds_recordings,
     electrode_positions_for,
+    expected_channel_count_for,
     embed_attr,
     embed_root_attr,
     event_descriptions_for,
@@ -1560,6 +1562,61 @@ class TestRecordingSizeFromPointers(unittest.TestCase):
             ).strip()
             total = recording_size_from_pointers(repo, primary, {primary, companion}, head)
             self.assertEqual(total, 5000 + 2000000)
+
+
+class TestExpectedChannelCountFor(unittest.TestCase):
+    def _write(self, root: str, rel: str, text: str) -> None:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_sibling_channels_tsv_row_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = "sub-01/eeg/sub-01_task-rest_channels.tsv"
+            self._write(d, tsv, "name\ttype\tunits\nCz\tEEG\tuV\nPz\tEEG\tuV\nEOG1\tEOG\tuV\n")
+            self.assertEqual(
+                expected_channel_count_for(d, rec, {tsv}, "HEAD"), 3
+            )
+
+    def test_none_when_no_channels_tsv(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.vhdr"
+            self.assertIsNone(expected_channel_count_for(d, rec, set(), "HEAD"))
+
+    def test_other_recordings_channels_tsv_does_not_apply(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = "sub-01/eeg/sub-01_task-other_channels.tsv"
+            self._write(d, tsv, "name\ttype\nCz\tEEG\n")
+            self.assertIsNone(expected_channel_count_for(d, rec, {tsv}, "HEAD"))
+
+    def test_most_specific_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            root_tsv = "task-rest_channels.tsv"
+            sib_tsv = "sub-01/eeg/sub-01_task-rest_channels.tsv"
+            self._write(d, root_tsv, "name\ttype\nCz\tEEG\nPz\tEEG\n")
+            self._write(d, sib_tsv, "name\ttype\nCz\tEEG\nPz\tEEG\nOz\tEEG\nFz\tEEG\n")
+            self.assertEqual(
+                expected_channel_count_for(d, rec, {root_tsv, sib_tsv}, "HEAD"), 4
+            )
+
+    def test_header_only_tsv_yields_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            tsv = "sub-01/eeg/sub-01_task-rest_channels.tsv"
+            self._write(d, tsv, "name\ttype\tunits\n")
+            self.assertIsNone(expected_channel_count_for(d, rec, {tsv}, "HEAD"))
+
+
+class TestChannelCountMismatch(unittest.TestCase):
+    def test_carries_typed_data_failure_code(self):
+        # The gate must surface as a DETERMINISTIC data failure (a .code the
+        # index records), not an untyped infra failure that retries forever.
+        self.assertEqual(ChannelCountMismatch.code, "channel_count_mismatch")
+        self.assertIn("channels.tsv", reason_for_code("channel_count_mismatch"))
 
 
 if __name__ == "__main__":
