@@ -153,13 +153,22 @@ class RecordingTooLarge(Exception):
     code = "recording_too_large"
 
 
-class ChannelCountMismatch(RuntimeError):
+class ChannelCountMismatch(Exception):
     """The converted store carries fewer channels than the recording's BIDS
     `_channels.tsv` declares, so publishing it would serve a silently
     unfaithful copy (the failure mode behind nemarDatasets/on002718#1, where
     biosigio#110 truncated 74-channel EEGLAB files to one channel). Typed so
-    the gate is a DETERMINISTIC data failure surfaced in the index; the store
-    is never uploaded and a previously-valid store is never overwritten."""
+    the gate is a DETERMINISTIC data failure surfaced in the index and the
+    unfaithful store is never uploaded.
+
+    Policy: better NO store than a wrong store. On the incremental path the
+    prior store survives (the gate runs before this recording's sync). Under
+    ``--clean`` (the Hallu bulk path) the dataset prefix is wiped up front, so
+    a gated recording ends with no serving copy at all -- intended, since a
+    copy that contradicts channels.tsv must not be served, and the prior copy
+    was built by the same converter lineage that just failed the check. Being
+    deterministic, a gated recording does NOT self-retry: after a converter
+    fix, re-run the dataset explicitly (hallu-zarr.sh --dataset <id>)."""
 
     code = "channel_count_mismatch"
 
@@ -519,6 +528,13 @@ def power_line_frequency_for(
     return plf
 
 
+def store_total_channels(meta: dict) -> int:
+    """Total channels a built store serves, summed across its groups (a group
+    with a missing/None n_channels counts 0). Compared against
+    ``expected_channel_count_for`` by the fidelity gate in ``convert_one``."""
+    return sum(int(g.get("n_channels") or 0) for g in meta.get("groups", []))
+
+
 def expected_channel_count_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> int | None:
@@ -533,6 +549,12 @@ def expected_channel_count_for(
     This is the ground truth for the post-conversion fidelity gate: a store
     whose total channel count falls short of this number is withheld
     (``ChannelCountMismatch``) instead of served.
+
+    Unlike PLF's per-field JSON inheritance, only the single most specific
+    candidate is read (BIDS TSV inheritance is closest-file-wins, not a
+    merge). If that read fails or the file has no data rows, this returns
+    None and the gate is silently OFF for the recording -- fail-open by
+    design: no ground truth, nothing to check against.
     """
     stem = filename_stem(primary_path)
     rec_dir = os.path.dirname(primary_path)
@@ -1677,15 +1699,16 @@ def convert_one(primary: str) -> dict:
         # importer silently dropped signals (biosigio#110 served 74-channel
         # EEGLAB recordings as 1 channel for weeks, nemarDatasets/on002718#1);
         # withhold it as a typed data failure rather than publish an unfaithful
-        # copy. Runs BEFORE the sync so a bad rebuild also never --delete-wipes
-        # a previously-valid store.
+        # copy. Runs BEFORE the sync, so on the incremental path this
+        # recording's previous store survives untouched; under --clean the
+        # prefix was already wiped and the recording simply stays absent (see
+        # the ChannelCountMismatch docstring for why absent beats unfaithful,
+        # and note a gated recording needs an explicit re-run after a fix).
         expected = expected_channel_count_for(
             c["repo"], primary, c["head_files"], c["head"]
         )
         if expected:
-            total = sum(
-                int(g.get("n_channels") or 0) for g in meta.get("groups", [])
-            )
+            total = store_total_channels(meta)
             if total < expected:
                 raise ChannelCountMismatch(
                     f"store has {total} channel(s) but {primary}'s channels.tsv "

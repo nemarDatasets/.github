@@ -49,6 +49,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     ctf_ds_recordings,
     electrode_positions_for,
     expected_channel_count_for,
+    store_total_channels,
     embed_attr,
     embed_root_attr,
     event_descriptions_for,
@@ -1609,6 +1610,46 @@ class TestExpectedChannelCountFor(unittest.TestCase):
             tsv = "sub-01/eeg/sub-01_task-rest_channels.tsv"
             self._write(d, tsv, "name\ttype\tunits\n")
             self.assertIsNone(expected_channel_count_for(d, rec, {tsv}, "HEAD"))
+
+
+    def test_reads_via_git_when_no_working_tree(self):
+        # The workflow clones --no-checkout, so channels.tsv is only in the git
+        # object store. Resolution must fall back to `git cat-file`.
+        tsv = "sub-01/eeg/sub-01_task-rest_channels.tsv"
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as clone_parent:
+            self._write(src, tsv, "name\ttype\nCz\tEEG\nPz\tEEG\n")
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t",
+            }
+
+            def run(*a: str) -> None:
+                subprocess.run(a, check=True, env=env, capture_output=True)
+
+            run("git", "-C", src, "init", "-q", "-b", "main")
+            run("git", "-C", src, "add", "-A")
+            run("git", "-C", src, "commit", "-qm", "init")
+            clone = os.path.join(clone_parent, "repo")
+            run("git", "clone", "--no-checkout", "-q", src, clone)
+            self.assertFalse(os.path.exists(os.path.join(clone, tsv)))
+            rec = "sub-01/eeg/sub-01_task-rest_eeg.set"
+            self.assertEqual(expected_channel_count_for(clone, rec, {tsv}, "HEAD"), 2)
+
+
+class TestStoreTotalChannels(unittest.TestCase):
+    def test_sums_across_groups(self):
+        meta = {"groups": [{"n_channels": 70}, {"n_channels": 4}]}
+        self.assertEqual(store_total_channels(meta), 74)
+
+    def test_missing_or_none_counts_zero(self):
+        self.assertEqual(store_total_channels({}), 0)
+        self.assertEqual(store_total_channels({"groups": []}), 0)
+        self.assertEqual(
+            store_total_channels({"groups": [{"n_channels": None}, {}, {"n_channels": 3}]}), 3
+        )
 
 
 class TestChannelCountMismatch(unittest.TestCase):
