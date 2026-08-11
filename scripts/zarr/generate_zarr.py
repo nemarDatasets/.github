@@ -153,6 +153,26 @@ class RecordingTooLarge(Exception):
     code = "recording_too_large"
 
 
+class ChannelCountMismatch(Exception):
+    """The converted store carries fewer channels than the recording's BIDS
+    `_channels.tsv` declares, so publishing it would serve a silently
+    unfaithful copy (the failure mode behind nemarDatasets/on002718#1, where
+    biosigio#110 truncated 74-channel EEGLAB files to one channel). Typed so
+    the gate is a DETERMINISTIC data failure surfaced in the index and the
+    unfaithful store is never uploaded.
+
+    Policy: better NO store than a wrong store. On the incremental path the
+    prior store survives (the gate runs before this recording's sync). Under
+    ``--clean`` (the Hallu bulk path) the dataset prefix is wiped up front, so
+    a gated recording ends with no serving copy at all -- intended, since a
+    copy that contradicts channels.tsv must not be served, and the prior copy
+    was built by the same converter lineage that just failed the check. Being
+    deterministic, a gated recording does NOT self-retry: after a converter
+    fix, re-run the dataset explicitly (hallu-zarr.sh --dataset <id>)."""
+
+    code = "channel_count_mismatch"
+
+
 def projected_peak_bytes(primary_local: str, size_bytes: int) -> int:
     """Estimated peak RAM to convert this recording: bounded for the streaming
     path, ~float64 blow-up for the in-memory path. Drives the skip guard (#909)."""
@@ -215,6 +235,12 @@ _FALLBACK_REASONS = {
     "recording_too_large": (
         "This recording is too large to convert to an interactive viewer copy "
         "within the conversion node's memory limits."
+    ),
+    # NEMAR-side fidelity gate: the converted copy disagreed with the BIDS
+    # channels.tsv ground truth, so it was withheld rather than served.
+    "channel_count_mismatch": (
+        "The converted viewer copy carried fewer channels than this recording's "
+        "channels.tsv declares, so it was withheld pending a converter fix."
     ),
 }
 _GENERIC_REASON = _FALLBACK_REASONS["file_read_error"]
@@ -500,6 +526,60 @@ def power_line_frequency_for(
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
             plf = float(v)
     return plf
+
+
+def store_total_channels(meta: dict) -> int:
+    """Total channels a built store serves, summed across its groups (a group
+    with a missing/None n_channels counts 0). Compared against
+    ``expected_channel_count_for`` by the fidelity gate in ``convert_one``."""
+    return sum(int(g.get("n_channels") or 0) for g in meta.get("groups", []))
+
+
+def expected_channel_count_for(
+    repo_dir: str, primary_path: str, head_files: set[str], head: str
+) -> int | None:
+    """Channel count the recording's BIDS `_channels.tsv` declares, or None when
+    no applicable channels.tsv exists (nothing to check against).
+
+    Resolution mirrors ``power_line_frequency_for``: among `_channels.tsv` files
+    in the recording's directory or an ancestor whose entities are a subset of
+    the recording's, the most specific wins. channels.tsv is git-tracked text
+    (never annexed), so this is a head-file-list scan plus one small read.
+
+    This is the ground truth for the post-conversion fidelity gate: a store
+    whose total channel count falls short of this number is withheld
+    (``ChannelCountMismatch``) instead of served.
+
+    Unlike PLF's per-field JSON inheritance, only the single most specific
+    candidate is read (BIDS TSV inheritance is closest-file-wins, not a
+    merge). If that read fails or the file has no data rows, this returns
+    None and the gate is silently OFF for the recording -- fail-open by
+    design: no ground truth, nothing to check against.
+    """
+    stem = filename_stem(primary_path)
+    rec_dir = os.path.dirname(primary_path)
+    rec_ents = _bids_entities(stem)
+    candidates: list[tuple[int, int, str]] = []
+    for f in head_files:
+        if not f.endswith("_channels.tsv"):
+            continue
+        cdir = os.path.dirname(f)
+        if cdir and rec_dir != cdir and not rec_dir.startswith(cdir + "/"):
+            continue
+        cents = _bids_entities(filename_stem(f))
+        if any(rec_ents.get(k) != v for k, v in cents.items()):
+            continue
+        depth = cdir.count("/") + (1 if cdir else 0)
+        candidates.append((depth, len(cents), f))
+    if not candidates:
+        return None
+    candidates.sort()
+    best = candidates[-1][2]  # most specific
+    text = _read_repo_text(repo_dir, head, best)
+    if text is None:
+        return None
+    rows = [line for line in text.splitlines()[1:] if line.strip()]
+    return len(rows) or None
 
 
 def affected_primaries(
@@ -1614,6 +1694,26 @@ def convert_one(primary: str) -> dict:
         meta = store_metadata(store_local)
         if not meta.get("groups"):
             raise RuntimeError(f"store has no channel groups: {store_local}")
+        # Fidelity gate: the BIDS channels.tsv is ground truth for how many
+        # channels this recording has. A store that comes up short means the
+        # importer silently dropped signals (biosigio#110 served 74-channel
+        # EEGLAB recordings as 1 channel for weeks, nemarDatasets/on002718#1);
+        # withhold it as a typed data failure rather than publish an unfaithful
+        # copy. Runs BEFORE the sync, so on the incremental path this
+        # recording's previous store survives untouched; under --clean the
+        # prefix was already wiped and the recording simply stays absent (see
+        # the ChannelCountMismatch docstring for why absent beats unfaithful,
+        # and note a gated recording needs an explicit re-run after a fix).
+        expected = expected_channel_count_for(
+            c["repo"], primary, c["head_files"], c["head"]
+        )
+        if expected:
+            total = store_total_channels(meta)
+            if total < expected:
+                raise ChannelCountMismatch(
+                    f"store has {total} channel(s) but {primary}'s channels.tsv "
+                    f"declares {expected}; refusing to publish an unfaithful copy"
+                )
         # Latest-only: --delete drops stale chunk objects a smaller new store no
         # longer needs. Long origin TTL; the callback purges zarr.json/index.json.
         # Through `_aws` for the wall-clock timeout + retry: a store is thousands of

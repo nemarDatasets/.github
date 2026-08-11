@@ -15,4 +15,8 @@
 # channel instead of failing the whole recording -- a NaN in one MISC/aux channel
 # (MoBI accelerometer/force/sync) no longer sinks a dataset's EEG coverage
 # (biosigio#107). Bumping the pin forces the idempotent cron install to upgrade.
-biosigio[zarr,meg]>=1.2.1
+# >=1.2.2: EEGLAB importer loads column-form (N, 1) chanlocs/event struct arrays
+# instead of silently truncating the recording to one channel (biosigio#110,
+# root cause of nemarDatasets/on002718#1); pairs with this repo's
+# channel_count_mismatch fidelity gate.
+biosigio[zarr,meg]>=1.2.2
