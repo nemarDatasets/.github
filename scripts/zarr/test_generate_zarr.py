@@ -1662,3 +1662,99 @@ class TestChannelCountMismatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCleanOrphanSelection(unittest.TestCase):
+    """`--clean` no longer wipes the prefix; it removes only the stores that are
+    no longer produced at HEAD. This is the selection rule that replaced the wipe
+    (nemarOrg/nemar-cli#1068 follow-up), expressed exactly as `main` computes it."""
+
+    @staticmethod
+    def orphans(prior_index: dict | None, convert: list[str]) -> set[str]:
+        prior_rels = {
+            e["zarr"]
+            for e in (prior_index or {}).get("stores", [])
+            if isinstance(e, dict) and isinstance(e.get("zarr"), str)
+        }
+        return prior_rels - {store_rel_for(p) for p in convert}
+
+    def test_rebuilt_recordings_are_never_orphans(self):
+        # The whole point: a full rebuild of the same dataset deletes NOTHING, so
+        # the ~45 min wipe-then-re-upload of identical keys disappears.
+        prior = {"stores": [
+            {"zarr": "sub-01/eeg/sub-01_task-rest_eeg.zarr"},
+            {"zarr": "sub-02/eeg/sub-02_task-rest_eeg.zarr"},
+        ]}
+        convert = ["sub-01/eeg/sub-01_task-rest_eeg.set", "sub-02/eeg/sub-02_task-rest_eeg.set"]
+        self.assertEqual(self.orphans(prior, convert), set())
+
+    def test_recording_dropped_from_head_is_removed(self):
+        prior = {"stores": [
+            {"zarr": "sub-01/eeg/sub-01_task-rest_eeg.zarr"},
+            {"zarr": "sub-02/eeg/sub-02_task-rest_eeg.zarr"},
+        ]}
+        convert = ["sub-01/eeg/sub-01_task-rest_eeg.set"]
+        self.assertEqual(
+            self.orphans(prior, convert), {"sub-02/eeg/sub-02_task-rest_eeg.zarr"}
+        )
+
+    def test_renamed_recording_removes_the_old_store(self):
+        prior = {"stores": [{"zarr": "sub-01/eeg/sub-01_task-old_eeg.zarr"}]}
+        convert = ["sub-01/eeg/sub-01_task-new_eeg.set"]
+        self.assertEqual(self.orphans(prior, convert), {"sub-01/eeg/sub-01_task-old_eeg.zarr"})
+
+    def test_first_conversion_has_no_prior_index_and_removes_nothing(self):
+        self.assertEqual(self.orphans(None, ["sub-01/eeg/sub-01_task-rest_eeg.set"]), set())
+
+    def test_malformed_prior_entries_are_ignored(self):
+        prior = {"stores": [{"zarr": 42}, {"no_zarr": "x"}, "notadict", {"zarr": "a.zarr"}]}
+        self.assertEqual(self.orphans(prior, []), {"a.zarr"})
+
+
+class TestRmRecursiveSharding(unittest.TestCase):
+    """`_rm_recursive` shards a big delete across child prefixes. A single
+    `aws s3 rm --recursive` measured 13.8k objects/min on Hallu, which made a
+    large wipe a ~45 min near-idle block."""
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+
+    def _patch(self, children: list[str]):
+        import generate_zarr as gz
+
+        self._orig_aws, self._orig_children = gz._aws, gz._s3_child_prefixes
+        gz._s3_child_prefixes = lambda url: children
+        gz._aws = lambda cmd, **kw: self.calls.append(cmd)
+        self.addCleanup(setattr, gz, "_aws", self._orig_aws)
+        self.addCleanup(setattr, gz, "_s3_child_prefixes", self._orig_children)
+        return gz
+
+    def test_shards_across_child_prefixes_then_sweeps(self):
+        gz = self._patch(["s3://b/d/zarr/sub-01/", "s3://b/d/zarr/sub-02/"])
+        gz._rm_recursive("s3://b/d/zarr/")
+        targets = [c[3] for c in self.calls]
+        self.assertIn("s3://b/d/zarr/sub-01/", targets)
+        self.assertIn("s3://b/d/zarr/sub-02/", targets)
+        # ...and a final unsharded sweep, so keys sitting directly under the
+        # prefix (which no child covers) are still deleted.
+        self.assertEqual(targets[-1], "s3://b/d/zarr/")
+
+    def test_falls_back_to_one_rm_when_there_are_no_children(self):
+        gz = self._patch([])
+        gz._rm_recursive("s3://b/d/zarr/")
+        self.assertEqual([c[3] for c in self.calls], ["s3://b/d/zarr/"])
+
+    def test_a_failing_shard_is_not_reported_as_a_clean_wipe(self):
+        import generate_zarr as gz
+
+        orig_aws, orig_children = gz._aws, gz._s3_child_prefixes
+        gz._s3_child_prefixes = lambda url: ["s3://b/d/zarr/sub-01/"]
+
+        def boom(cmd, **kw):
+            raise RuntimeError("delete failed")
+
+        gz._aws = boom
+        self.addCleanup(setattr, gz, "_aws", orig_aws)
+        self.addCleanup(setattr, gz, "_s3_child_prefixes", orig_children)
+        with self.assertRaises(RuntimeError):
+            gz._rm_recursive("s3://b/d/zarr/")
