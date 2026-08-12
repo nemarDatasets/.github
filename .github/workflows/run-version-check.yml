@@ -1,0 +1,151 @@
+name: Run Version Check
+
+# Central version-check workflow for NEMAR datasets.
+#
+# Replaces the per-repo `.github/workflows/version-check.yml`, which cannot run
+# where per-repo Actions are unavailable. That leaves PRs permanently BLOCKED,
+# because `version-check` is a required status check in the "NEMAR branch
+# protection" ruleset while `Run BIDS Validation` is already served centrally.
+#
+# Same shape as run-bids-validation.yml: mint a per-repo App token, post a
+# check-run named exactly `version-check` onto the PR head SHA of the target
+# dataset repo, and complete it with the outcome.
+#
+# Triggered by:
+#   - repository_dispatch[run-version-check] with client_payload
+#     {dataset_id, ref, head_sha, pr_number}
+#   - workflow_dispatch (manual recovery)
+#
+# The check name MUST stay `version-check` to satisfy the ruleset.
+
+on:
+  repository_dispatch:
+    types: [run-version-check]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm099999)"
+        required: true
+        type: string
+      ref:
+        description: "PR branch to compare against main"
+        required: true
+        type: string
+      head_sha:
+        description: "Commit SHA to attach the check-run to"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number, for linkback only"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  version-check:
+    name: Version Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      REF: ${{ github.event.client_payload.ref || inputs.ref }}
+      HEAD_SHA: ${{ github.event.client_payload.head_sha || inputs.head_sha }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number || '' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ID" ]; then echo "::error::Missing dataset_id"; exit 1; fi
+          case "$DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]|xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::Invalid dataset_id shape: $DATASET_ID"; exit 1 ;;
+          esac
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::Missing head_sha — the check-run needs a commit to attach to"; exit 1
+          fi
+          if [ -z "$REF" ]; then echo "::error::Missing ref (the PR branch)"; exit 1; fi
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Create in-progress check-run
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          DETAILS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PR_HINT=""; [ -n "$PR_NUMBER" ] && PR_HINT=" (PR #$PR_NUMBER)"
+          CHECK_ID=$(gh api -X POST "repos/nemarDatasets/$DATASET_ID/check-runs" \
+            -f name='version-check' \
+            -f head_sha="$HEAD_SHA" \
+            -f status=in_progress \
+            -f "output[title]=Version check in progress$PR_HINT" \
+            -f "output[summary]=Comparing dataset_description.json Version on $REF against main. See [run logs]($DETAILS_URL)." \
+            --jq .id)
+          echo "check_id=$CHECK_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: compare
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          get_version() {
+            gh api "repos/nemarDatasets/$DATASET_ID/contents/dataset_description.json?ref=$1" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | jq -r '.Version // "0.0.0"'
+          }
+          PR_VERSION=$(get_version "$HEAD_SHA")
+          MAIN_VERSION=$(get_version "main")
+          echo "Main version: $MAIN_VERSION"
+          echo "PR version:   $PR_VERSION"
+          {
+            echo "pr_version=$PR_VERSION"
+            echo "main_version=$MAIN_VERSION"
+          } >> "$GITHUB_OUTPUT"
+          if [ -z "$PR_VERSION" ] || [ "$PR_VERSION" = "null" ]; then
+            echo "outcome=error" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$PR_VERSION" = "$MAIN_VERSION" ]; then
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Finalize check-run
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHECK_ID: ${{ steps.check.outputs.check_id }}
+          OUTCOME: ${{ steps.compare.outputs.outcome }}
+          PRV: ${{ steps.compare.outputs.pr_version }}
+          MAINV: ${{ steps.compare.outputs.main_version }}
+        run: |
+          set -euo pipefail
+          DETAILS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          case "${OUTCOME:-}" in
+            success)
+              CONCLUSION=success
+              TITLE="Version check passed"
+              SUMMARY="Version bumped: \`$MAINV\` → \`$PRV\`." ;;
+            failure)
+              CONCLUSION=failure
+              TITLE="Version not bumped"
+              SUMMARY="\`dataset_description.json\` still reports \`$MAINV\` on this branch. Bump the \`Version\` field." ;;
+            *)
+              CONCLUSION=failure
+              TITLE="Version check could not complete"
+              SUMMARY="Could not read \`Version\` from dataset_description.json on \`$HEAD_SHA\`." ;;
+          esac
+          jq -n --arg c "$CONCLUSION" --arg t "$TITLE" \
+                --arg s "$SUMMARY"$'\n\n'"[View central run logs]($DETAILS_URL)" \
+             '{status:"completed", conclusion:$c, output:{title:$t, summary:$s}}' \
+            | gh api -X PATCH "repos/nemarDatasets/$DATASET_ID/check-runs/$CHECK_ID" --input -
+          echo "Finalized check-run $CHECK_ID -> $CONCLUSION"
