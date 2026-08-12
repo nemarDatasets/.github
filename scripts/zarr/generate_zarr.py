@@ -39,7 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 
 # --- Path classification -------------------------------------------------
@@ -948,6 +948,82 @@ def _s3_prefix_empty(bucket: str, prefix: str) -> bool:
     return res.stdout.strip() in ("", "None")
 
 
+# How many `aws s3 rm --recursive` processes to shard a big prefix across. Each
+# inherits the runner profile's own (deliberately low) per-process request
+# concurrency, so this multiplies delete throughput without raising the transfer
+# concurrency that was pinned low to stop JOBS-way uploads causing multipart
+# races. A single rm measured 13.8k objects/min on Hallu; the wipes that remain
+# after the --clean change are rare (recovery via --wipe) but can still be huge.
+_AWS_RM_SHARDS = int(os.environ.get("ZARR_AWS_RM_SHARDS", "8"))
+
+
+def _s3_child_prefixes(url: str) -> list[str]:
+    """Immediate child prefixes of an ``s3://bucket/prefix/`` URL (delimited LIST).
+
+    Used to shard a recursive delete. Returns [] on any error or when the prefix
+    has no subdirectories, so the caller falls back to one unsharded rm.
+    """
+    rest = url[len("s3://") :]
+    bucket, _, prefix = rest.partition("/")
+    try:
+        res = subprocess.run(
+            [
+                "aws", "s3api", "list-objects-v2", "--bucket", bucket,
+                "--prefix", prefix, "--delimiter", "/",
+                "--query", "CommonPrefixes[].Prefix", "--output", "text",
+                *_AWS_TIMEOUTS,
+            ],
+            capture_output=True, text=True, timeout=_AWS_OP_TIMEOUT, env=_aws_env(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if res.returncode != 0 or res.stdout.strip() in ("", "None"):
+        return []
+    return [f"s3://{bucket}/{p}" for p in res.stdout.split() if p and p != "None"]
+
+
+def _rm_recursive(url: str) -> None:
+    """Recursively delete an S3 prefix, sharded across child prefixes.
+
+    `aws s3 rm --recursive` is single-process and paces at its profile's request
+    concurrency, so a large prefix serializes into a long, near-idle wall-clock
+    block. Splitting by child prefix lets N of them run at once. Falls back to one
+    unsharded rm when the prefix has no children (or the LIST fails), and always
+    finishes with an unsharded sweep so any key directly under `url` -- which no
+    child prefix covers -- is deleted too.
+    """
+    children = _s3_child_prefixes(url) if _AWS_RM_SHARDS > 1 else []
+    if children:
+        print(f"[zarr] deleting {url} across {len(children)} shard(s)", flush=True)
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(max_workers=min(_AWS_RM_SHARDS, len(children))) as pool:
+            futures = {
+                pool.submit(
+                    _aws,
+                    ["aws", "s3", "rm", child, "--recursive", "--only-show-errors"],
+                    timeout=_AWS_RM_TIMEOUT,
+                    retries=_AWS_RM_RETRIES,
+                ): child
+                for child in children
+            }
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException as exc:  # noqa: BLE001 -- re-raised below
+                    errors.append(exc)
+        if errors:
+            # Surface the first failure; a partially-deleted prefix must not be
+            # reported as a clean wipe.
+            raise errors[0]
+    # Sweep: catches loose keys at the top level, and is a cheap no-op once the
+    # shards have done the bulk.
+    _aws(
+        ["aws", "s3", "rm", url, "--recursive", "--only-show-errors"],
+        timeout=_AWS_RM_TIMEOUT,
+        retries=_AWS_RM_RETRIES,
+    )
+
+
 def aws_cp(src: str, dst: str, *, extra: list[str] | None = None) -> None:
     # --only-show-errors drops the per-file transfer progress meter; with JOBS
     # workers each streaming a blob, that meter otherwise floods the log.
@@ -1828,11 +1904,19 @@ def main() -> int:
     ap.add_argument(
         "--clean",
         action="store_true",
-        help="wipe s3://<bucket>/<id>/zarr/ first, then full-rebuild the whole "
-        "dataset. The serving copy must mirror the current dataset exactly, so a "
-        "trigger remakes it wholesale rather than incrementally (no orphaned "
-        "stores from removed/renamed recordings, no stale groups from a regroup, "
-        "no merged index). Implies --full.",
+        help="full-rebuild every recording and rewrite the index fresh (no merge). "
+        "Each store is uploaded with `aws s3 sync --delete`, so its contents are "
+        "reconciled exactly; stores for recordings no longer at HEAD are removed "
+        "afterwards. Does NOT erase the serving prefix up front -- see --wipe. "
+        "Implies --full.",
+    )
+    ap.add_argument(
+        "--wipe",
+        action="store_true",
+        help="erase s3://<bucket>/<id>/zarr/ before rebuilding. Recovery only (a "
+        "corrupt prefix, or an index that no longer describes what is on S3): it "
+        "destroys the serving copy before the replacement exists, so the dataset "
+        "has no viewer for the length of the run. Use with --clean.",
     )
     ap.add_argument(
         "--local",
@@ -1858,10 +1942,14 @@ def main() -> int:
     head = _run(["git", "-C", repo, "rev-parse", "HEAD"]).strip()
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # --clean rebuilds from scratch: ignore any prior index (no merge, no diff) so
-    # the run is unconditionally full and the index is rewritten fresh below.
+    # --clean rebuilds every recording from scratch: no diff, and the index is
+    # rewritten fresh (no carry-forward of stale entries) rather than merged.
+    # The prior index is still READ -- purely to find orphaned stores below, not
+    # to seed the merge or the diff.
+    prior_for_orphans: dict | None = None
     if args.clean:
         prior, prior_commit, full = None, None, True
+        prior_for_orphans = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
     else:
         prior = s3_read_json(bucket, f"{dataset_id}/zarr/index.json")
         prior_commit = (prior or {}).get("source_commit")
@@ -1875,23 +1963,49 @@ def main() -> int:
         diff = git_diff_name_status(repo, prior_commit, head)
     convert, remove = compute_worklist(head_files, diff, full)
 
-    # Wipe the whole serving prefix before rebuilding. Guarded on a non-empty
-    # worklist so a transient "no recordings" read can never nuke a good copy;
-    # the convert loop then re-uploads every store into the emptied prefix.
-    if args.clean and convert:
+    # --clean no longer wipes the serving prefix up front.
+    #
+    # It used to, and that dominated the run: nm000338 (a v1.0.1 -> v1.0.2 bump)
+    # spent ~45 min deleting ~620k objects at 13.8k/min before converting a single
+    # recording, with 30 of 32 cores idle -- then re-uploaded almost exactly what
+    # it had just deleted. The wipe was never what made the copy exact: each store
+    # is uploaded with `aws s3 sync --delete`, which already reconciles that
+    # store's contents precisely (stale chunks, renamed groups, a shortened
+    # recording). The ONLY thing the wipe added was dropping stores for recordings
+    # that no longer exist at HEAD.
+    #
+    # So compute exactly those, and hand them to the `remove` path that the
+    # incremental branch already uses -- which deletes per store, AFTER a
+    # successful conversion, instead of pre-emptively destroying a good serving
+    # copy. A recording that is still at HEAD but fails to convert is in `convert`,
+    # never an orphan, so it keeps its previous store (ADR 0005: partial data
+    # still serves) instead of being deleted by a wipe that ran before we knew.
+    #
+    # `--wipe` keeps the old behaviour for recovery (a corrupt prefix, an index
+    # that no longer describes what is on S3).
+    if args.clean:
+        prior_rels = {
+            e["zarr"]
+            for e in (prior_for_orphans or {}).get("stores", [])
+            if isinstance(e, dict) and isinstance(e.get("zarr"), str)
+        }
+        orphans = prior_rels - {store_rel_for(p) for p in convert}
+        if orphans:
+            print(
+                f"[zarr] --clean: {len(orphans)} store(s) no longer at HEAD; "
+                "removing those, keeping the rest in place",
+                flush=True,
+            )
+        # Stays a sorted LIST: `remove` is JSON-serialized into the callback and
+        # the index, and a set would blow up json.dump.
+        remove = sorted(set(remove) | orphans)
+    if args.wipe and convert:
         prefix = f"{dataset_id}/zarr/"
         if _s3_prefix_empty(bucket, prefix):
-            print(f"[zarr] --clean: s3://{bucket}/{prefix} already empty; skipping wipe", flush=True)
+            print(f"[zarr] --wipe: s3://{bucket}/{prefix} already empty; skipping wipe", flush=True)
         else:
-            print(f"[zarr] --clean: wiping s3://{bucket}/{prefix} before full rebuild", flush=True)
-            _aws(
-                [
-                    "aws", "s3", "rm", f"s3://{bucket}/{prefix}",
-                    "--recursive", "--only-show-errors",
-                ],
-                timeout=_AWS_RM_TIMEOUT,
-                retries=_AWS_RM_RETRIES,
-            )
+            print(f"[zarr] --wipe: erasing s3://{bucket}/{prefix} before full rebuild", flush=True)
+            _rm_recursive(f"s3://{bucket}/{prefix}")
     print(
         f"[zarr] {dataset_id} head={head[:8]} prior={(prior_commit or 'none')[:8]} "
         f"full={full} convert={len(convert)} remove={len(remove)}",
@@ -1960,14 +2074,7 @@ def main() -> int:
             _drain_with_admission(convert, peaks, cpu_cap, ram_ceiling, ctx, record)
 
     for rel_store in remove:
-        _aws(
-            [
-                "aws", "s3", "rm", safe_store_prefix(bucket, dataset_id, rel_store),
-                "--recursive", "--only-show-errors",
-            ],
-            timeout=_AWS_RM_TIMEOUT,
-            retries=_AWS_RM_RETRIES,
-        )
+        _rm_recursive(safe_store_prefix(bucket, dataset_id, rel_store))
         print(f"[zarr] removed store {rel_store}", flush=True)
 
     # `deterministic` = every failure is a typed DATA failure (biosigIO carries a
