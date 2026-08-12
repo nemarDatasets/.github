@@ -33,11 +33,13 @@
 #   ./hallu-zarr.sh --dataset nm000132   # one dataset now (bypasses the queue)
 #   ./hallu-zarr.sh --stats              # print queue status and exit
 #
-# Every conversion wipes s3://<id>/zarr/ and rebuilds the whole dataset (the
-# driver's --clean), so the serving copy always mirrors the current dataset.
+# Every conversion rebuilds the whole dataset (the driver's --clean) so the
+# serving copy mirrors the current dataset. --clean RECONCILES rather than
+# erases: each store is synced with --delete and only stores that no longer
+# exist in HEAD are removed, after a successful conversion (ADR 0023).
 #
 # Crontab (sibling of hallu-sync, offset to :30):
-#   30 * * * * /path/to/nemar-cli/scripts/hallu-zarr.sh >> /data/projects/yahya/nemar/.nm-zarr-cron.log 2>&1
+#   30 * * * * /path/to/hallu-zarr.sh >> /mnt/local/zarr-state/.nm-zarr-cron.log 2>&1
 #
 # Prereqs: curl, jq, git, git-annex, nemar CLI, aws, uv, python3 in PATH.
 ################################################################################
@@ -51,21 +53,37 @@ done
 export PATH
 
 # --- Config (environment-overridable) ----------------------------------------
-# WORK_DIR is the EPHEMERAL per-recording scratch and MUST be fast local disk:
-# the driver streams each annex blob here and builds the temp Zarr store before
-# upload, and N parallel workers hammer it at once. On Hallu that is a dedicated
-# NVMe (/mnt/local, ~950 GB) -- NOT the NFS /data/projects (which would serialize
-# the parallel writers). STATE_DIR (queue db, venv, driver clone) stays on the
-# persistent NFS so it survives reboots; only the hot I/O path is on NVMe.
-WORK_DIR="${ZARR_WORK_DIR:-/mnt/local/zarr-scratch}"
-STATE_DIR="${ZARR_STATE_DIR:-/data/projects/yahya/nemar}"
-# Recordings convert in parallel (ProcessPoolExecutor in the driver). Conversion
-# is CPU-bound (resample + zstd); Hallu has 32 cores. Cap so N concurrent
-# multi-GB recordings stay within NVMe scratch + RAM (5-10 is the sweet spot).
-JOBS="${ZARR_JOBS:-6}"
+# ZARR_BASE is the SINGLE local drive this pipeline lives on. Both the hot
+# per-recording scratch AND the persistent state (queue db, venv, driver clone,
+# logs) hang off it, so the whole pipeline touches exactly one filesystem and has
+# NO network (NFS) dependency: NFS made every Python import, SQLite lock, and stat
+# a network round-trip -- too much tension/traffic on the hot path, and
+# SQLite-over-NFS locking is fragile. All state here is rebuildable (venv/clone
+# via setup(); the queue via `reconcile`) and the real outputs live in S3, so
+# single-drive-local is the right durability trade. Moving to another machine is
+# a one-line change here (or set ZARR_BASE in the environment / crontab).
+#
+# WORK_DIR is the EPHEMERAL per-recording scratch: the driver streams each annex
+# blob here and N parallel workers build temp Zarr stores before upload, so it
+# MUST be fast local disk. Only this subtree is wiped between recordings; the
+# sibling STATE_DIR is never touched by the cleanup.
+ZARR_BASE="${ZARR_BASE:-/mnt/local}"
+WORK_DIR="${ZARR_WORK_DIR:-${ZARR_BASE}/zarr-scratch}"
+STATE_DIR="${ZARR_STATE_DIR:-${ZARR_BASE}/zarr-state}"
+# Max parallel workers = the driver's ProcessPoolExecutor CPU cap. Default to all
+# cores: the driver's RAM-admission control (nemarDatasets/.github#67) dispatches a
+# recording only while the SUM of in-flight projected peaks fits usable RAM, so a
+# high worker count adds CPU parallelism WITHOUT OOM risk or shrinking the
+# per-recording budget (small EEG packs many-wide; large MEG self-limits). Override
+# with ZARR_JOBS.
+JOBS="${ZARR_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 DRIVER_REPO="${ZARR_DRIVER_REPO:-${STATE_DIR}/dotgithub}"   # clone of nemarDatasets/.github
 VENV_DIR="${ZARR_VENV_DIR:-${STATE_DIR}/.zarr-venv}"
-BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg]>=1.2.1}"
+# Fallback only (used when the clone predates scripts/zarr/requirements.txt, which
+# is the real pin). Floor is 1.2.2, not 1.2.1: 1.2.1 truncates column-form (N, 1)
+# EEGLAB chanlocs to a single channel (biosigio#110, nemar-cli#1068), so a run that
+# fell back to the older floor would convert unfaithfully and look fine.
+BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg]>=1.2.2}"
 API_BASE="${API_BASE:-https://api.nemar.org}"
 CALLBACK_URL="${ZARR_CALLBACK_URL:-${API_BASE}/webhooks/zarr-ready}"
 S3_BUCKET="${S3_BUCKET:-nemar}"
@@ -258,6 +276,23 @@ sweep_orphaned_scratch
 setup
 if [[ ! -f "$DRIVER" || ! -f "$QUEUE" ]]; then
   err "driver/queue not found under $DRIVER_REPO after setup"; exit 1
+fi
+
+# Drift guard. setup() refreshes DRIVER_REPO from origin/main every run, so the
+# Python driver deploys itself -- but THIS script cannot: it has to exist before
+# the clone does, so it is a hand-placed copy that git never touches. That copy
+# silently fell ~5 weeks behind main once already (nemarDatasets/.github#92's
+# scratch sweep merged and did nothing here). Compare and warn; do NOT self-copy,
+# because bash reads a script incrementally and rewriting the running file mid-run
+# resumes execution at a garbage byte offset. Deploy with an atomic rename:
+#   scp hallu-zarr.sh hallu:/path/.hallu-zarr.sh.new && ssh hallu 'mv /path/.hallu-zarr.sh.new /path/hallu-zarr.sh'
+# dirname/basename rather than ${BASH_SOURCE%/*}: invoked by bare name off $PATH
+# there is no slash to strip, and the parameter expansion would yield the filename
+# as the directory, making every run report a bogus drift.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_SELF="$DRIVER_REPO/scripts/zarr/$(basename "${BASH_SOURCE[0]}")"
+if [[ -f "$REPO_SELF" && "$SELF" != "$REPO_SELF" ]] && ! cmp -s "$SELF" "$REPO_SELF"; then
+  err "DRIFT: $SELF differs from $REPO_SELF (origin/main). Changes merged to this script are NOT live; deploy it."
 fi
 
 if [[ -n "$STATS_ONLY" ]]; then
