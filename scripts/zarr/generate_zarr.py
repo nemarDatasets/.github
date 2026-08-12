@@ -30,6 +30,7 @@ Design notes
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -2015,18 +2016,27 @@ def main() -> int:
     index = merge_index(
         prior, dataset_id, index_commit, converted_entries, remove, updated, failure_entries
     )
+    # `delete=False` is deliberate -- aws_cp reads the file back by path after the
+    # handle closes -- but it left the upload as the file's only reader and nothing
+    # as its owner, so every dataset conversion leaked one temp file into TMPDIR
+    # (= the Hallu NVMe scratch); 544 strays had piled up by 2026-08-12. Unlink in
+    # a `finally` so a failed upload leaks nothing either. nemarOrg/nemar-cli#1068.
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(index, fh, separators=(",", ":"))
         index_local = fh.name
-    aws_cp(
-        index_local,
-        f"s3://{bucket}/{dataset_id}/zarr/index.json",
-        extra=["--content-type", "application/json", "--cache-control", "public, max-age=60"],
-    )
-    etag = _run(
-        ["aws", "s3api", "head-object", "--bucket", bucket, "--key",
-         f"{dataset_id}/zarr/index.json", "--query", "ETag", "--output", "text"]
-    ).strip().strip('"')
+    try:
+        aws_cp(
+            index_local,
+            f"s3://{bucket}/{dataset_id}/zarr/index.json",
+            extra=["--content-type", "application/json", "--cache-control", "public, max-age=60"],
+        )
+        etag = _run(
+            ["aws", "s3api", "head-object", "--bucket", bucket, "--key",
+             f"{dataset_id}/zarr/index.json", "--query", "ETag", "--output", "text"]
+        ).strip().strip('"')
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(index_local)
 
     # status stays "ready": the stores that converted + the index are on S3, so
     # the latest-only state is real and worth recording even on a partial run.

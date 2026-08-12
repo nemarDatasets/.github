@@ -225,6 +225,36 @@ if ! flock -n 9; then
   exit 3
 fi
 
+# --- Reclaim orphaned scratch -------------------------------------------------
+# The driver's per-recording `tempfile.TemporaryDirectory()` unwinds on a normal
+# exit, but a SIGKILL, an OOM, or an operator killing the drain's process group
+# leaves the whole tree behind. Those are invisible (random `tmp*` names, not
+# dataset-named) and they are BIG: 130 GB across 10 dirs by 2026-08-12, one of
+# them 117 GB on its own. nemarOrg/nemar-cli#1068.
+#
+# Sweeping is safe HERE and only here: we hold the single-instance lock and have
+# not started the driver, so nothing owns anything under WORK_DIR and every
+# `tmp*` entry is by definition from a dead run. Dataset-named scratch dirs are
+# left alone -- convert_dataset safe_rm's those itself before each clone.
+sweep_orphaned_scratch() {
+  local n=0 kb=0 sz
+  while IFS= read -r -d '' p; do
+    # `du -sk` (KiB) not `-sb`: -b is GNU-only. The regex guard keeps a failed or
+    # empty du from turning the arithmetic into a syntax error and aborting the
+    # sweep mid-loop -- reporting the size must never cost us the reclaim.
+    sz=$(du -sk "$p" 2>/dev/null | cut -f1)
+    [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
+    kb=$((kb + sz))
+    safe_rm "$p"
+    n=$((n + 1))
+  done < <(find "$WORK_DIR" -maxdepth 1 -name 'tmp*' -print0 2>/dev/null)
+  if [[ "$n" -gt 0 ]]; then
+    log "swept $n orphaned scratch entries from a previous run (~$((kb / 1024)) MiB reclaimed)"
+  fi
+  return 0
+}
+sweep_orphaned_scratch
+
 setup
 if [[ ! -f "$DRIVER" || ! -f "$QUEUE" ]]; then
   err "driver/queue not found under $DRIVER_REPO after setup"; exit 1

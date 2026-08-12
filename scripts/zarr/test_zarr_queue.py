@@ -182,6 +182,37 @@ class QueueTest(unittest.TestCase):
         # terminal -> never handed back out by claim_next
         self.assertIsNone(claim_next(self.conn))
 
+    def converted_version(self, dataset_id):
+        r = self.conn.execute(
+            "SELECT converted_version FROM jobs WHERE dataset_id=?", (dataset_id,)
+        ).fetchone()
+        return r["converted_version"] if r else None
+
+    def test_mark_done_stores_canonical_v_tag(self):
+        # A bare version from the catalog must land in the column as the canonical
+        # tag, so `converted_version` is uniform for any future comparison written
+        # without _vtag (222 live rows had drifted to the bare form).
+        reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_done(self.conn, "nm000001", "1.0.0")
+        self.assertEqual(self.converted_version("nm000001"), "v1.0.0")
+
+    def test_mark_done_leaves_tagged_version_untouched(self):
+        reconcile(self.conn, [("nm000001", "v1.2.3")], 3600)
+        claim_next(self.conn)
+        mark_done(self.conn, "nm000001", "v1.2.3")
+        self.assertEqual(self.converted_version("nm000001"), "v1.2.3")
+
+    def test_mark_done_normalization_does_not_requeue(self):
+        # The normalized write must still compare equal to a bare catalog version
+        # on the next reconcile -- otherwise every dataset re-converts forever.
+        reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        claim_next(self.conn)
+        mark_done(self.conn, "nm000001", "1.0.0")
+        res = reconcile(self.conn, [("nm000001", "1.0.0")], 3600)
+        self.assertEqual(res["enqueued"], 0)
+        self.assertEqual(self.status("nm000001"), "done")
+
 
 if __name__ == "__main__":
     unittest.main()

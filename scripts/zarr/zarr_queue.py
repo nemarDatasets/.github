@@ -197,10 +197,15 @@ def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def mark_done(conn: sqlite3.Connection, dataset_id: str, version: str) -> None:
+    # Store the canonical tag, not whatever the caller happened to hold. `_vtag`
+    # already makes reconcile's comparisons prefix-agnostic, so a bare value is
+    # harmless TODAY -- but it left 222 rows carrying "1.0.0" against a
+    # "v1.0.0" latest_version, which is a trap for the next comparison written
+    # without _vtag. Normalize on write so the column is uniform.
     conn.execute(
         "UPDATE jobs SET status='done', converted_version=?, last_error=NULL,"
         " next_retry_at=0, updated_at=? WHERE dataset_id=?",
-        (version, _now(), dataset_id),
+        (_vtag(version), _now(), dataset_id),
     )
     conn.commit()
 
