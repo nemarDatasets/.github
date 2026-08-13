@@ -103,6 +103,29 @@ def run(cmd: list[str], cwd: str | None = None) -> str:
     return subprocess.check_output(cmd, cwd=cwd, text=True)
 
 
+def run_bytes(cmd: list[str], cwd: str | None = None) -> bytes:
+    """Run a subprocess and return stdout as raw bytes.
+
+    Use this instead of run() for `git cat-file blob`: a blob is arbitrary
+    bytes, and decoding it as text raises UnicodeDecodeError on the first
+    binary file. Callers that want text decode explicitly and handle failure.
+    """
+    return subprocess.check_output(cmd, cwd=cwd)
+
+
+def decode_blob(raw: bytes) -> str | None:
+    """Decode a git blob as UTF-8 text, or return None if it is binary.
+
+    Returning None (rather than raising) lets callers treat "this blob is
+    binary" as an ordinary answer: a binary blob is simply not a git-annex
+    pointer, and is keyed as a plain git object like any other file.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 def parse_annex_key(symlink_target: str) -> str | None:
     """Return the annex key embedded in a symlink target, or None."""
     m = ANNEX_TARGET_RE.search(symlink_target.strip())
@@ -204,11 +227,19 @@ def build_manifest(
     bare_version = version.lstrip("v")
     tag = f"v{bare_version}"
 
-    raw = run(["git", "-C", repo_dir, "ls-tree", "-r", tag])
+    # -z is load-bearing, not a micro-optimisation. Without it git C-quotes
+    # any path holding a byte outside printable ASCII: the whole path is
+    # wrapped in double quotes and the offending bytes become octal escapes,
+    # so a file named '\u622a\u56fe.jpg' arrives as the 30-character literal
+    # "\346\210\252\345\233\276.jpg" (quotes included). That string was
+    # then stored verbatim as the manifest path and interpolated into
+    # bytes_url, producing a URL with %22 and %5C346 that 404s. -z emits
+    # NUL-delimited records with paths verbatim.
+    raw = run(["git", "-C", repo_dir, "ls-tree", "-r", "-z", tag])
 
     files: dict[str, dict] = {}
 
-    for line in raw.splitlines():
+    for line in raw.split("\0"):
         meta, _, path = line.partition("\t")
         if not path:
             continue
@@ -221,8 +252,10 @@ def build_manifest(
             continue
 
         if mode == "120000":
-            target = run(["git", "-C", repo_dir, "cat-file", "blob", sha]).strip()
-            key = parse_annex_key(target)
+            target = decode_blob(
+                run_bytes(["git", "-C", repo_dir, "cat-file", "blob", sha])
+            )
+            key = parse_annex_key(target.strip()) if target is not None else None
             if key:
                 algo = extract_algo_from_key(key)
                 files[path] = {
@@ -249,8 +282,15 @@ def build_manifest(
             # them. The 512-byte ceiling is generous; real pointer blobs
             # rarely exceed ~120 bytes even with long extensions.
             if mode in ("100644", "100755") and size <= 512:
-                content = run(["git", "-C", repo_dir, "cat-file", "blob", sha])
-                key = parse_annex_pointer_content(content)
+                # Read as bytes: this probe runs against every blob <=512
+                # bytes, which includes small binary files. Decoding straight
+                # to text aborted the whole manifest on the first one -- a
+                # 476-byte .mat file was enough to fail a dataset release with
+                # only "failed at step: emit" surfaced to the caller.
+                content = decode_blob(
+                    run_bytes(["git", "-C", repo_dir, "cat-file", "blob", sha])
+                )
+                key = parse_annex_pointer_content(content) if content else None
                 if key:
                     algo = extract_algo_from_key(key)
                     files[path] = {
