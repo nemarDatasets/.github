@@ -1,0 +1,47 @@
+name: Lint workflows
+
+# Meta-CI for this repo's own workflow files (nemarOrg/nemar-cli#1045).
+#
+# These workflows are shared infrastructure: every one of the ~785 dataset repos
+# dispatches them, so a broken workflow is not one failed build but every
+# dataset's build, discovered whenever a dispatch next happens rather than at
+# review time. Until now nothing checked them at all.
+#
+# Two gates, both cheap:
+#   actionlint  -- workflow schema, expression syntax, and (via its bundled
+#                  shellcheck) the `run:` bash blocks.
+#   inline JS   -- `node --check` on every heredoc'd JavaScript body. actionlint
+#                  cannot see inside a heredoc; to YAML it is an opaque string,
+#                  so a syntax error there is invisible to every other check.
+#
+# Runs on ANY workflow change, deliberately unfiltered by path beyond that:
+# these gates take seconds, and the failure mode they prevent is repo-wide.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/check_inline_scripts.js"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - "scripts/check_inline_scripts.js"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: workflow syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          # shellcheck is bundled; keep it on -- the archive job's
+          # delete-on-failure wrapper is non-trivial bash.
+          shellcheck: true
+
+      - name: node --check every inlined JS heredoc
+        run: node scripts/check_inline_scripts.js
