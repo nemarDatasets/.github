@@ -1014,5 +1014,75 @@ class BytesUrlForUnitTests(unittest.TestCase):
         )
 
 
+class NonAsciiPathAndBinaryBlobTests(unittest.TestCase):
+    """Regression tests for two failures that aborted or corrupted a release.
+
+    1. A path holding non-ASCII bytes was C-quoted by `git ls-tree` and stored
+       verbatim, so the manifest carried a literal '"...\\346\\210\\252....jpg"'
+       and a bytes_url containing %22 and %5C346 that 404s.
+    2. A small binary blob aborted the entire run: the annex-pointer probe
+       reads every blob <=512 bytes and decoded it as UTF-8, so one 476-byte
+       .mat file raised UnicodeDecodeError and the release failed with only
+       "failed at step: emit" surfaced.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-edge-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+        setup_repo(cls.repo)
+
+        # (1) A filename whose bytes are outside printable ASCII.
+        cls.nonascii_rel = "sub-01/eeg/\u622a\u56fe\u672a\u547d\u540d.jpg"
+        (cls.repo / cls.nonascii_rel).write_bytes(b"\xff\xd8\xff\xe0 fake jpeg")
+
+        # (2) A small binary blob, under the 512-byte annex-pointer probe
+        # ceiling, whose first non-UTF-8 byte sits partway in -- the shape of
+        # the .mat file that aborted the real release.
+        (cls.repo / "sub-01" / "eeg" / "small_binary.mat").write_bytes(
+            b"MATLAB 5.0 MAT-file" + b"\x20" * 118 + b"\x9c\x00\xfe" * 20
+        )
+
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "Edge-case files"],
+            env=env,
+        )
+        git(cls.repo, "tag", "-f", "v0.0.0")
+
+        # Before the fix this raised CalledProcessError (UnicodeDecodeError).
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.manifest = json.loads((cls.out / "manifest.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_binary_blob_does_not_abort_the_run(self):
+        self.assertEqual(self.proc.returncode, 0)
+
+    def test_small_binary_blob_is_git_keyed(self):
+        meta = self.manifest["files"].get("sub-01/eeg/small_binary.mat")
+        self.assertIsNotNone(meta, "small binary blob missing from manifest")
+        self.assertTrue(meta["key"].startswith("git:"))
+
+    def test_non_ascii_path_is_verbatim_not_quoted(self):
+        self.assertIn(self.nonascii_rel, self.manifest["files"])
+
+    def test_no_manifest_path_is_c_quoted(self):
+        bad = [p for p in self.manifest["files"] if p.startswith('"') or "\\" in p]
+        self.assertEqual(bad, [], f"C-quoted paths leaked into the manifest: {bad}")
+
+    def test_non_ascii_bytes_url_has_no_quote_or_backslash_escapes(self):
+        url = self.manifest["files"][self.nonascii_rel]["bytes_url"]
+        self.assertNotIn("%22", url)
+        self.assertNotIn("%5C", url)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
