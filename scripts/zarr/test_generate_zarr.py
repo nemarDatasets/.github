@@ -1660,10 +1660,6 @@ class TestChannelCountMismatch(unittest.TestCase):
         self.assertIn("channels.tsv", reason_for_code("channel_count_mismatch"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCleanOrphanSelection(unittest.TestCase):
     """`--clean` no longer wipes the prefix; it removes only the stores that are
     no longer produced at HEAD. This is the selection rule that replaced the wipe
@@ -1758,3 +1754,7 @@ class TestRmRecursiveSharding(unittest.TestCase):
         self.addCleanup(setattr, gz, "_s3_child_prefixes", orig_children)
         with self.assertRaises(RuntimeError):
             gz._rm_recursive("s3://b/d/zarr/")
+
+
+if __name__ == "__main__":
+    unittest.main()
