@@ -55,6 +55,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     embed_root_attr,
     event_descriptions_for,
     events_sibling_for,
+    fix_source_file_attr,
     in_excluded_tree,
     is_bids_calibration_file,
     is_ctf_ds,
@@ -619,6 +620,83 @@ class TestEmbedAttr(unittest.TestCase):
                 doc = json.load(fh)
             self.assertEqual(doc["attributes"]["power_line_frequency"], 50.0)
             self.assertEqual(doc["attributes"]["x"], 1)
+
+
+class TestFixSourceFileAttr(unittest.TestCase):
+    """recording_metadata.source_file must be the reproducible BIDS-repo-
+    relative path, not the conversion host's ephemeral scratch path biosigIO
+    was handed (nemarOrg/nemar-cli#1102)."""
+
+    def _make_store(self, d: str, recording_metadata: dict) -> str:
+        store = os.path.join(d, "rec.zarr")
+        os.makedirs(store)
+        with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "zarr_format": 3,
+                    "node_type": "group",
+                    "attributes": {
+                        "format": "biosigio-zarr",
+                        "channel_groups": ["eeg_250hz"],
+                        "recording_metadata": recording_metadata,
+                    },
+                },
+                fh,
+            )
+        return store
+
+    def test_overwrites_scratch_path_with_bids_relpath(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = self._make_store(
+                d,
+                {
+                    "source_file": (
+                        "/mnt/local/zarr-scratch/tmpv58rz85q/work/"
+                        "sub-1_task-x_eeg.bdf/sub-1_task-x_eeg.bdf"
+                    ),
+                    "source_format": "bdf",
+                },
+            )
+            bids_path = "sub-1/eeg/sub-1_task-x_eeg.bdf"
+            fix_source_file_attr(store, bids_path)
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            rec_meta = doc["attributes"]["recording_metadata"]
+            self.assertEqual(rec_meta["source_file"], bids_path)
+            self.assertEqual(rec_meta["source_format"], "bdf")  # other keys preserved
+            self.assertEqual(
+                doc["attributes"]["channel_groups"], ["eeg_250hz"]
+            )  # sibling root attrs preserved
+
+    def test_reconversion_is_reproducible_across_different_scratch_dirs(self):
+        # The whole point: two runs with DIFFERENT mkdtemp scratch dirs must
+        # converge on the SAME source_file once fixed, since only the fix
+        # (not biosigIO) determines the published value.
+        bids_path = "sub-1/eeg/sub-1_task-x_eeg.bdf"
+        results = []
+        for tmp_name in ("tmpaaaaaaaa", "tmpbbbbbbbb"):
+            with tempfile.TemporaryDirectory() as d:
+                store = self._make_store(
+                    d,
+                    {"source_file": f"/mnt/local/zarr-scratch/{tmp_name}/work/x.bdf"},
+                )
+                fix_source_file_attr(store, bids_path)
+                with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                results.append(doc["attributes"]["recording_metadata"]["source_file"])
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], bids_path)
+
+    def test_missing_recording_metadata_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3, "attributes": {"format": "biosigio-zarr"}}, fh)
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")  # must not raise
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertNotIn("recording_metadata", doc["attributes"])  # not fabricated
 
 
 class TestEventDescriptionsFor(unittest.TestCase):

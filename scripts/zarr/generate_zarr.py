@@ -1484,6 +1484,41 @@ def embed_root_attr(store_path: str, key: str, value: object) -> None:
     embed_attr(os.path.join(store_path, "zarr.json"), key, value)
 
 
+def fix_source_file_attr(store_path: str, bids_relpath: str) -> None:
+    """Overwrite the store's `recording_metadata.source_file` root attribute
+    with the repository-relative BIDS path.
+
+    Every biosigIO importer calls ``rec.set_metadata("source_file", filepath)``
+    with whatever path this driver handed it -- the conversion host's scratch
+    materialisation (``.../zarr-scratch/tmpXXXXXXXX/work/...``), a fresh
+    ``mkdtemp`` name every run. Left as-is, re-converting the same recording at
+    the same source commit produces byte-different store metadata (defeating
+    reproducibility), needlessly publishes the conversion host's internal
+    directory layout, and names a directory that no longer exists by the time
+    anyone reads it. ``bids_relpath`` is the same ``path`` this recording is
+    already keyed at in index.json, so it is stable and known here without any
+    extra lookup. biosigIO itself is untouched; this only corrects what NEMAR
+    publishes downstream, after biosigIO has written the store and before it
+    is validated/uploaded. nemarOrg/nemar-cli#1102.
+    """
+    meta_path = os.path.join(store_path, "zarr.json")
+    with open(meta_path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    rec_meta = doc.get("attributes", {}).get("recording_metadata")
+    if not isinstance(rec_meta, dict):
+        # Unexpected biosigIO version/shape: nothing to correct, and we must
+        # not fabricate a key biosigIO did not write.
+        print(
+            f"::warning::no recording_metadata attribute at {meta_path}; "
+            "source_file scratch-path fix skipped",
+            flush=True,
+        )
+        return
+    rec_meta["source_file"] = bids_relpath
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
+
 def electrode_positions_for(
     repo_dir: str, primary_path: str, head_files: set[str], head: str
 ) -> dict | None:
@@ -1873,6 +1908,11 @@ def convert_one(primary: str) -> dict:
             primary_local, events_local, store_local, plf, descs or None, elec,
             mem_budget_bytes=c.get("mem_budget"),
         )
+        # biosigIO stamped recording_metadata.source_file with the scratch path
+        # it was handed (this run's tmpdir); overwrite it with the stable,
+        # reproducible BIDS-repo-relative path before validating/uploading.
+        # nemarOrg/nemar-cli#1102.
+        fix_source_file_attr(store_local, primary)
         # Guard the --delete sync: an empty/partial store would otherwise wipe a
         # previously-valid one. zarr.json => v3 root.
         validate_store(store_local)
