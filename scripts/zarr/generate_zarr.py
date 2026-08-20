@@ -23,6 +23,16 @@ Design notes
   we ``git diff <prior>..HEAD`` and convert only the affected recordings, mapping
   a changed companion (``.fdt``/``.eeg``/``.vmrk``) or ``*_events.tsv`` back to its
   sibling recording. ``--full`` (or a missing/!ancestor prior) converts everything.
+* BIDS raw only: ``derivatives/``, ``sourcedata/``, and ``code/`` never hold a BIDS
+  raw recording, so ``is_excluded_from_discovery`` excludes them (and BIDS-reserved
+  MEG calibration filenames) from every discovery path -- ``is_primary``, the CTF
+  ``.ds`` derivation, and the diff-based companion/events routing. This scope matches
+  nemarOrg/nemar-cli ADR 0027 (the backend dispatch-gate side of the same decision).
+  Excluding a tree from *future* conversion must not be read as "gone from HEAD":
+  ``compute_clean_orphans`` explicitly protects already-published stores under an
+  excluded tree from ``--clean``'s orphan-removal so this scope change alone never
+  deletes a store; that cleanup is separate, explicitly-authorized follow-up work
+  (nemarOrg/nemar-cli#1095 / nemarOrg/nemar-cli#1097).
 * The pure helpers (path classification, worklist, index merge) carry the logic
   and are unit-tested in ``test_generate_zarr.py``; the I/O lives in ``main``.
 """
@@ -56,6 +66,20 @@ COMPANION_EXTS = (".fdt", ".eeg", ".vmrk")
 # single file, so it never appears in `git ls-tree` as one path -- it is derived
 # from the files under it and treated as one recording keyed at the `.ds` dir.
 CTF_DS_EXT = ".ds"
+
+# Trees that can never hold a BIDS raw recording, so a file under one is never
+# a servable recording no matter its extension. Mirrors `emit_records.py`'s
+# `derivatives`/`sourcedata` exclusion shape (this repo), extended to also
+# cover `code/` -- see `is_excluded_from_discovery` below and
+# nemarOrg/nemar-cli ADR 0027 for the matching backend dispatch-gate scope.
+EXCLUDED_TREES = ("derivatives", "sourcedata", "code")
+
+# BIDS-reserved Elekta/Neuromag MEG calibration filenames: fine-calibration
+# and crosstalk-correction data, never a recording. `_acq-crosstalk_meg.fif`
+# matches PRIMARY_EXTS by extension alone and, read as a recording, raises a
+# correctly-failing `ValueError: Could not find measurement data` (confirmed
+# in on006012, on006720) -- the right verdict on the wrong question.
+_BIDS_CALIBRATION_SUFFIXES = ("_acq-crosstalk_meg.fif", "_acq-calibration_meg.dat")
 
 INDEX_FORMAT = "nemar-zarr-index"
 INDEX_FORMAT_VERSION = 1
@@ -288,8 +312,41 @@ def lower_ext(path: str) -> str:
     return os.path.splitext(path)[1].lower()
 
 
+def in_excluded_tree(path: str) -> bool:
+    """True if `path` sits under `derivatives/`, `sourcedata/`, or `code/`,
+    matched at the top level or nested, on a full path SEGMENT rather than a
+    bare substring -- `mycode/`, `derivatives_old/`, and a task label
+    containing "code" must still be discoverable. Same shape as
+    `emit_records.py`'s `derivatives`/`sourcedata` exclusion in this repo."""
+    return any(
+        path.startswith(f"{tree}/") or f"/{tree}/" in path for tree in EXCLUDED_TREES
+    )
+
+
+def is_bids_calibration_file(path: str) -> bool:
+    """True for a BIDS-reserved MEG calibration filename (crosstalk or
+    fine-calibration correction data), which is never a recording."""
+    return path.endswith(_BIDS_CALIBRATION_SUFFIXES)
+
+
+def is_excluded_from_discovery(path: str) -> bool:
+    """True if `path` can never be a servable BIDS raw recording: it sits
+    under an excluded tree, or it is a reserved BIDS calibration filename.
+
+    The single predicate every recording-discovery path runs a candidate
+    through before treating it as buildable -- `is_primary`, the CTF `.ds`
+    derivation (`ctf_ds_recordings`), the diff-based companion/`_events.tsv`
+    routing in `compute_worklist`, the stale-failure carry-forward in
+    `merge_index`, and the `--clean` orphan-safety filter in
+    `compute_clean_orphans`. One predicate used everywhere instead of
+    repeating the tree/filename checks inline keeps the raw-only scope
+    consistent across every entry point.
+    """
+    return in_excluded_tree(path) or is_bids_calibration_file(path)
+
+
 def is_primary(path: str) -> bool:
-    return lower_ext(path) in PRIMARY_EXTS
+    return lower_ext(path) in PRIMARY_EXTS and not is_excluded_from_discovery(path)
 
 
 def is_events_tsv(path: str) -> bool:
@@ -422,11 +479,17 @@ def is_ctf_ds(path: str) -> bool:
 
 def ctf_ds_recordings(head_files) -> set[str]:
     """Every CTF `.ds` recording directory present in `head_files` (derived from
-    the inner files, since the directory itself is never a tracked path)."""
+    the inner files, since the directory itself is never a tracked path).
+
+    Excludes a `.ds` under an excluded tree (derivatives/sourcedata/code): a
+    CTF recording's identity is directory-derived rather than an extension
+    match, so it needs its own `is_excluded_from_discovery` check rather than
+    inheriting `is_primary`'s.
+    """
     dirs: set[str] = set()
     for f in head_files:
         ds = ctf_ds_of(f)
-        if ds is not None:
+        if ds is not None and not is_excluded_from_discovery(ds):
             dirs.add(ds)
     return dirs
 
@@ -653,6 +716,14 @@ def compute_worklist(
     # can't route through it. Group by split_group_key and decide once per group.
     deleted_split_groups: dict[str, list[str]] = {}
     for status, path in diff_entries:
+        # A changed/removed path under an excluded tree (derivatives/
+        # sourcedata/code) or a BIDS calibration filename never builds or
+        # removes a store: it was never a candidate recording, and a
+        # deletion there must not be misread as "the recording is gone from
+        # HEAD" -- that would delete an already-published store this change
+        # is required to leave untouched (see `compute_clean_orphans`).
+        if is_excluded_from_discovery(path):
+            continue
         # A change anywhere inside a CTF `.ds` is a change to that one recording.
         ds = ctf_ds_of(path)
         if ds is not None:
@@ -703,6 +774,34 @@ def compute_worklist(
     return sorted(convert), sorted(remove)
 
 
+def compute_clean_orphans(prior_index: dict | None, convert: list[str]) -> set[str]:
+    """Stores a `--clean` run should remove: prior index stores this run does
+    not (re)produce, MINUS any store under an excluded tree
+    (derivatives/sourcedata/code).
+
+    A store's rel-path missing from `convert` normally means its recording is
+    gone from HEAD. But since this converter went raw-only, a derivatives/
+    sourcedata/code primary is ALSO absent from `convert` -- deliberately,
+    because we stopped attempting it, not because the file disappeared. A
+    store rel-path mirrors its primary's directory structure (`store_rel_for`
+    only swaps the extension), so `is_excluded_from_discovery` applies to it
+    directly. Without this guard, going raw-only would let `--clean`'s own
+    orphan-removal delete the ~4,721 already-published non-raw stores on the
+    very next run -- exactly the cleanup this change must NOT perform; that
+    is separate, explicitly-authorized follow-up work
+    (nemarOrg/nemar-cli#1095 / nemarOrg/nemar-cli#1097).
+    """
+    prior_rels = {
+        e["zarr"]
+        for e in (prior_index or {}).get("stores", [])
+        if isinstance(e, dict) and isinstance(e.get("zarr"), str)
+    }
+    convert_rels = {store_rel_for(p) for p in convert}
+    return {
+        rel for rel in prior_rels - convert_rels if not is_excluded_from_discovery(rel)
+    }
+
+
 def merge_index(
     prior: dict | None,
     dataset_id: str,
@@ -743,7 +842,16 @@ def merge_index(
     fails: dict[str, dict] = {}
     if prior and isinstance(prior.get("failures"), list):
         for f in prior["failures"]:
-            if isinstance(f, dict) and f.get("path"):
+            # A path now excluded from discovery (derivatives/sourcedata/code,
+            # or a BIDS calibration filename) will never be reconverted, so a
+            # stale failure entry for it would otherwise persist in
+            # index.json indefinitely -- showing users a failure for a file
+            # we deliberately no longer serve at all.
+            if (
+                isinstance(f, dict)
+                and f.get("path")
+                and not is_excluded_from_discovery(f["path"])
+            ):
                 fails[f["path"]] = f
     converted_paths = {e["path"] for e in converted if e.get("path")}
     removed_set = set(removed_store_rels)
@@ -1984,12 +2092,11 @@ def main() -> int:
     # `--wipe` keeps the old behaviour for recovery (a corrupt prefix, an index
     # that no longer describes what is on S3).
     if args.clean:
-        prior_rels = {
-            e["zarr"]
-            for e in (prior_for_orphans or {}).get("stores", [])
-            if isinstance(e, dict) and isinstance(e.get("zarr"), str)
-        }
-        orphans = prior_rels - {store_rel_for(p) for p in convert}
+        # `compute_clean_orphans` also protects already-published stores under
+        # an excluded tree (derivatives/sourcedata/code) from this removal: a
+        # raw-only `convert` no longer contains them, but that must not be
+        # misread as "gone from HEAD" -- see its docstring.
+        orphans = compute_clean_orphans(prior_for_orphans, convert)
         if orphans:
             print(
                 f"[zarr] --clean: {len(orphans)} store(s) no longer at HEAD; "
