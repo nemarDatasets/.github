@@ -30,6 +30,10 @@ Safety design
   usually just means an earlier, partial `--execute` run already removed it
   (this tool is idempotent and safe to re-run), but it could also mean the
   index is stale, so it is always visible in the report either way.
+  This required a fix to hold: `aws s3 ls` exits 1 for a prefix matching zero
+  keys, so every already-absent store used to raise and be filed as an error
+  instead, which also meant its index entry could never be dropped. See
+  `interpret_s3_ls_result`.
 * Only ever `<dataset_id>/zarr/...`. Every computed delete target is
   re-validated, a second and independent time, immediately before the delete
   call itself (`assert_within_zarr_prefix`) -- `safe_store_prefix` already
@@ -444,18 +448,51 @@ def parse_s3_ls_summary(output: str) -> tuple[int, int]:
     """Parse `aws s3 ls --recursive --summarize`'s trailing summary lines into
     `(object_count, total_bytes)`.
 
-    Both default to 0 when the prefix holds no objects at all -- `aws s3 ls`
-    prints nothing whatsoever (not even the summary lines) for a prefix that
-    matches zero keys -- or when the summary lines are absent for any other
-    reason. Absence is always read as "empty," never as "unknown," which is
-    the conservative direction for this tool: it only ever makes a store look
-    like it needs no deletion, never the reverse.
+    Both default to 0 when the summary lines are absent. Absence is always read
+    as "empty," never as "unknown," which is the conservative direction for this
+    tool: it only ever makes a store look like it needs no deletion, never the
+    reverse.
+
+    Note what `aws s3 ls` actually does for a prefix matching zero keys, since
+    an earlier version of this docstring had it wrong: it DOES print a
+    well-formed `Total Objects: 0` / `Total Size: 0` summary, and it exits 1.
+    Deciding whether a non-zero exit is a real failure or just "no keys" is
+    `interpret_s3_ls_result`'s job, not this function's.
     """
     objects_match = _TOTAL_OBJECTS_RE.search(output)
     size_match = _TOTAL_SIZE_RE.search(output)
     count = int(objects_match.group(1)) if objects_match else 0
     total_bytes = int(size_match.group(1)) if size_match else 0
     return count, total_bytes
+
+
+def interpret_s3_ls_result(returncode: int, stdout: str) -> tuple[int, int] | None:
+    """`(object_count, total_bytes)` when `aws s3 ls`'s output can be trusted,
+    `None` when the call genuinely failed and the counts are unknown.
+
+    `aws s3 ls --recursive --summarize` **exits 1 for a prefix that matches zero
+    keys**, while still printing a well-formed `Total Objects: 0` summary and
+    writing nothing to stderr. That is a real answer -- the store is already
+    gone -- not a failure.
+
+    Treating every non-zero exit as an error made the `already_absent` outcome
+    unreachable in practice, which was not merely a reporting wart. An errored
+    target is excluded from `purged_rels` by design (never drop the index entry
+    of a store we are unsure about), so a store deleted by a run whose index
+    rewrite did not complete would be re-statted on the next run, raise, be
+    classed as an error, and keep its index entry -- permanently, across any
+    number of re-runs. The published index would go on advertising stores that
+    return 404. Observed on `nm000172`: 23 stores deleted, index rewrite lost to
+    an expired session, and every subsequent run reported 23 "delete errors"
+    while being unable to ever finish the job.
+
+    The discriminator is the summary itself: a credential, permission, or
+    network failure produces no `Total Objects` line, so it still returns None
+    and still raises upstream.
+    """
+    if returncode == 0 or _TOTAL_OBJECTS_RE.search(stdout):
+        return parse_s3_ls_summary(stdout)
+    return None
 
 
 # --- I/O: S3 + index.json -------------------------------------------------
@@ -478,9 +515,10 @@ def stat_prefix(bucket: str, key_prefix: str, *, timeout: int = _AWS_OP_TIMEOUT)
         env=_aws_env(),
         check=False,
     )
-    if res.returncode != 0:
+    counts = interpret_s3_ls_result(res.returncode, res.stdout)
+    if counts is None:
         raise RuntimeError(f"aws s3 ls {key_prefix} exited {res.returncode}: {res.stderr.strip()}")
-    return parse_s3_ls_summary(res.stdout)
+    return counts
 
 
 def _execute_target_step(bucket: str, dataset_id: str, step: dict, *, execute: bool) -> dict:

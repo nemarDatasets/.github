@@ -39,6 +39,7 @@ from purge_non_raw_stores import (  # type: ignore[import-not-found]
     assert_within_zarr_prefix,
     dataset_has_issue,
     decide_target_action,
+    interpret_s3_ls_result,
     load_snapshot_index,
     main,
     parse_s3_ls_summary,
@@ -797,6 +798,43 @@ class NoSnapshotStatusTests(unittest.TestCase):
         # The specific confusion this guards against: the generic counts line.
         self.assertNotIn("store(s) would purge", out)
         self.assertNotIn("store(s) purged", out)
+
+
+class InterpretS3LsResultTests(unittest.TestCase):
+    """`aws s3 ls` exits 1 for a prefix matching zero keys but still prints a
+    valid summary. Reading that as a failure made `already_absent` unreachable
+    and left deleted stores stuck in the index forever (see nm000172)."""
+
+    # Verbatim from `aws s3 ls s3://nemar/<deleted-prefix>/ --recursive --summarize`,
+    # which exits 1.
+    EMPTY_OUT = "\nTotal Objects: 0\n   Total Size: 0\n"
+    NONEMPTY_OUT = (
+        "2026-08-12 12:52:14        512 nm000191/zarr/sub-01/eeg/x.zarr/zarr.json\n"
+        "\nTotal Objects: 1\n   Total Size: 512\n"
+    )
+
+    def test_exit_1_with_a_zero_summary_is_a_real_answer(self):
+        self.assertEqual(interpret_s3_ls_result(1, self.EMPTY_OUT), (0, 0))
+
+    def test_already_absent_is_therefore_reachable(self):
+        """The whole point: this must become `already_absent`, not an error."""
+        counts = interpret_s3_ls_result(1, self.EMPTY_OUT)
+        self.assertIsNotNone(counts)
+        self.assertEqual(decide_target_action(counts[0], execute=True), "already_absent")
+
+    def test_exit_0_with_objects_parses_normally(self):
+        self.assertEqual(interpret_s3_ls_result(0, self.NONEMPTY_OUT), (1, 512))
+
+    def test_exit_0_with_no_summary_is_still_zero_not_a_failure(self):
+        self.assertEqual(interpret_s3_ls_result(0, ""), (0, 0))
+
+    def test_genuine_failure_returns_none(self):
+        """A credential/permission/network failure prints no summary, so it must
+        stay an error rather than being silently read as 'already gone' -- which
+        would drop the index entry for a store still present in S3."""
+        self.assertIsNone(interpret_s3_ls_result(255, ""))
+        self.assertIsNone(interpret_s3_ls_result(1, "aws: [ERROR]: 'deadbeef'\n"))
+        self.assertIsNone(interpret_s3_ls_result(1, "fatal error: Unable to locate credentials\n"))
 
 
 class MainSnapshotWiringTests(unittest.TestCase):
