@@ -80,12 +80,14 @@ JOBS="${ZARR_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 DRIVER_REPO="${ZARR_DRIVER_REPO:-${STATE_DIR}/dotgithub}"   # clone of nemarDatasets/.github
 VENV_DIR="${ZARR_VENV_DIR:-${STATE_DIR}/.zarr-venv}"
 # Fallback only (used when the clone predates scripts/zarr/requirements.txt, which
-# is the real pin). Floor is 1.2.3, not 1.2.2: 1.2.2 fixed EEGLAB chanlocs
-# truncation (biosigio#110, nemar-cli#1068) but predates MEF3 .mefd / 4D-BTi
-# import support, so a run that fell back to the older floor would discover a
-# .mefd/BTi recording (generate_zarr.py's dir_recording_of/bti_recordings) and
-# then fail to convert it. [mef3] extra added for the same reason (pymef).
-BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg,mef3]>=1.2.3}"
+# is the real pin). Floor is 1.2.4, not 1.2.3: 1.2.3 added MEF3 .mefd / 4D-BTi
+# import (so a run below that floor would discover a .mefd/BTi recording via
+# generate_zarr.py's dir_recording_of/bti_recordings and then fail to convert it),
+# and 1.2.4 additionally reads MATLAB v7.3 (HDF5) EEGLAB `.set` and recovers three
+# false EDF/BDF rejections. Extras are not optional here: [mef3] carries pymef and
+# [hdf5] carries h5py, and without either the matching recordings raise ImportError
+# at convert time even though discovery finds them.
+BIOSIGIO_SPEC="${BIOSIGIO_SPEC:-biosigio[zarr,meg,mef3,hdf5]>=1.2.4}"
 API_BASE="${API_BASE:-https://api.nemar.org}"
 CALLBACK_URL="${ZARR_CALLBACK_URL:-${API_BASE}/webhooks/zarr-ready}"
 S3_BUCKET="${S3_BUCKET:-nemar}"
