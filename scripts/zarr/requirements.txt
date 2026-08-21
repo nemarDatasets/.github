@@ -27,4 +27,21 @@
 # .mefd/BTi discovery (dir_recording_of/bti_recordings) depends on; the [mef3]
 # extra must be added here too, or .mefd recordings raise ImportError at convert
 # time even though discovery finds them. nemarOrg/nemar-cli#1095 (track: #1097).
-biosigio[zarr,meg,mef3]>=1.2.3
+# >=1.2.4: two classes of recording that were being discarded despite being fully
+# readable now convert.
+#   - MATLAB v7.3 (HDF5) EEGLAB `.set` (biosigio#114, closing biosigio#21).
+#     MNE refuses these outright and scipy.io.loadmat cannot read them either,
+#     since a v7.3 `.set` is an HDF5 container, not a classic MAT file. Read via
+#     h5py, which is the `[hdf5]` extra -- added below for exactly the same reason
+#     `[mef3]` was: without it these raise ImportError at convert time even though
+#     discovery finds them. 544 recordings measured across the archive.
+#   - Three false EDF/BDF rejections (biosigio#116, closing biosigio#109):
+#     a channel with physical_min == physical_max (legal EDF -- a referential
+#     montage's reference electrode is identically zero by construction, and one
+#     such channel was discarding the whole recording), a numeric header field
+#     NUL-padded instead of space-padded, and discontinuous EDF+D. Recovered reads
+#     are numerically identical to a pyedflib read (verified at machine-epsilon on
+#     real recordings, all channels) and are flagged via `edf_tolerant_read`.
+#     Genuine truncation is still reported as corruption. ~4,332 recordings across
+#     23 datasets, the largest single cluster.
+biosigio[zarr,meg,mef3,hdf5]>=1.2.4
