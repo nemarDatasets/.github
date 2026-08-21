@@ -46,8 +46,15 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     STREAM_EDF_MIN_BYTES,
     compute_worklist,
     ChannelCountMismatch,
-    ctf_ds_of,
-    ctf_ds_recordings,
+    dir_recording_of,
+    dir_recordings,
+    is_dir_recording,
+    is_mefd,
+    bti_recordings,
+    bti_pdf_choice,
+    is_bti_dir,
+    is_bti_marker_name,
+    MEFD_EXT,
     electrode_positions_for,
     expected_channel_count_for,
     store_total_channels,
@@ -58,7 +65,6 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     fix_source_file_attr,
     in_excluded_tree,
     is_bids_calibration_file,
-    is_ctf_ds,
     is_excluded_from_discovery,
     is_primary,
     is_split_fif,
@@ -1185,7 +1191,9 @@ class TestElectrodePositionsFor(unittest.TestCase):
 
 
 class TestKitAndCtf(unittest.TestCase):
-    """KIT `.con`/`.sqd`/`.kdf` files and CTF `.ds` directory recordings."""
+    """KIT `.con`/`.sqd`/`.kdf` files and CTF `.ds` directory recordings (the
+    extension-keyed directory mechanism generalized to also cover MEF3 `.mefd`
+    -- see `TestMefdRecordings` -- via `dir_recording_of`/`dir_recordings`)."""
 
     def test_kit_extensions_are_primary(self):
         for ext in (".con", ".sqd", ".kdf"):
@@ -1197,16 +1205,16 @@ class TestKitAndCtf(unittest.TestCase):
             "sub-01/meg/sub-01_task-x_meg.zarr",
         )
 
-    def test_ctf_ds_of_and_is_ctf_ds(self):
+    def test_dir_recording_of_and_is_dir_recording(self):
         inner = "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4"
         ds = "sub-01/meg/sub-01_task-x_meg.ds"
-        self.assertEqual(ctf_ds_of(inner), ds)
-        self.assertEqual(ctf_ds_of(ds), ds)  # the dir maps to itself
-        self.assertIsNone(ctf_ds_of("sub-01/meg/sub-01_task-x_meg.fif"))
-        self.assertTrue(is_ctf_ds(ds))
-        self.assertFalse(is_ctf_ds(inner))
+        self.assertEqual(dir_recording_of(inner), ds)
+        self.assertEqual(dir_recording_of(ds), ds)  # the dir maps to itself
+        self.assertIsNone(dir_recording_of("sub-01/meg/sub-01_task-x_meg.fif"))
+        self.assertTrue(is_dir_recording(ds))
+        self.assertFalse(is_dir_recording(inner))
 
-    def test_ctf_ds_recordings_derived_from_inner_files(self):
+    def test_dir_recordings_derived_from_inner_files(self):
         head = [
             "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
             "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.res4",
@@ -1215,7 +1223,7 @@ class TestKitAndCtf(unittest.TestCase):
             "dataset_description.json",
         ]
         self.assertEqual(
-            ctf_ds_recordings(head),
+            dir_recordings(head),
             {"sub-01/meg/sub-01_task-x_meg.ds", "sub-02/meg/sub-02_task-y_meg.ds"},
         )
 
@@ -1278,6 +1286,302 @@ class TestKitAndCtf(unittest.TestCase):
             with open(os.path.join(ds, "sub-01_task-x_meg.res4"), "wb") as fh:
                 fh.write(b"r" * 200)
             self.assertEqual(_recording_size_bytes(ds), 8200)
+
+
+class TestMefdRecordings(unittest.TestCase):
+    """MEF3 `.mefd` directory recordings: the extension-keyed directory
+    mechanism generalized from CTF `.ds` (`dir_recording_of`/`is_dir_recording`/
+    `dir_recordings`) rather than copy-pasted for the new format. A real MEF3
+    session nests several levels below the `.mefd` itself:
+    `<name>.mefd/<CHANNEL>.timd/<CHANNEL>-000000.segd/<CHANNEL>-000000.{tdat,tidx,
+    tmet}` (on006392 has 194 `.timd` channel dirs and 582 tracked files)."""
+
+    MEFD = "sub-01/ieeg/sub-01_task-photicstim_ieeg.mefd"
+
+    def _member(self, channel: str, suffix: str) -> str:
+        return f"{self.MEFD}/{channel}.timd/{channel}-000000.segd/{channel}-000000.{suffix}"
+
+    def test_dir_recording_of_resolves_nested_segd_members(self):
+        for suffix in ("tdat", "tidx", "tmet"):
+            self.assertEqual(dir_recording_of(self._member("C3", suffix)), self.MEFD)
+        self.assertEqual(dir_recording_of(self.MEFD), self.MEFD)  # the dir maps to itself
+        self.assertTrue(is_dir_recording(self.MEFD))
+        self.assertTrue(is_mefd(self.MEFD))
+        self.assertFalse(is_mefd("sub-01/meg/sub-01_task-x_meg.ds"))
+
+    def test_dir_recordings_derives_one_mefd_from_many_channel_members(self):
+        # Every .tdat/.tidx/.tmet across every .timd channel dir still resolves
+        # to the SAME one recording, keyed at the .mefd path -- not one per
+        # channel and not one per segd/timd directory.
+        head = [
+            self._member(ch, suffix)
+            for ch in ("C3", "C4", "CZ", "ECG")
+            for suffix in ("tdat", "tidx", "tmet")
+        ]
+        head.append("dataset_description.json")
+        self.assertEqual(dir_recordings(head), {self.MEFD})
+
+    def test_mefd_is_not_itself_a_file_extension_primary(self):
+        # Like CTF .ds, a .mefd recording is directory-derived, not an
+        # extension match on `is_primary` (which only matches file exts).
+        self.assertFalse(is_primary(self.MEFD))
+
+    def test_mefd_store_rel_events_and_modality(self):
+        self.assertEqual(
+            store_rel_for(self.MEFD), "sub-01/ieeg/sub-01_task-photicstim_ieeg.zarr"
+        )
+        self.assertEqual(
+            events_sibling_for(self.MEFD),
+            "sub-01/ieeg/sub-01_task-photicstim_events.tsv",
+        )
+        self.assertEqual(bids_suffix_modality(self.MEFD), "IEEG")
+
+    def test_full_converts_mefd_as_one_primary(self):
+        head = [self._member("C3", "tdat"), self._member("C3", "tidx")]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, [self.MEFD])
+        self.assertEqual(remove, [])
+
+    def test_modify_inner_mefd_file_rebuilds_recording(self):
+        head = [self._member("C3", "tdat"), self._member("C4", "tdat")]
+        convert, remove = compute_worklist(
+            head, [("M", self._member("C3", "tdat"))], full=False
+        )
+        self.assertEqual(convert, [self.MEFD])
+        self.assertEqual(remove, [])
+
+    def test_delete_whole_mefd_removes_store(self):
+        convert, remove = compute_worklist(
+            [],
+            [("D", self._member("C3", "tdat")), ("D", self._member("C3", "tidx"))],
+            full=False,
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(
+            remove, ["sub-01/ieeg/sub-01_task-photicstim_ieeg.zarr"]
+        )
+
+    def test_delete_one_channel_with_others_remaining_rebuilds(self):
+        head = [self._member("C4", "tdat")]
+        convert, remove = compute_worklist(
+            head, [("D", self._member("C3", "tdat"))], full=False
+        )
+        self.assertEqual(convert, [self.MEFD])
+        self.assertEqual(remove, [])
+
+    def test_full_worklist_excludes_mefd_under_derivatives(self):
+        head = [
+            self._member("C3", "tdat"),
+            f"derivatives/preprocessed/{self._member('C3', 'tdat')}",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, [self.MEFD])
+        self.assertEqual(remove, [])
+
+    def test_mefd_size_sums_the_whole_nested_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            mefd = os.path.join(d, "sub-01_task-x_ieeg.mefd")
+            sizes = {"C3": 4000, "C4": 3000}
+            for ch, size in sizes.items():
+                segd = os.path.join(mefd, f"{ch}.timd", f"{ch}-000000.segd")
+                os.makedirs(segd)
+                for suffix in ("tdat", "tidx", "tmet"):
+                    with open(os.path.join(segd, f"{ch}-000000.{suffix}"), "wb") as fh:
+                        fh.write(b"m" * size)
+            self.assertEqual(_recording_size_bytes(mefd), sum(sizes.values()) * 3)
+
+    def test_mefd_joins_stream_exts_at_the_multigb_threshold(self):
+        # .mefd streams like CTF/FIF/BrainVision (biosigio>=1.2.3, read_raw_mef
+        # supports preload=False) -- the SAME multi-GB threshold, not the lower
+        # KIT one (MEF3 has a genuine lazy reader, unlike read_raw_kit).
+        self.assertTrue(self.MEFD.endswith(MEFD_EXT))
+        self.assertFalse(should_stream(self.MEFD, 500 * 1024**2))
+        self.assertTrue(should_stream(self.MEFD, 3 * 1024**3))
+
+
+class TestBtiRecordings(unittest.TestCase):
+    """4D/BTi recording directories: BIDS gives them NO extension at all, so
+    detection is content-based (`bti_recordings`) rather than the extension
+    match `dir_recording_of` uses for CTF `.ds`/MEF3 `.mefd`. Mirrors
+    biosigIO's `importers.meg._find_bti_pdf` gate exactly: a `c,rf*` file AND a
+    sibling `config` file, both required, checked directly in the directory."""
+
+    BTI = "sub-01/meg/sub-01_task-rest_meg"
+
+    def test_detects_directory_with_config_and_crf(self):
+        head = [f"{self.BTI}/c,rfDC", f"{self.BTI}/config", f"{self.BTI}/hs_file"]
+        self.assertEqual(bti_recordings(head), {self.BTI})
+
+    def test_datalad_config_alone_is_not_a_bti_recording(self):
+        # The exact false-positive this converter must never repeat: almost
+        # every datalad-tracked dataset has `.datalad/config`, and it carries
+        # no `c,rf*` sibling, so it must never be mistaken for a BTi recording.
+        head = [
+            ".datalad/config",
+            "dataset_description.json",
+            "sub-01/eeg/sub-01_task-x_eeg.set",
+        ]
+        self.assertEqual(bti_recordings(head), set())
+
+    def test_crf_without_config_is_not_a_bti_recording(self):
+        # Mirrors biosigIO's gate exactly: `config` is REQUIRED alongside
+        # `c,rf*`, not merely sufficient on its own (the previous test) -- a
+        # stray c,rf*-prefixed file with no config sibling is not enough
+        # either, so the two sides never disagree about what counts.
+        head = [f"{self.BTI}/c,rfDC"]
+        self.assertEqual(bti_recordings(head), set())
+
+    def test_excludes_bti_dir_under_derivatives(self):
+        head = [
+            f"{self.BTI}/c,rfDC",
+            f"{self.BTI}/config",
+            f"derivatives/preprocessed/{self.BTI}/c,rfDC",
+            f"derivatives/preprocessed/{self.BTI}/config",
+        ]
+        self.assertEqual(bti_recordings(head), {self.BTI})
+
+    def test_is_bti_marker_name(self):
+        self.assertTrue(is_bti_marker_name("config"))
+        self.assertTrue(is_bti_marker_name("c,rfDC"))
+        self.assertTrue(is_bti_marker_name("c,rfDC,fn50,o"))
+        # hs_file is optional and deliberately NOT a marker: its absence must
+        # never affect whether a directory counts as a BTi recording.
+        self.assertFalse(is_bti_marker_name("hs_file"))
+        self.assertFalse(is_bti_marker_name("e,pos"))
+
+    def test_is_bti_dir_is_a_bare_extension_check(self):
+        self.assertTrue(is_bti_dir(self.BTI))
+        self.assertFalse(is_bti_dir("sub-01/meg/sub-01_task-x_meg.ds"))
+        self.assertFalse(is_bti_dir("sub-01/meg/sub-01_task-x_meg.mefd"))
+        self.assertFalse(is_bti_dir("sub-01/eeg/sub-01_task-x_eeg.set"))
+
+    def test_bti_pdf_choice_prefers_exact_crfdc(self):
+        # Exact c,rfDC wins even when a filtered copy sits right beside it,
+        # and its presence with only one candidate is NOT ambiguous.
+        chosen, ambiguous = bti_pdf_choice({"c,rfDC", "config", "hs_file"})
+        self.assertEqual(chosen, "c,rfDC")
+        self.assertFalse(ambiguous)
+
+    def test_bti_pdf_choice_prefers_crfdc_over_filtered_variant(self):
+        chosen, ambiguous = bti_pdf_choice({"c,rfDC", "c,rfDC,fn50,o", "config"})
+        self.assertEqual(chosen, "c,rfDC")
+        self.assertTrue(ambiguous)  # >1 candidate, even though c,rfDC won
+
+    def test_bti_pdf_choice_falls_back_to_sorted_order(self):
+        # No exact c,rfDC present -> the first candidate in sorted() order,
+        # NOT filesystem/os.listdir order (which is not reproducible).
+        chosen, ambiguous = bti_pdf_choice({"c,rfDC,fn50,o", "c,rfhp0.1Hz", "config"})
+        self.assertEqual(chosen, "c,rfDC,fn50,o")
+        self.assertTrue(ambiguous)
+
+    def test_bti_pdf_choice_no_candidates(self):
+        self.assertEqual(bti_pdf_choice({"config", "hs_file"}), (None, False))
+
+    def test_bti_store_rel_and_events_and_modality(self):
+        # No extension to strip: store_rel_for is a plain `path + ".zarr"`.
+        self.assertEqual(
+            store_rel_for(self.BTI), "sub-01/meg/sub-01_task-rest_meg.zarr"
+        )
+        self.assertEqual(
+            events_sibling_for(self.BTI), "sub-01/meg/sub-01_task-rest_events.tsv"
+        )
+        self.assertEqual(bids_suffix_modality(self.BTI), "MEG")
+
+    def test_full_converts_bti_dir_as_one_primary(self):
+        head = [f"{self.BTI}/c,rfDC", f"{self.BTI}/config", f"{self.BTI}/hs_file"]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, [self.BTI])
+        self.assertEqual(remove, [])
+
+    def test_modify_config_rebuilds_recording(self):
+        head = [f"{self.BTI}/c,rfDC", f"{self.BTI}/config"]
+        convert, remove = compute_worklist(head, [("M", f"{self.BTI}/config")], full=False)
+        self.assertEqual(convert, [self.BTI])
+        self.assertEqual(remove, [])
+
+    def test_delete_optional_hs_file_rebuilds_not_removes(self):
+        # hs_file is optional in BIDS; its removal must rebuild the recording
+        # (without headshape), never delete the store.
+        head = [f"{self.BTI}/c,rfDC", f"{self.BTI}/config"]
+        convert, remove = compute_worklist(
+            head, [("D", f"{self.BTI}/hs_file")], full=False
+        )
+        self.assertEqual(convert, [self.BTI])
+        self.assertEqual(remove, [])
+
+    def test_delete_last_crf_removes_store(self):
+        # The only c,rf* file is gone -> the directory no longer qualifies as
+        # BTi (bti_dirs, computed from the post-diff HEAD state) -> drop it.
+        convert, remove = compute_worklist(
+            [f"{self.BTI}/config"], [("D", f"{self.BTI}/c,rfDC")], full=False
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, ["sub-01/meg/sub-01_task-rest_meg.zarr"])
+
+    def test_delete_config_with_crf_remaining_removes_store(self):
+        # config gone -> below the two-file detection threshold, even though
+        # c,rfDC is still there; mirrors biosigIO's own gate exactly.
+        convert, remove = compute_worklist(
+            [f"{self.BTI}/c,rfDC"], [("D", f"{self.BTI}/config")], full=False
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, ["sub-01/meg/sub-01_task-rest_meg.zarr"])
+
+    def test_replacing_crfdc_with_filtered_variant_still_rebuilds(self):
+        # A rename (git diff --no-renames -> D old + A new) must still be read
+        # as "rebuild," never "removed," because a qualifying c,rf* file is
+        # still present at HEAD after the change (just a different one).
+        head = [f"{self.BTI}/c,rfDC,fn50,o", f"{self.BTI}/config"]
+        convert, remove = compute_worklist(
+            head,
+            [("D", f"{self.BTI}/c,rfDC"), ("A", f"{self.BTI}/c,rfDC,fn50,o")],
+            full=False,
+        )
+        self.assertEqual(convert, [self.BTI])
+        self.assertEqual(remove, [])
+
+    def test_bti_size_sums_the_whole_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            bti = os.path.join(d, "sub-01_task-x_meg")
+            os.makedirs(bti)
+            with open(os.path.join(bti, "c,rfDC"), "wb") as fh:
+                fh.write(b"p" * 9000)
+            with open(os.path.join(bti, "config"), "wb") as fh:
+                fh.write(b"c" * 300)
+            with open(os.path.join(bti, "hs_file"), "wb") as fh:
+                fh.write(b"h" * 100)
+            self.assertEqual(_recording_size_bytes(bti), 9400)
+
+    def test_bti_streams_at_the_multigb_threshold_not_the_kit_one(self):
+        # BTi genuinely supports preload=False (biosigIO's streaming exporter
+        # opens it lazily via the same _MneSource path as CTF/FIF/.mefd), so it
+        # must NOT join KIT's much-lower threshold: a size that would stream as
+        # KIT must stay in-memory here.
+        kit_streaming_size = 300 * 1024**2  # above STREAM_KIT_MIN_BYTES (256 MB)
+        self.assertFalse(should_stream(self.BTI, kit_streaming_size))
+        self.assertTrue(should_stream(self.BTI, 3 * 1024**3))
+
+    def test_all_directory_recording_kinds_coexist_in_one_worklist(self):
+        # CTF .ds, MEF3 .mefd, and 4D/BTi discovered together must not
+        # interfere with each other or with a plain file-extension primary.
+        head = [
+            "sub-01/eeg/sub-01_task-x_eeg.set",
+            "sub-02/meg/sub-02_task-x_meg.ds/sub-02_task-x_meg.meg4",
+            "sub-03/ieeg/sub-03_task-x_ieeg.mefd/C3.timd/C3-000000.segd/C3-000000.tdat",
+            f"{self.BTI}/c,rfDC",
+            f"{self.BTI}/config",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(
+            convert,
+            sorted([
+                "sub-01/eeg/sub-01_task-x_eeg.set",
+                "sub-02/meg/sub-02_task-x_meg.ds",
+                "sub-03/ieeg/sub-03_task-x_ieeg.mefd",
+                self.BTI,
+            ]),
+        )
+        self.assertEqual(remove, [])
 
 
 class TestRecordingSizeBytes(unittest.TestCase):
@@ -1839,6 +2143,52 @@ class TestRecordingSizeFromPointers(unittest.TestCase):
             ).strip()
             total = recording_size_from_pointers(repo, primary, {primary, companion}, head)
             self.assertEqual(total, 5000 + 2000000)
+
+    def test_sums_mefd_members_across_channel_dirs(self):
+        mefd = "sub-01/ieeg/sub-01_task-x_ieeg.mefd"
+        members = {
+            f"{mefd}/C3.timd/C3-000000.segd/C3-000000.tdat": "SHA256E-s4000--c3.tdat",
+            f"{mefd}/C4.timd/C4-000000.segd/C4-000000.tdat": "SHA256E-s3000--c4.tdat",
+        }
+        with tempfile.TemporaryDirectory() as repo:
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "t@t")
+            self._git(repo, "config", "user.name", "t")
+            for path, key in members.items():
+                full = os.path.join(repo, path)
+                os.makedirs(os.path.dirname(full))
+                # 5 levels deep (sub-01/ieeg/*.mefd/*.timd/*.segd) back to repo root.
+                os.symlink(f"../../../../../.git/annex/objects/aa/bb/{key}/{key}", full)
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-qm", "fixture")
+            head = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+            ).strip()
+            total = recording_size_from_pointers(repo, mefd, set(members), head)
+            self.assertEqual(total, 4000 + 3000)
+
+    def test_sums_bti_dir_members_by_exact_dirname(self):
+        bti = "sub-01/meg/sub-01_task-x_meg"
+        members = {
+            f"{bti}/c,rfDC": "SHA256E-s9000--pdf",
+            f"{bti}/config": "SHA256E-s300--cfg",
+        }
+        with tempfile.TemporaryDirectory() as repo:
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "t@t")
+            self._git(repo, "config", "user.name", "t")
+            for path, key in members.items():
+                full = os.path.join(repo, path)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                # 3 levels deep (sub-01/meg/*_meg) back to repo root.
+                os.symlink(f"../../../.git/annex/objects/aa/bb/{key}/{key}", full)
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-qm", "fixture")
+            head = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+            ).strip()
+            total = recording_size_from_pointers(repo, bti, set(members), head)
+            self.assertEqual(total, 9000 + 300)
 
 
 class TestExpectedChannelCountFor(unittest.TestCase):
