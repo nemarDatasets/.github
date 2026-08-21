@@ -22,7 +22,9 @@ Run with:
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import sys
 import tempfile
@@ -33,10 +35,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from purge_non_raw_stores import (  # type: ignore[import-not-found]
     INDEX_FORMAT,
+    _print_dataset_summary,
     assert_within_zarr_prefix,
     dataset_has_issue,
     decide_target_action,
     load_snapshot_index,
+    main,
     parse_s3_ls_summary,
     plan_dataset_operations,
     plan_snapshot_index_rewrite,
@@ -764,6 +768,58 @@ class PlanSnapshotIndexRewriteTests(unittest.TestCase):
         before = copy.deepcopy(live)
         plan_snapshot_index_rewrite(live, {stale["zarr"]})
         self.assertEqual(live, before)
+
+
+class NoSnapshotStatusTests(unittest.TestCase):
+    """A named target that was silently skipped must not look clean.
+
+    The sibling `no_index` status is deliberately benign (nothing to purge, so
+    the no-op was correct). `no_snapshot` is the opposite: the dataset was named
+    as a target and never examined, and its zero-purged/zero-error result is
+    byte-identical to a genuinely clean dataset's. So it has to be an issue for
+    the exit code, and it has to print differently.
+    """
+
+    def test_no_snapshot_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "no_snapshot"}))
+
+    def test_no_index_is_still_not_an_issue(self):
+        """Pins the asymmetry, so a future change cannot collapse the two."""
+        self.assertFalse(dataset_has_issue({"status": "no_index"}))
+
+    def test_summary_line_says_skipped_not_zero_counts(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_dataset_summary({"dataset_id": DATASET, "status": "no_snapshot"})
+        out = buf.getvalue()
+        self.assertIn("SKIPPED", out)
+        self.assertIn("no index snapshot", out)
+        # The specific confusion this guards against: the generic counts line.
+        self.assertNotIn("store(s) would purge", out)
+        self.assertNotIn("store(s) purged", out)
+
+
+class MainSnapshotWiringTests(unittest.TestCase):
+    """`main()` called for real -- no S3 is reached on either of these paths."""
+
+    def test_nonexistent_snapshot_dir_exits_2_without_touching_s3(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--all", "--from-index-snapshot", "/nonexistent/dir/for/test"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no such directory", buf.getvalue())
+
+    def test_all_with_empty_snapshot_dir_reports_the_dir_not_the_bucket(self):
+        with tempfile.TemporaryDirectory() as td:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["--all", "--from-index-snapshot", td, "--audit-log",
+                           str(Path(td) / "audit.json")])
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            # Must not have fallen back to listing the bucket.
+            self.assertIn(td, out)
+            self.assertIn("0 dataset(s)", out)
 
 
 if __name__ == "__main__":

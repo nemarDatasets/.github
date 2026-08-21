@@ -741,7 +741,11 @@ def purge_dataset(
                 return result
             new_index = plan_snapshot_index_rewrite(live_index, purged_rels)
             if new_index is None:
-                result["index_rewrite_skipped"] = "live index does not list the purged stores"
+                result["index_rewrite_skipped"] = (
+                    "no live index.json to rewrite"
+                    if not live_index
+                    else "live index does not list the purged stores"
+                )
                 return result
         else:
             new_index = rewrite_index(index, purged_rels)
@@ -773,9 +777,18 @@ def dataset_has_issue(result: dict) -> bool:
     depend on an operator noticing them. Scripting `--execute` off `$?` is
     the obvious way to gate a rollout on this tool, so the exit code has to
     agree with what gets printed.
+
+    `no_snapshot` counts as an issue; `no_index` deliberately does not. The
+    asymmetry is the point. A dataset with no `index.json` has nothing to purge
+    and was correctly a no-op. A dataset with no SNAPSHOT was explicitly named
+    as a target and then silently skipped -- a typo in the directory, a file
+    never exported, the wrong path -- and it must not be reported as clean:
+    zero purged and zero errors is the same output a genuinely clean dataset
+    produces, so an operator gating `--execute` on `$?` would get a green light
+    while a named target went untouched.
     """
     return bool(
-        result.get("status") == "error"
+        result.get("status") in ("error", "no_snapshot")
         or result.get("delete_errors")
         or result.get("rejected")
         or result.get("anomalies")
@@ -794,6 +807,16 @@ def _print_dataset_summary(result: dict) -> None:
     dataset_id = result.get("dataset_id")
     if status == "no_index":
         print(f"[purge] {dataset_id}: no zarr index.json -- nothing to do", flush=True)
+        return
+    if status == "no_snapshot":
+        # Must NOT fall through to the counts line: zero purged / zero errors is
+        # indistinguishable from a dataset that was genuinely checked and clean,
+        # and this one was never checked at all.
+        print(
+            f"[purge] {dataset_id}: SKIPPED -- no index snapshot found for this "
+            f"dataset; nothing was examined or deleted",
+            flush=True,
+        )
         return
     if status == "error":
         print(f"[purge] {dataset_id}: ERROR -- {result.get('error')}", flush=True)
