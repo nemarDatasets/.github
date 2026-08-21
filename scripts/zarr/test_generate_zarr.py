@@ -35,6 +35,7 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     affected_primaries,
     annex_key_size,
     bids_suffix_modality,
+    compute_clean_orphans,
     convert_recording,
     projected_peak_bytes,
     per_recording_ceiling_bytes,
@@ -54,7 +55,11 @@ from generate_zarr import (  # type: ignore[import-not-found]  # noqa: E402  (si
     embed_root_attr,
     event_descriptions_for,
     events_sibling_for,
+    fix_source_file_attr,
+    in_excluded_tree,
+    is_bids_calibration_file,
     is_ctf_ds,
+    is_excluded_from_discovery,
     is_primary,
     is_split_fif,
     materialize_local,
@@ -117,6 +122,136 @@ class TestPathClassification(unittest.TestCase):
             events_sibling_for("sub-03/meg/sub-03_task-x_run-02_split-01_meg.fif"),
             "sub-03/meg/sub-03_task-x_run-02_events.tsv",
         )
+
+
+class TestBidsRawOnlyDiscovery(unittest.TestCase):
+    """derivatives/sourcedata/code never hold a BIDS raw recording (nemarOrg/
+    nemar-cli#1095/#1098, ADR 0027); BIDS-reserved MEG calibration files are
+    excluded by naming convention. Matched on a path SEGMENT, never a bare
+    substring."""
+
+    def test_excluded_trees_top_level(self):
+        for tree in ("derivatives", "sourcedata", "code"):
+            self.assertTrue(
+                in_excluded_tree(f"{tree}/sub-01/eeg/sub-01_task-x_eeg.set"),
+                tree,
+            )
+
+    def test_excluded_trees_nested(self):
+        for tree in ("derivatives", "sourcedata", "code"):
+            self.assertTrue(
+                in_excluded_tree(f"sub-01/{tree}/sub-01_task-x_eeg.set"),
+                tree,
+            )
+
+    def test_segment_boundary_negatives_are_not_excluded(self):
+        # A directory/name that merely CONTAINS an excluded word, but is not
+        # that exact path segment, must still be discoverable.
+        for path in (
+            "mycode/sub-01/eeg/sub-01_task-x_eeg.set",
+            "derivatives_old/sub-01/eeg/sub-01_task-x_eeg.set",
+            "sourcedatafoo/sub-01/eeg/sub-01_task-x_eeg.set",
+            "sub-01/eeg/sub-01_task-code_eeg.set",  # "code" as an entity VALUE
+            "sub-01/mycode/sub-01_task-x_eeg.set",
+        ):
+            self.assertFalse(in_excluded_tree(path), path)
+            self.assertTrue(is_primary(path), path)
+
+    def test_is_bids_calibration_file(self):
+        self.assertTrue(
+            is_bids_calibration_file("sub-01/meg/sub-01_acq-crosstalk_meg.fif")
+        )
+        self.assertTrue(
+            is_bids_calibration_file("sub-01/meg/sub-01_acq-calibration_meg.dat")
+        )
+        self.assertFalse(is_bids_calibration_file("sub-01/meg/sub-01_task-x_meg.fif"))
+
+    def test_is_primary_excludes_derivatives_sourcedata_code(self):
+        for path in (
+            "derivatives/preprocessed/sub-01_task-x-epo.fif",
+            "sourcedata/sub-01/sub-01_task-x_eeg.set",
+            "code/analysis/sub-01_task-x_eeg.set",
+            "sub-01/derivatives/sub-01_task-x_eeg.set",
+        ):
+            self.assertFalse(is_primary(path), path)
+
+    def test_is_primary_excludes_calibration_files(self):
+        self.assertFalse(is_primary("sub-01/meg/sub-01_acq-crosstalk_meg.fif"))
+        self.assertFalse(is_primary("sub-01/meg/sub-01_acq-calibration_meg.dat"))
+
+    def test_is_excluded_from_discovery_combines_both(self):
+        self.assertTrue(is_excluded_from_discovery("derivatives/x/y_eeg.set"))
+        self.assertTrue(
+            is_excluded_from_discovery("sub-01/meg/sub-01_acq-crosstalk_meg.fif")
+        )
+        self.assertFalse(is_excluded_from_discovery("sub-01/eeg/sub-01_task-x_eeg.set"))
+
+    def test_full_worklist_excludes_derivatives_sourcedata_code(self):
+        head = [
+            "sub-01/eeg/sub-01_task-x_eeg.set",
+            "derivatives/preprocessed/sub-01_task-x-epo.fif",
+            "sourcedata/sub-02/sub-02_task-x_eeg.set",
+            "code/analysis/helper.set",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/eeg/sub-01_task-x_eeg.set"])
+        self.assertEqual(remove, [])
+
+    def test_full_worklist_excludes_ctf_ds_under_derivatives(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
+            "derivatives/preprocessed/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_meg.ds"])
+        self.assertEqual(remove, [])
+
+    def test_full_worklist_excludes_split_fif_under_derivatives(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_split-01_meg.fif",
+            "sub-01/meg/sub-01_task-x_split-02_meg.fif",
+            "derivatives/x/sub-01_task-x_split-01_meg.fif",
+            "derivatives/x/sub-01_task-x_split-02_meg.fif",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_split-01_meg.fif"])
+        self.assertEqual(remove, [])
+
+    def test_full_worklist_excludes_calibration_files(self):
+        head = [
+            "sub-01/meg/sub-01_task-x_meg.fif",
+            "sub-01/meg/sub-01_acq-crosstalk_meg.fif",
+        ]
+        convert, remove = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/meg/sub-01_task-x_meg.fif"])
+        self.assertEqual(remove, [])
+
+    def test_derivatives_events_tsv_does_not_pull_in_a_recording(self):
+        head = ["derivatives/preprocessed/sub-01_task-x_events.tsv"]
+        convert, remove = compute_worklist(
+            head, [("M", "derivatives/preprocessed/sub-01_task-x_events.tsv")], full=False
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, [])
+
+    def test_deleting_file_under_excluded_tree_never_removes_a_store(self):
+        # A deletion confined to an excluded tree must never be misread as
+        # "the recording is gone from HEAD" (it was never a candidate).
+        convert, remove = compute_worklist(
+            [], [("D", "derivatives/preprocessed/sub-01_task-x-epo.fif")], full=False
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, [])
+
+    def test_deleting_one_file_of_a_derivatives_ctf_ds_does_not_remove_or_convert(self):
+        head = ["derivatives/x/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4"]
+        convert, remove = compute_worklist(
+            head,
+            [("D", "derivatives/x/sub-01_task-x_meg.ds/BadChannels")],
+            full=False,
+        )
+        self.assertEqual(convert, [])
+        self.assertEqual(remove, [])
 
 
 class TestAffectedPrimaries(unittest.TestCase):
@@ -485,6 +620,121 @@ class TestEmbedAttr(unittest.TestCase):
                 doc = json.load(fh)
             self.assertEqual(doc["attributes"]["power_line_frequency"], 50.0)
             self.assertEqual(doc["attributes"]["x"], 1)
+
+
+class TestFixSourceFileAttr(unittest.TestCase):
+    """recording_metadata.source_file must be the reproducible BIDS-repo-
+    relative path, not the conversion host's ephemeral scratch path biosigIO
+    was handed (nemarOrg/nemar-cli#1102)."""
+
+    def _make_store(self, d: str, recording_metadata: dict) -> str:
+        store = os.path.join(d, "rec.zarr")
+        os.makedirs(store)
+        with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "zarr_format": 3,
+                    "node_type": "group",
+                    "attributes": {
+                        "format": "biosigio-zarr",
+                        "channel_groups": ["eeg_250hz"],
+                        "recording_metadata": recording_metadata,
+                    },
+                },
+                fh,
+            )
+        return store
+
+    def test_overwrites_scratch_path_with_bids_relpath(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = self._make_store(
+                d,
+                {
+                    "source_file": (
+                        "/mnt/local/zarr-scratch/tmpv58rz85q/work/"
+                        "sub-1_task-x_eeg.bdf/sub-1_task-x_eeg.bdf"
+                    ),
+                    "source_format": "bdf",
+                },
+            )
+            bids_path = "sub-1/eeg/sub-1_task-x_eeg.bdf"
+            fix_source_file_attr(store, bids_path)
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            rec_meta = doc["attributes"]["recording_metadata"]
+            self.assertEqual(rec_meta["source_file"], bids_path)
+            self.assertEqual(rec_meta["source_format"], "bdf")  # other keys preserved
+            self.assertEqual(
+                doc["attributes"]["channel_groups"], ["eeg_250hz"]
+            )  # sibling root attrs preserved
+
+    def test_reconversion_is_reproducible_across_different_scratch_dirs(self):
+        # The whole point: two runs with DIFFERENT mkdtemp scratch dirs must
+        # converge on the SAME source_file once fixed, since only the fix
+        # (not biosigIO) determines the published value.
+        bids_path = "sub-1/eeg/sub-1_task-x_eeg.bdf"
+        results = []
+        for tmp_name in ("tmpaaaaaaaa", "tmpbbbbbbbb"):
+            with tempfile.TemporaryDirectory() as d:
+                store = self._make_store(
+                    d,
+                    {"source_file": f"/mnt/local/zarr-scratch/{tmp_name}/work/x.bdf"},
+                )
+                fix_source_file_attr(store, bids_path)
+                with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                results.append(doc["attributes"]["recording_metadata"]["source_file"])
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], bids_path)
+
+    def test_missing_recording_metadata_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3, "attributes": {"format": "biosigio-zarr"}}, fh)
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")  # must not raise
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertNotIn("recording_metadata", doc["attributes"])  # not fabricated
+
+    def test_explicit_null_attributes_does_not_raise(self):
+        # `"attributes": null` makes .get("attributes", {}) return None, so a
+        # chained .get would raise AttributeError rather than skipping cleanly.
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3, "attributes": None}, fh)
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")  # must not raise
+
+    def test_rewrite_leaves_no_temp_file_and_keeps_zarr_json_parseable(self):
+        # The rewrite goes through a sibling temp + os.replace so an interruption
+        # can never leave a truncated zarr.json that validate_store (which only
+        # checks existence) would wave through.
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "zarr_format": 3,
+                        "attributes": {
+                            "format": "biosigio-zarr",
+                            "recording_metadata": {"source_file": "/mnt/local/zarr-scratch/t/x.bdf"},
+                        },
+                    },
+                    fh,
+                )
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")
+            self.assertEqual(sorted(os.listdir(store)), ["zarr.json"])  # no .tmp left behind
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)  # parses, i.e. not truncated
+            self.assertEqual(
+                doc["attributes"]["recording_metadata"]["source_file"],
+                "sub-1/eeg/sub-1_task-x_eeg.bdf",
+            )
+            self.assertEqual(doc["attributes"]["format"], "biosigio-zarr")  # siblings intact
 
 
 class TestEventDescriptionsFor(unittest.TestCase):
@@ -1366,6 +1616,32 @@ class TestFailureReasons(unittest.TestCase):
         )
         self.assertEqual(index["failure_count"], 0)
 
+    def test_merge_index_drops_stale_failures_for_now_excluded_paths(self):
+        # A carried-forward failure for a path now excluded (derivatives/
+        # sourcedata/code) must not persist forever: it will never be
+        # reconverted, so it would otherwise show users a stale failure for a
+        # file we deliberately no longer serve. A genuine current failure for
+        # a still-discoverable path must survive alongside it.
+        prior = {
+            "source_commit": "old",
+            "stores": [],
+            "failures": [
+                {"path": "derivatives/preprocessed/sub-01_task-x-epo.fif",
+                 "zarr": "derivatives/preprocessed/sub-01_task-x-epo.zarr",
+                 "code": "not_continuous", "reason": "..."},
+                {"path": "sub-01/eeg/sub-01_task-y_eeg.set",
+                 "zarr": "sub-01/eeg/sub-01_task-y_eeg.zarr",
+                 "code": "corrupt_or_truncated", "reason": "..."},
+            ],
+        }
+        index = merge_index(
+            prior, "nm000104", "new", [], [], "2026-06-13T00:00:00Z", [],
+        )
+        self.assertEqual(index["failure_count"], 1)
+        self.assertEqual(
+            index["failures"][0]["path"], "sub-01/eeg/sub-01_task-y_eeg.set"
+        )
+
 
 class TestAwsRunner(unittest.TestCase):
     """The wall-clock timeout + retry that stops a wedged aws op from hanging a
@@ -1660,23 +1936,11 @@ class TestChannelCountMismatch(unittest.TestCase):
         self.assertIn("channels.tsv", reason_for_code("channel_count_mismatch"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCleanOrphanSelection(unittest.TestCase):
     """`--clean` no longer wipes the prefix; it removes only the stores that are
-    no longer produced at HEAD. This is the selection rule that replaced the wipe
-    (nemarOrg/nemar-cli#1068 follow-up), expressed exactly as `main` computes it."""
-
-    @staticmethod
-    def orphans(prior_index: dict | None, convert: list[str]) -> set[str]:
-        prior_rels = {
-            e["zarr"]
-            for e in (prior_index or {}).get("stores", [])
-            if isinstance(e, dict) and isinstance(e.get("zarr"), str)
-        }
-        return prior_rels - {store_rel_for(p) for p in convert}
+    no longer produced at HEAD. `compute_clean_orphans` is the selection rule
+    that replaced the wipe (nemarOrg/nemar-cli#1068 follow-up), and the exact
+    function `main` calls -- not a hand-copied mirror of its logic."""
 
     def test_rebuilt_recordings_are_never_orphans(self):
         # The whole point: a full rebuild of the same dataset deletes NOTHING, so
@@ -1686,7 +1950,7 @@ class TestCleanOrphanSelection(unittest.TestCase):
             {"zarr": "sub-02/eeg/sub-02_task-rest_eeg.zarr"},
         ]}
         convert = ["sub-01/eeg/sub-01_task-rest_eeg.set", "sub-02/eeg/sub-02_task-rest_eeg.set"]
-        self.assertEqual(self.orphans(prior, convert), set())
+        self.assertEqual(compute_clean_orphans(prior, convert), set())
 
     def test_recording_dropped_from_head_is_removed(self):
         prior = {"stores": [
@@ -1695,20 +1959,84 @@ class TestCleanOrphanSelection(unittest.TestCase):
         ]}
         convert = ["sub-01/eeg/sub-01_task-rest_eeg.set"]
         self.assertEqual(
-            self.orphans(prior, convert), {"sub-02/eeg/sub-02_task-rest_eeg.zarr"}
+            compute_clean_orphans(prior, convert), {"sub-02/eeg/sub-02_task-rest_eeg.zarr"}
         )
 
     def test_renamed_recording_removes_the_old_store(self):
         prior = {"stores": [{"zarr": "sub-01/eeg/sub-01_task-old_eeg.zarr"}]}
         convert = ["sub-01/eeg/sub-01_task-new_eeg.set"]
-        self.assertEqual(self.orphans(prior, convert), {"sub-01/eeg/sub-01_task-old_eeg.zarr"})
+        self.assertEqual(
+            compute_clean_orphans(prior, convert), {"sub-01/eeg/sub-01_task-old_eeg.zarr"}
+        )
 
     def test_first_conversion_has_no_prior_index_and_removes_nothing(self):
-        self.assertEqual(self.orphans(None, ["sub-01/eeg/sub-01_task-rest_eeg.set"]), set())
+        self.assertEqual(
+            compute_clean_orphans(None, ["sub-01/eeg/sub-01_task-rest_eeg.set"]), set()
+        )
 
     def test_malformed_prior_entries_are_ignored(self):
         prior = {"stores": [{"zarr": 42}, {"no_zarr": "x"}, "notadict", {"zarr": "a.zarr"}]}
-        self.assertEqual(self.orphans(prior, []), {"a.zarr"})
+        self.assertEqual(compute_clean_orphans(prior, []), {"a.zarr"})
+
+    def test_derivatives_sourcedata_code_stores_are_never_orphaned(self):
+        # These stores predate the raw-only scope; a raw-only `convert` no
+        # longer contains their primaries, but that must NOT be read as "gone
+        # from HEAD" -- this change must not delete any already-published
+        # store (nemarOrg/nemar-cli#1095 / #1097).
+        prior = {"stores": [
+            {"zarr": "derivatives/preprocessed/sub-01_task-x-epo.zarr"},
+            {"zarr": "sourcedata/sub-02/sub-02_task-x_eeg.zarr"},
+            {"zarr": "code/analysis/helper.zarr"},
+            {"zarr": "sub-01/eeg/sub-01_task-rest_eeg.zarr"},
+        ]}
+        convert = ["sub-01/eeg/sub-01_task-rest_eeg.set"]  # only the raw one rebuilds
+        self.assertEqual(compute_clean_orphans(prior, convert), set())
+
+    def test_genuinely_gone_raw_store_is_still_removed_alongside_excluded_ones(self):
+        prior = {"stores": [
+            {"zarr": "derivatives/preprocessed/sub-01_task-x-epo.zarr"},
+            {"zarr": "sub-02/eeg/sub-02_task-gone_eeg.zarr"},
+        ]}
+        convert: list[str] = []
+        self.assertEqual(
+            compute_clean_orphans(prior, convert),
+            {"sub-02/eeg/sub-02_task-gone_eeg.zarr"},
+        )
+
+    def test_on005520_pattern_drops_from_index_without_deleting_stores(self):
+        """A dataset whose ONLY prior stores are derivatives-tree ones (all
+        raw recordings currently fail for an unrelated reason) legitimately
+        reports store_count 0 in the next --clean index -- but the 92
+        already-published derivatives stores are never scheduled for
+        removal. Mirrors the documented on005520 case end-to-end at the
+        pure-function level: worklist -> orphan selection -> index rewrite.
+        """
+        head = [
+            "derivatives/preprocessed/sub-01_task-rest_eeg.set",
+            "sub-01/eeg/sub-01_task-rest_eeg.vhdr",  # the one raw recording; fails
+        ]
+        convert, remove_from_worklist = compute_worklist(head, [], full=True)
+        self.assertEqual(convert, ["sub-01/eeg/sub-01_task-rest_eeg.vhdr"])
+        self.assertEqual(remove_from_worklist, [])
+
+        prior_index = {"stores": [
+            {"zarr": "derivatives/preprocessed/sub-01_task-rest_eeg.zarr"},
+        ]}
+        orphans = compute_clean_orphans(prior_index, convert)
+        # The derivatives store is NOT an orphan: it must not be deleted.
+        self.assertEqual(orphans, set())
+
+        # The raw recording fails (unrelated reason) -> nothing converts, and
+        # --clean rewrites the index fresh (prior=None), so the derivatives
+        # store -- never touched -- simply has no entry in the new index.
+        index = merge_index(
+            None, "on005520", "sha", [], sorted(orphans),
+            "2026-08-20T00:00:00Z",
+            [{"path": head[1], "zarr": "sub-01/eeg/sub-01_task-rest_eeg.zarr",
+              "code": "corrupt_or_truncated", "reason": "..."}],
+        )
+        self.assertEqual(index["store_count"], 0)  # 92 -> 0 in this dataset's index
+        self.assertEqual(index["failure_count"], 1)  # the raw failure IS reported
 
 
 class TestRmRecursiveSharding(unittest.TestCase):
@@ -1758,3 +2086,7 @@ class TestRmRecursiveSharding(unittest.TestCase):
         self.addCleanup(setattr, gz, "_s3_child_prefixes", orig_children)
         with self.assertRaises(RuntimeError):
             gz._rm_recursive("s3://b/d/zarr/")
+
+
+if __name__ == "__main__":
+    unittest.main()
