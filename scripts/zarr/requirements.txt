@@ -7,7 +7,9 @@
 # both the Actions workflow and the Hallu cron.
 #
 # Extras: [zarr] -> zarr v3 store writer/reader; [meg] -> mne (.fif + BrainVision
-# .vhdr importers). Core biosigIO covers .set/.fdt/.edf/.bdf.
+# .vhdr + CTF .ds + KIT/Yokogawa + 4D-BTi importers); [mef3] -> mne>=1.12 + pymef
+# (MEF3 .mefd iEEG import; kept as its own extra upstream because it pins a newer
+# MNE than [meg] alone needs). Core biosigIO covers .set/.fdt/.edf/.bdf.
 # >=1.2.0: streams EDF/BDF via pyedflib (importer parity), so generate_zarr.py's
 # _biosigio_streams_edf() gate flips on and large EDF converts instead of OOMing
 # (nemar-cli#944).
@@ -19,4 +21,10 @@
 # instead of silently truncating the recording to one channel (biosigio#110,
 # root cause of nemarDatasets/on002718#1); pairs with this repo's
 # channel_count_mismatch fidelity gate.
-biosigio[zarr,meg]>=1.2.2
+# >=1.2.3: adds MEF3 .mefd import (mne.io.read_raw_mef + pymef, [mef3] extra) and
+# 4D/BTi import (mne.io.read_raw_bti, content-detected -- no extension), both with
+# bounded-memory streaming support. This is the release generate_zarr.py's
+# .mefd/BTi discovery (dir_recording_of/bti_recordings) depends on; the [mef3]
+# extra must be added here too, or .mefd recordings raise ImportError at convert
+# time even though discovery finds them. nemarOrg/nemar-cli#1095 (track: #1097).
+biosigio[zarr,meg,mef3]>=1.2.3

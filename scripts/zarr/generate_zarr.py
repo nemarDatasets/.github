@@ -25,14 +25,23 @@ Design notes
   sibling recording. ``--full`` (or a missing/!ancestor prior) converts everything.
 * BIDS raw only: ``derivatives/``, ``sourcedata/``, and ``code/`` never hold a BIDS
   raw recording, so ``is_excluded_from_discovery`` excludes them (and BIDS-reserved
-  MEG calibration filenames) from every discovery path -- ``is_primary``, the CTF
-  ``.ds`` derivation, and the diff-based companion/events routing. This scope matches
-  nemarOrg/nemar-cli ADR 0027 (the backend dispatch-gate side of the same decision).
-  Excluding a tree from *future* conversion must not be read as "gone from HEAD":
-  ``compute_clean_orphans`` explicitly protects already-published stores under an
-  excluded tree from ``--clean``'s orphan-removal so this scope change alone never
-  deletes a store; that cleanup is separate, explicitly-authorized follow-up work
-  (nemarOrg/nemar-cli#1095 / nemarOrg/nemar-cli#1097).
+  MEG calibration filenames) from every discovery path -- ``is_primary``, the
+  directory-recording derivation, and the diff-based companion/events routing. This
+  scope matches nemarOrg/nemar-cli ADR 0027 (the backend dispatch-gate side of the
+  same decision). Excluding a tree from *future* conversion must not be read as
+  "gone from HEAD": ``compute_clean_orphans`` explicitly protects already-published
+  stores under an excluded tree from ``--clean``'s orphan-removal so this scope
+  change alone never deletes a store; that cleanup is separate, explicitly-authorized
+  follow-up work (nemarOrg/nemar-cli#1095 / nemarOrg/nemar-cli#1097).
+* Directory-keyed recordings: CTF ``.ds``, MEF3 ``.mefd``, and 4D/BTi are each a
+  DIRECTORY of files git tracks individually, never the directory itself.
+  ``.ds``/``.mefd`` are derived from an extension on a path component
+  (``dir_recording_of`` / ``is_dir_recording`` / ``dir_recordings``); 4D/BTi carries
+  no extension at all (BIDS names it a bare ``..._meg/`` directory), so it is
+  detected by CONTENT instead -- a ``c,rf*`` processed-data file alongside a sibling
+  ``config`` file (``bti_recordings``), the same gate biosigIO's importer uses, so
+  the two sides agree on what counts as a recording. Requires biosigio>=1.2.3 (the
+  release that added ``.mefd``/4D-BTi import); see ``requirements.txt``.
 * The pure helpers (path classification, worklist, index merge) carry the logic
   and are unit-tested in ``test_generate_zarr.py``; the I/O lives in ``main``.
 """
@@ -62,10 +71,32 @@ PRIMARY_EXTS = (".set", ".edf", ".bdf", ".vhdr", ".fif", ".con", ".sqd", ".kdf")
 # Companions that share a recording's filename stem and carry its samples or
 # markers; a change confined to one still rebuilds the recording's store.
 COMPANION_EXTS = (".fdt", ".eeg", ".vmrk")
-# CTF MEG is a `.ds` DIRECTORY (`.meg4` data + `.res4`/`.hc`/... headers), not a
-# single file, so it never appears in `git ls-tree` as one path -- it is derived
-# from the files under it and treated as one recording keyed at the `.ds` dir.
+# CTF MEG is a `.ds` DIRECTORY (`.meg4` data + `.res4`/`.hc`/... headers), and MEF3
+# iEEG is a `.mefd` DIRECTORY (`<CHANNEL>.timd/<CHANNEL>-000000.segd/` holding
+# `.tdat`/`.tidx`/`.tmet` per channel segment -- a real session can hold well over a
+# hundred `.timd` channel dirs, see on006392's 194). Neither is a single file, so
+# neither ever appears in `git ls-tree` as one path -- each is derived from the files
+# under it and treated as one recording keyed at the directory itself. Both are
+# EXTENSION-keyed (the directory's own name ends in `.ds`/`.mefd`), which is what
+# lets `dir_recording_of` derive the recording from any member path without
+# consulting `head_files`; contrast 4D/BTi below, which is directory-based too but
+# carries no extension and needs content-based detection instead.
 CTF_DS_EXT = ".ds"
+MEFD_EXT = ".mefd"
+DIR_RECORDING_EXTS = (CTF_DS_EXT, MEFD_EXT)
+
+# 4D Neuroimaging/BTi MEG: BIDS gives the recording directory NO extension at all
+# (`sub-<label>[_ses-<label>]_task-<label>[_run-<index>]_meg/`), so unlike
+# `.ds`/`.mefd` it cannot be keyed by a path-component extension -- detection is by
+# CONTENT instead (`bti_recordings`, `bti_dir_of`): a directory qualifies only when
+# it directly (non-nested) contains a `c,rf*`-prefixed processed-data file AND a
+# sibling `config` file. Requiring `c,rf*` is the point: `config` alone is common to
+# almost every datalad-tracked dataset (`.datalad/config`) and would false-positive
+# on nearly every repo if used by itself. This mirrors biosigIO's own
+# `importers.meg._find_bti_pdf` gate exactly, so the converter and biosigIO agree on
+# what counts as a BTi recording.
+_BTI_PDF_PREFIX = "c,rf"
+_BTI_CONFIG_NAME = "config"
 
 # Trees that can never hold a BIDS raw recording, so a file under one is never
 # a servable recording no matter its extension. Mirrors `emit_records.py`'s
@@ -96,16 +127,28 @@ MODALITY_RATES = {"EEG": 250, "MEG": 250, "IEEG": 1000, "EMG": 1000}
 # streamed read matches the in-memory reader for that format exactly (BrainVision/
 # FIF both go through MNE either way); EDF/EEGLAB stay on the in-memory path.
 # Requires biosigio>=1.1.5. Threshold is env-overridable for the Hallu cron.
-# CTF `.ds` is MNE-native too (large MEG), so it streams as well.
+# CTF `.ds` is MNE-native too (large MEG), so it streams as well. So is MEF3
+# `.mefd`: `mne.io.read_raw_mef` supports `preload=False`, and biosigio's streaming
+# exporter opens it lazily the same way as CTF/FIF (`_MneSource`, biosigio>=1.2.3)
+# -- worth it, since a MEF3 iEEG session can be multi-gigabyte. 4D/BTi streams too
+# (`mne.io.read_raw_bti(preload=False)`, same `_MneSource` lazy path) but is NOT
+# extension-keyed, so it cannot join this tuple; `should_stream` below gives it its
+# own extension-less branch at this SAME multi-GB threshold, deliberately not the
+# lower KIT one (see the KIT comment below for why KIT differs).
 STREAM_MIN_BYTES = int(os.environ.get("ZARR_STREAM_MIN_BYTES", str(2 * 1024**3)))
-STREAM_EXTS = (".vhdr", ".fif", ".ds")
+STREAM_EXTS = (".vhdr", ".fif", ".ds", MEFD_EXT)
 # KIT/Yokogawa .con/.sqd/.kdf load FULLY in memory (read_raw_kit has no lazy
 # path), and a many-channel MEG file expands to ~5x its bytes as float64 + the
 # biosigIO DataFrame + the resample copy -- so even a ~600 MB .con OOM-kills a
 # pool worker at JOBS-way concurrency (which then breaks the whole pool). Route
 # them through the streaming converter above a much lower threshold than the
 # multi-GB one: streaming peaks ~3 GB regardless of file size, and small KIT
-# files stay on the faster in-memory path.
+# files stay on the faster in-memory path. 4D/BTi does NOT belong in this group
+# even though it is also MEG and also directory-based: `read_raw_bti` DOES support
+# `preload=False` (confirmed via biosigio's streaming exporter, which opens it lazily
+# exactly like CTF/FIF/`.mefd`), so it has none of KIT's "no lazy path" problem and
+# stays on the multi-GB `STREAM_EXTS`-equivalent threshold instead (see
+# `should_stream`).
 STREAM_KIT_EXTS = (".con", ".sqd", ".kdf")
 STREAM_KIT_MIN_BYTES = int(os.environ.get("ZARR_STREAM_KIT_MIN_BYTES", str(256 * 1024**2)))
 
@@ -139,17 +182,39 @@ _EDF_STREAMABLE = _biosigio_streams_edf()
 def should_stream(primary_local: str, size_bytes: int) -> bool:
     """Whether a recording converts via the bounded-memory streaming path.
 
-    Large MNE-native recordings (multi-GB iEEG/MEG BrainVision/FIF, CTF `.ds`)
-    stream above ``STREAM_MIN_BYTES``; KIT `.con`/`.sqd`/`.kdf` and -- when
-    biosigIO >= 1.2.0 -- EDF/BDF stream above the much lower KIT/EDF thresholds
-    because their in-memory float64 blow-up OOMs a worker well below the multi-GB
-    mark. Everything else (and small KIT/EDF) uses the faster in-memory path."""
+    Large MNE-native recordings (multi-GB iEEG/MEG BrainVision/FIF, CTF `.ds`,
+    MEF3 `.mefd`) stream above ``STREAM_MIN_BYTES``; KIT `.con`/`.sqd`/`.kdf` and
+    -- when biosigIO >= 1.2.0 -- EDF/BDF stream above the much lower KIT/EDF
+    thresholds because their in-memory float64 blow-up OOMs a worker well below
+    the multi-GB mark. Everything else (and small KIT/EDF) uses the faster
+    in-memory path.
+
+    Called both pre-materialization (``primary_local`` is still the git-relative
+    path, e.g. the RAM-admission estimate in ``main``) and post-materialization
+    (a real local path, from ``convert_recording``), so every branch here must
+    decide from the path STRING alone -- never ``os.path.isdir`` or another
+    filesystem check, which would silently misclassify the pre-materialization
+    call (nothing exists at that path yet).
+    """
     ext = lower_ext(primary_local)
     if ext in STREAM_KIT_EXTS:
         return size_bytes > STREAM_KIT_MIN_BYTES
     if _EDF_STREAMABLE and ext in STREAM_EDF_EXTS:
         return size_bytes > STREAM_EDF_MIN_BYTES
-    return ext in STREAM_EXTS and size_bytes > STREAM_MIN_BYTES
+    if ext in STREAM_EXTS:
+        return size_bytes > STREAM_MIN_BYTES
+    # 4D/BTi: BIDS gives it no extension at all (see `bti_recordings`), so it
+    # can't join STREAM_EXTS by extension the way `.ds`/`.mefd` do. Every other
+    # primary this converter discovers carries a real extension (PRIMARY_EXTS, or
+    # `.ds`/`.mefd` via DIR_RECORDING_EXTS), so an empty extension reaching here is
+    # a BTi recording by construction, not an unrelated ext-less path. It streams
+    # above the SAME multi-GB threshold as STREAM_EXTS -- deliberately not the
+    # lower KIT one -- because `read_raw_bti` genuinely supports `preload=False`
+    # (biosigIO's streaming exporter opens it lazily via the same `_MneSource`
+    # path as CTF/FIF/`.mefd`); it doesn't have KIT's "no lazy reader" problem.
+    if ext == "":
+        return size_bytes > STREAM_MIN_BYTES
+    return False
 
 
 # --- Per-recording memory guard (#909) ----------------------------------------
@@ -334,8 +399,9 @@ def is_excluded_from_discovery(path: str) -> bool:
     under an excluded tree, or it is a reserved BIDS calibration filename.
 
     The single predicate every recording-discovery path runs a candidate
-    through before treating it as buildable -- `is_primary`, the CTF `.ds`
-    derivation (`ctf_ds_recordings`), the diff-based companion/`_events.tsv`
+    through before treating it as buildable -- `is_primary`, the directory-
+    recording derivations (`dir_recordings` for CTF `.ds`/MEF3 `.mefd`,
+    `bti_recordings` for 4D/BTi), the diff-based companion/`_events.tsv`
     routing in `compute_worklist`, the stale-failure carry-forward in
     `merge_index`, and the `--clean` orphan-safety filter in
     `compute_clean_orphans`. One predicate used everywhere instead of
@@ -445,53 +511,158 @@ def store_rel_for(primary_path: str) -> str:
 
     Strips the data extension and appends `.zarr`; the BIDS suffix (`_eeg`,
     `_emg`, ...) is preserved, so the rule is uniform across all primary exts and
-    over a CTF `.ds` directory (`..._meg.ds` -> `..._meg.zarr`).
+    over a directory recording (CTF `..._meg.ds` -> `..._meg.zarr`, MEF3
+    `..._ieeg.mefd` -> `..._ieeg.zarr`). A 4D/BTi directory carries no extension
+    at all, so `os.path.splitext` finds none to strip and this is a plain
+    `path + ".zarr"` for it (`..._meg` -> `..._meg.zarr`).
     """
     root, _ = os.path.splitext(primary_path)
     return root + ".zarr"
 
 
-# --- CTF `.ds` directory recordings --------------------------------------
+# --- Extension-keyed directory recordings (CTF `.ds`, MEF3 `.mefd`) -----------
 #
 # A CTF recording is a directory `..._meg.ds/` holding `.meg4` (data) + `.res4`/
-# `.hc`/... headers. git tracks the inner files, never the directory, so the
-# recording is derived from those files and treated as one primary keyed at the
-# `.ds` dir path; biosigIO/MNE reads the directory (`read_raw_ctf`).
+# `.hc`/... headers. A MEF3 recording is a directory `..._ieeg.mefd/` holding one
+# `<CHANNEL>.timd/<CHANNEL>-000000.segd/` per channel, each with `.tdat`/`.tidx`/
+# `.tmet`. Both are directories git tracks by their inner files, never the
+# directory itself, so each is derived from those files and treated as one
+# primary keyed at the directory path; biosigIO/MNE reads the directory whole
+# (`read_raw_ctf` / `read_raw_mef`). Generalized into one mechanism (rather than
+# copy-pasting the CTF logic for MEF3) because the shape is identical: both are
+# recognized by an EXTENSION on a path component, so the recording can be derived
+# from any member path alone, without consulting `head_files`. Contrast 4D/BTi
+# just below, which is directory-based too but has no extension and needs
+# content-based detection instead.
 
 
-def ctf_ds_of(path: str) -> str | None:
-    """The `.ds` recording directory a path belongs to, or None.
+def dir_recording_of(path: str) -> str | None:
+    """The `.ds`/`.mefd` recording directory a path belongs to, or None.
 
     `sub-01/meg/sub-01_task-x_meg.ds/sub-01_task-x_meg.meg4` ->
-    `sub-01/meg/sub-01_task-x_meg.ds`. Returns the `.ds` path itself unchanged.
-    Only the FIRST `.ds` component counts (CTF dirs are not nested)."""
+    `sub-01/meg/sub-01_task-x_meg.ds`; likewise a `.mefd` member resolves to its
+    `.mefd` directory regardless of nesting depth (a MEF3 recording nests a
+    `<CHANNEL>.timd/<CHANNEL>-000000.segd/*.tdat` several levels below the
+    `.mefd` itself). Returns a directory path itself unchanged. Only the FIRST
+    matching component counts (neither `.ds` nor `.mefd` dirs are nested)."""
     parts = path.split("/")
     for i, comp in enumerate(parts):
-        if comp.lower().endswith(CTF_DS_EXT):
+        lower = comp.lower()
+        if any(lower.endswith(ext) for ext in DIR_RECORDING_EXTS):
             return "/".join(parts[: i + 1])
     return None
 
 
-def is_ctf_ds(path: str) -> bool:
-    """True if `path` is exactly a CTF `.ds` recording directory (not a file in one)."""
-    return path.lower().rstrip("/").endswith(CTF_DS_EXT)
+def is_dir_recording(path: str) -> bool:
+    """True if `path` is exactly a `.ds`/`.mefd` recording directory (not a file
+    inside one)."""
+    stripped = path.lower().rstrip("/")
+    return any(stripped.endswith(ext) for ext in DIR_RECORDING_EXTS)
 
 
-def ctf_ds_recordings(head_files) -> set[str]:
-    """Every CTF `.ds` recording directory present in `head_files` (derived from
-    the inner files, since the directory itself is never a tracked path).
+def is_mefd(path: str) -> bool:
+    """True if `path` is exactly a MEF3 `.mefd` recording directory."""
+    return path.lower().rstrip("/").endswith(MEFD_EXT)
 
-    Excludes a `.ds` under an excluded tree (derivatives/sourcedata/code): a
-    CTF recording's identity is directory-derived rather than an extension
-    match, so it needs its own `is_excluded_from_discovery` check rather than
-    inheriting `is_primary`'s.
+
+def dir_recordings(head_files) -> set[str]:
+    """Every CTF `.ds` / MEF3 `.mefd` recording directory present in `head_files`
+    (derived from the inner files, since the directory itself is never a tracked
+    path).
+
+    Excludes a directory under an excluded tree (derivatives/sourcedata/code): a
+    directory recording's identity is directory-derived rather than an extension
+    match on the recording's OWN path, so it needs its own
+    `is_excluded_from_discovery` check rather than inheriting `is_primary`'s.
     """
     dirs: set[str] = set()
     for f in head_files:
-        ds = ctf_ds_of(f)
-        if ds is not None and not is_excluded_from_discovery(ds):
-            dirs.add(ds)
+        d = dir_recording_of(f)
+        if d is not None and not is_excluded_from_discovery(d):
+            dirs.add(d)
     return dirs
+
+
+# --- Content-keyed directory recordings (4D/BTi) -------------------------------
+#
+# 4D/BTi is directory-based like CTF/MEF3, but BIDS gives it NO extension at all,
+# so it cannot be derived from a path component the way `dir_recording_of` does.
+# Detection is instead by CONTENT: a directory qualifies only when it directly
+# (non-nested) contains a `c,rf*`-prefixed processed-data file (conventionally
+# `c,rfDC`; a hardware-filtered copy such as `c,rfDC,fn50,o` also matches) AND a
+# sibling `config` file -- exactly biosigIO's own `importers.meg._find_bti_pdf`
+# gate, so this converter and biosigIO agree on what counts as a BTi recording
+# (the converter decides what's a recording; biosigIO decides which file it
+# reads -- if they disagreed, the index would describe a different file than was
+# actually converted). `config` is checked but never sufficient by itself:
+# `.datalad/config` exists in virtually every datalad-tracked dataset, and using
+# it alone as the detector would treat every repo as a BTi recording.
+
+
+def is_bti_marker_name(name: str) -> bool:
+    """True for a basename that participates in 4D/BTi directory detection: the
+    processed-data file (`c,rf*`) or its required `config` sibling. `hs_file`
+    (the optional head-shape sidecar) deliberately does NOT count -- its absence
+    or removal must not affect whether a directory is a BTi recording."""
+    return name == _BTI_CONFIG_NAME or name.startswith(_BTI_PDF_PREFIX)
+
+
+def bti_recordings(head_files) -> set[str]:
+    """Every 4D/BTi recording directory present in `head_files`, detected by
+    content rather than extension (see the module note above): a directory
+    qualifies when it directly contains both a `c,rf*` file and a sibling
+    `config` file. Excludes a directory under an excluded tree
+    (derivatives/sourcedata/code), like `dir_recordings`.
+    """
+    names_by_dir: dict[str, set[str]] = {}
+    for f in head_files:
+        names_by_dir.setdefault(os.path.dirname(f), set()).add(os.path.basename(f))
+    dirs: set[str] = set()
+    for d, names in names_by_dir.items():
+        if not d or is_excluded_from_discovery(d):
+            continue
+        if _BTI_CONFIG_NAME in names and any(n.startswith(_BTI_PDF_PREFIX) for n in names):
+            dirs.add(d)
+    return dirs
+
+
+def is_bti_dir(path: str) -> bool:
+    """True for a path that is a 4D/BTi recording directory keyed the
+    extension-less way (see `bti_recordings`).
+
+    A bare extension check, not a content re-check: every OTHER primary this
+    converter discovers carries a real extension (`PRIMARY_EXTS`, or `.ds`/
+    `.mefd` via `DIR_RECORDING_EXTS`), so this is only ever called on a path
+    already known to be a recording (from the worklist), where "no extension"
+    unambiguously means "4D/BTi directory."
+    """
+    return lower_ext(path) == ""
+
+
+def bti_pdf_choice(basenames) -> tuple[str | None, bool]:
+    """Which processed-data file biosigIO's `_find_bti_pdf` will read among the
+    `c,rf*`-prefixed candidates in `basenames`, and whether that choice is
+    AMBIGUOUS (more than one candidate present, or falling back off the
+    canonical name).
+
+    Mirrors biosigIO 1.2.3's precedence exactly: an exact `c,rfDC` always wins;
+    otherwise the first candidate in `sorted()` order (filesystem listing order
+    is NOT used -- verified to matter in practice, see biosigIO's module note).
+    Neither side of this converter picks a file to convert -- biosigIO alone
+    reads the directory -- so this exists purely to let this converter's own
+    discovery/materialization logging name the SAME file biosigIO is expected
+    to read, keeping the two sides verifiably in agreement (see the module note
+    above: if they disagreed, the index would describe a different file than
+    was actually converted). Returns (None, False) when no `c,rf*` candidate is
+    present at all.
+    """
+    candidates = sorted(n for n in basenames if n.startswith(_BTI_PDF_PREFIX))
+    if not candidates:
+        return None, False
+    fell_back = "c,rfDC" not in candidates
+    chosen = candidates[0] if fell_back else "c,rfDC"
+    ambiguous = fell_back or len(candidates) > 1
+    return chosen, ambiguous
 
 
 def events_sibling_for(primary_path: str) -> str:
@@ -695,16 +866,19 @@ def compute_worklist(
     """
     head_set = set(head_files)
     primaries = [p for p in head_files if is_primary(p)]
-    # CTF `.ds` recordings are directories derived from the files under them, not
-    # tracked paths, so they are buildable primaries alongside the file primaries.
-    ctf_dirs = ctf_ds_recordings(head_files)
+    # Directory-keyed recordings are derived from the files under them, not
+    # tracked paths of their own, so they are buildable primaries alongside the
+    # file primaries. CTF `.ds`/MEF3 `.mefd` are extension-derived; 4D/BTi is
+    # content-derived (see the two sections above).
+    dirrec_dirs = dir_recordings(head_files)
+    bti_dirs = bti_recordings(head_files)
     # Collapse FIF split groups to their chain head: only the head builds a store,
     # and a change to any split routes to that head (member_to_head).
     heads, member_to_head = split_heads_and_members(primaries)
     by_dir: dict[str, list[str]] = {}
     for p in heads:
         by_dir.setdefault(os.path.dirname(p), []).append(p)
-    all_primaries = sorted([*heads, *ctf_dirs])
+    all_primaries = sorted([*heads, *dirrec_dirs, *bti_dirs])
 
     if full:
         return all_primaries, []
@@ -724,13 +898,28 @@ def compute_worklist(
         # is required to leave untouched (see `compute_clean_orphans`).
         if is_excluded_from_discovery(path):
             continue
-        # A change anywhere inside a CTF `.ds` is a change to that one recording.
-        ds = ctf_ds_of(path)
+        # A change anywhere inside a CTF `.ds`/MEF3 `.mefd` is a change to that
+        # one recording (extension-derived; see `dir_recording_of`).
+        ds = dir_recording_of(path)
         if ds is not None:
-            if ds in ctf_dirs:  # at least one file remains -> rebuild the recording
+            if ds in dirrec_dirs:  # at least one file remains -> rebuild the recording
                 convert.add(ds)
-            elif status == "D":  # the whole `.ds` is gone -> drop its store
+            elif status == "D":  # the whole directory is gone -> drop its store
                 remove.add(store_rel_for(ds))
+            continue
+        # A change anywhere inside a 4D/BTi directory is a change to that one
+        # recording too, but BTi has no extension to derive it from -- membership
+        # is content-based (`bti_dirs`, computed from the current HEAD state), so
+        # a still-valid BTi dir means "rebuild." A deletion that drops the
+        # directory below the c,rf*/config threshold (the last processed-data or
+        # config file going away) is the removal signal instead; `hs_file` (not a
+        # marker name) deliberately does NOT trigger removal on its own.
+        btidir = os.path.dirname(path)
+        if btidir in bti_dirs:
+            convert.add(btidir)
+            continue
+        if status == "D" and is_bti_marker_name(os.path.basename(path)):
+            remove.add(store_rel_for(btidir))
             continue
         if status == "D":
             if is_split_fif(path):
@@ -767,7 +956,8 @@ def compute_worklist(
         else:
             remove.add(store_rel_for(old_lowest))
 
-    present = head_set | ctf_dirs  # a `.ds` dir is "present" when it has files at HEAD
+    # A directory recording is "present" when it still has qualifying files at HEAD.
+    present = head_set | dirrec_dirs | bti_dirs
     convert &= present  # never convert something not present at HEAD
     convert_stores = {store_rel_for(p) for p in convert}
     remove -= convert_stores  # a rebuilt store must not also be deleted
@@ -1169,11 +1359,16 @@ def recording_size_from_pointers(
 ) -> int:
     """On-disk bytes of a recording's whole file set, read from git-annex pointers
     at ``head`` WITHOUT downloading: primary + same-stem companions + FIF split
-    members, or every file under a CTF ``.ds``. Mirrors ``materialize_recording``'s
-    wanted set and ``_recording_size_bytes`` so the parent's admission estimate
-    (main) lines up with the worker's #909 preflight."""
-    if is_ctf_ds(primary_path):
-        members: list[str] = [p for p in head_files if ctf_ds_of(p) == primary_path]
+    members, or every file under a directory recording (CTF ``.ds``/MEF3
+    ``.mefd``/4D-BTi). Mirrors ``materialize_recording``'s wanted set and
+    ``_recording_size_bytes`` so the parent's admission estimate (main) lines up
+    with the worker's #909 preflight."""
+    if is_dir_recording(primary_path):
+        members: list[str] = [p for p in head_files if dir_recording_of(p) == primary_path]
+    elif is_bti_dir(primary_path):
+        # 4D/BTi: extension-less directory, so membership is exact-dirname
+        # matching rather than `dir_recording_of`'s ancestor-component match.
+        members = [p for p in head_files if os.path.dirname(p) == primary_path]
     else:
         d = os.path.dirname(primary_path)
         stem = filename_stem(primary_path)
@@ -1290,36 +1485,44 @@ def _fetch_blob(
     return True, key
 
 
-def _materialize_ctf(
+def _materialize_dir_members(
     repo_dir: str,
     bucket: str,
     dataset_id: str,
-    ds_path: str,
+    dir_path: str,
+    inner: list[str],
     head_files: set[str],
     head: str,
     work_dir: str,
+    kind: str,
 ) -> tuple[str, str | None, str | None]:
-    """Download every file under a CTF `.ds` directory into `work_dir`, preserving
-    the `.ds/...` layout MNE's `read_raw_ctf` expects, plus the events sidecar.
-    Returns (local_ds_dir, events_local|None, None)."""
-    local_ds = os.path.join(work_dir, os.path.basename(ds_path))
-    inner = sorted(p for p in head_files if ctf_ds_of(p) == ds_path)
+    """Shared download step for a directory-keyed recording (CTF `.ds`, MEF3
+    `.mefd`, or 4D/BTi): materialize the already-resolved `inner` member paths
+    into `work_dir`, preserving the directory's internal layout the reader
+    expects, plus the BIDS events sidecar if present. `kind` (e.g. ``"CTF"``,
+    ``"MEF3"``, ``"4D/BTi"``) only flavors error/warning text -- the download
+    logic itself is identical for all three, which is the point of factoring it
+    out rather than repeating it per format. Returns (local_dir, events_local|
+    None, None) -- a directory recording carries no single git-annex key of its
+    own (see `materialize_recording`).
+    """
+    local_dir = os.path.join(work_dir, os.path.basename(dir_path))
     if not inner:
-        raise RuntimeError(f"CTF recording {ds_path!r} has no files at ls-tree {head[:8]}")
+        raise RuntimeError(f"{kind} recording {dir_path!r} has no files at ls-tree {head[:8]}")
     for path in inner:
-        rel = path[len(ds_path) + 1 :]  # path relative to the `.ds` dir
-        found, _ = _fetch_blob(repo_dir, bucket, dataset_id, path, head, os.path.join(local_ds, rel))
+        rel = path[len(dir_path) + 1 :]  # path relative to the recording dir
+        found, _ = _fetch_blob(repo_dir, bucket, dataset_id, path, head, os.path.join(local_dir, rel))
         if not found:
             # Every inner file came from `ls-tree head`; a missing one means a real
-            # tree/pack desync. A `.ds` is read as a whole (read_raw_ctf needs the
-            # `.meg4` + headers), and we cannot tell a mandatory file from an
-            # optional sidecar, so FAIL rather than convert a partial recording into
-            # a wrong store that would then `aws s3 sync --delete` over a good one.
+            # tree/pack desync. The recording is read as a whole, and we cannot tell
+            # a mandatory file from an optional sidecar, so FAIL rather than convert
+            # a partial recording into a wrong store that would then
+            # `aws s3 sync --delete` over a good one.
             raise RuntimeError(
-                f"CTF file {path!r} absent from ls-tree {head[:8]}; refusing to convert a "
-                "partial .ds recording"
+                f"{kind} file {path!r} absent from ls-tree {head[:8]}; refusing to convert a "
+                "partial recording"
             )
-    events_path = events_sibling_for(ds_path)
+    events_path = events_sibling_for(dir_path)
     events_local = None
     if events_path in head_files:
         events_local = os.path.join(work_dir, os.path.basename(events_path))
@@ -1327,9 +1530,57 @@ def _materialize_ctf(
         if not found:
             # Sidecar tracked at HEAD but unfetchable -> don't claim a phantom path
             # (downstream would silently embed no events); warn and drop it.
-            print(f"::warning::CTF events {events_path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
+            print(f"::warning::{kind} events {events_path!r} absent from ls-tree {head[:8]}; skipping", flush=True)
             events_local = None
-    return local_ds, events_local, None
+    return local_dir, events_local, None
+
+
+def _materialize_dir_recording(
+    repo_dir: str,
+    bucket: str,
+    dataset_id: str,
+    dir_path: str,
+    head_files: set[str],
+    head: str,
+    work_dir: str,
+) -> tuple[str, str | None, str | None]:
+    """Download every file under a CTF `.ds` or MEF3 `.mefd` recording directory
+    (extension-derived membership; see `dir_recording_of`)."""
+    inner = sorted(p for p in head_files if dir_recording_of(p) == dir_path)
+    kind = "MEF3" if is_mefd(dir_path) else "CTF"
+    return _materialize_dir_members(
+        repo_dir, bucket, dataset_id, dir_path, inner, head_files, head, work_dir, kind
+    )
+
+
+def _materialize_bti(
+    repo_dir: str,
+    bucket: str,
+    dataset_id: str,
+    bti_dir: str,
+    head_files: set[str],
+    head: str,
+    work_dir: str,
+) -> tuple[str, str | None, str | None]:
+    """Download every file directly inside a 4D/BTi recording directory (see
+    `bti_recordings`). BIDS gives it no extension, so unlike `.ds`/`.mefd` its
+    members are exact-dirname matches rather than ancestor-derived."""
+    inner = sorted(p for p in head_files if os.path.dirname(p) == bti_dir)
+    # Name, in this converter's own log, the same file biosigIO's `_find_bti_pdf`
+    # is expected to choose (see `bti_pdf_choice`) whenever the choice is
+    # ambiguous -- so an operator reading THIS converter's output can already see
+    # which processed-data file will end up in the store, without cross-
+    # referencing biosigIO's separate warning.
+    chosen, ambiguous = bti_pdf_choice({os.path.basename(p) for p in inner})
+    if chosen and ambiguous:
+        print(
+            f"::warning::4D/BTi {bti_dir!r} has multiple processed-data candidates; "
+            f"biosigio is expected to read {chosen!r}",
+            flush=True,
+        )
+    return _materialize_dir_members(
+        repo_dir, bucket, dataset_id, bti_dir, inner, head_files, head, work_dir, "4D/BTi"
+    )
 
 
 def materialize_recording(
@@ -1345,12 +1596,15 @@ def materialize_recording(
 
     Downloads the primary + every same-stem companion (annex content via
     authenticated `aws s3 cp`, in-git blobs written directly) and the BIDS
-    `_events.tsv` sidecar if present. A CTF `.ds` recording is a directory, handled
-    by `_materialize_ctf`. Returns (primary_local_path, events_local_path|None,
+    `_events.tsv` sidecar if present. A directory recording (CTF `.ds`/MEF3
+    `.mefd`/4D-BTi) is handled by `_materialize_dir_recording`/`_materialize_bti`
+    instead. Returns (primary_local_path, events_local_path|None,
     primary_annex_key|None).
     """
-    if is_ctf_ds(primary_path):
-        return _materialize_ctf(repo_dir, bucket, dataset_id, primary_path, head_files, head, work_dir)
+    if is_dir_recording(primary_path):
+        return _materialize_dir_recording(repo_dir, bucket, dataset_id, primary_path, head_files, head, work_dir)
+    if is_bti_dir(primary_path):
+        return _materialize_bti(repo_dir, bucket, dataset_id, primary_path, head_files, head, work_dir)
 
     d = os.path.dirname(primary_path)
     stem = filename_stem(primary_path)
@@ -1716,16 +1970,23 @@ def event_descriptions_for(
 
 def _recording_size_bytes(primary_local: str) -> int:
     """On-disk size of a recording: its primary file + same-stem companions
-    (`.eeg`/`.vmrk` for BrainVision; FIF is single-file), or every file under a CTF
-    `.ds` directory. Drives the streaming decision -- the bulk lives in the `.eeg`
-    companion / `.meg4`, not the tiny `.vhdr` / `.ds` header files.
+    (`.eeg`/`.vmrk` for BrainVision; FIF is single-file), or every file under a
+    directory recording. The `os.path.isdir` branch is format-agnostic, so it
+    already covers CTF `.ds`, MEF3 `.mefd` (a real MEF3 session's bulk lives in
+    its many `.timd/.../.tdat` channel-segment files, not any single header), and
+    a 4D/BTi directory (whose bulk is the `c,rf*` processed-data file) with no
+    extension-specific code -- summing the whole tree is correct for all three.
+    Drives the streaming decision -- the bulk lives in the `.eeg` companion /
+    `.meg4` / `.tdat` / `c,rf*`, not the tiny header files beside it.
 
     On any stat/listing error this returns a value that FORCES the (bounded-memory)
     streaming path rather than an undercount/zero, which would misroute a large
     recording to the OOM-prone in-memory path. Only MNE-native exts reach streaming,
     so over-forcing a small file there is at worst slower, never wrong."""
     force = 1 << 62  # exceeds any real STREAM_MIN_BYTES -> routes to streaming
-    # CTF `.ds` recording: sum the whole directory tree.
+    # Any directory recording (CTF `.ds` / MEF3 `.mefd` / 4D-BTi): sum the whole
+    # directory tree. `os.path.isdir` alone decides this -- no extension check
+    # needed, which is exactly why this branch already covers `.mefd`/BTi too.
     if os.path.isdir(primary_local):
         errored = False
 
@@ -1741,7 +2002,7 @@ def _recording_size_bytes(primary_local: str) -> int:
                 except OSError:
                     errored = True
         if errored:
-            print(f"::warning::could not fully stat CTF dir {primary_local!r}; forcing streaming", flush=True)
+            print(f"::warning::could not fully stat recording dir {primary_local!r}; forcing streaming", flush=True)
             return force
         return total
     d = os.path.dirname(primary_local) or "."
@@ -1827,8 +2088,8 @@ def convert_recording(
 
     # Large recordings use the streaming converter so peak RAM stays bounded; the
     # in-memory path would load them at float64 2-3x and OOM. (multi-GB BrainVision/
-    # FIF/CTF, KIT above its lower threshold, and EDF/BDF via pyedflib on
-    # biosigio>=1.2.0 -- see should_stream.)
+    # FIF/CTF/MEF3/4D-BTi, KIT above its much lower threshold, and EDF/BDF via
+    # pyedflib on biosigio>=1.2.0 -- see should_stream.)
     if streaming:
         from biosigio import stream_to_zarr  # type: ignore[import-not-found]  # lazy
         from biosigio.bids import read_events_tsv  # type: ignore[import-not-found]  # lazy
