@@ -30,6 +30,10 @@ Safety design
   usually just means an earlier, partial `--execute` run already removed it
   (this tool is idempotent and safe to re-run), but it could also mean the
   index is stale, so it is always visible in the report either way.
+  This required a fix to hold: `aws s3 ls` exits 1 for a prefix matching zero
+  keys, so every already-absent store used to raise and be filed as an error
+  instead, which also meant its index entry could never be dropped. See
+  `interpret_s3_ls_result`.
 * Only ever `<dataset_id>/zarr/...`. Every computed delete target is
   re-validated, a second and independent time, immediately before the delete
   call itself (`assert_within_zarr_prefix`) -- `safe_store_prefix` already
@@ -47,6 +51,19 @@ Safety design
 * `index.json` is rewritten (`rewrite_index`) to drop purged store entries and
   any `failures` entries for the same paths, preserving every other top-level
   field and every remaining entry's content and relative order untouched.
+* `--from-index-snapshot DIR` reads the store list from a SAVED `index.json`
+  rather than the live one, for stores stranded in S3 after a converter rebuild
+  stopped listing them (the raw-only change in #98 makes a rebuilt index omit
+  them, which puts them beyond the reach of every index-derived target). It
+  widens where the store list is read from, NOT what may be deleted: selection
+  still runs `is_excluded_from_discovery`, so a raw path is unselectable from
+  any document; `safe_store_prefix` and `assert_within_zarr_prefix` still pin
+  each delete inside the dataset's own `zarr/` tree; and every target is still
+  confirmed against S3 before deletion. The snapshot is validated as a
+  `nemar-zarr-index` for that exact `dataset_id` (`load_snapshot_index`), and
+  the index rewrite is computed from the LIVE document and skipped when it does
+  not list the purged stores (`plan_snapshot_index_rewrite`) -- publishing the
+  snapshot itself would restore the very entries being cleaned up.
 * The ordering (delete before index rewrite, always exactly once) and
   error-isolation decisions (an errored target's index entry always
   survives; an already-absent one is folded in without a second delete
@@ -96,6 +113,11 @@ from generate_zarr import (  # type: ignore[import-not-found]  (sibling module v
 DEFAULT_BUCKET = "nemar"
 AUDIT_FORMAT = "nemar-zarr-purge-audit"
 AUDIT_FORMAT_VERSION = 1
+
+# The `format` marker every `index.json` this tool understands carries. Checked
+# when loading a snapshot so `--from-index-snapshot` cannot be pointed at some
+# other JSON file that happens to have a `stores` list.
+INDEX_FORMAT = "nemar-zarr-index"
 
 
 # --- Pure: candidate selection -------------------------------------------
@@ -255,6 +277,87 @@ def rewrite_index(index: dict, purged_rels: set[str]) -> dict:
     return out
 
 
+def plan_snapshot_index_rewrite(live_index: dict | None, purged_rels: set[str]) -> dict | None:
+    """Decide whether a snapshot-mode purge should rewrite the LIVE index.
+
+    Returns the rewritten live document, or `None` when no write is warranted.
+
+    This exists because snapshot mode reads its candidates from a SAVED index
+    while the authoritative document on S3 has usually moved on. Feeding the
+    snapshot itself to `write_index` would publish a stale document over a
+    fresher one -- for the stranded stores this mode was built for, that means
+    resurrecting hundreds of non-raw entries a converter rebuild had already
+    dropped, i.e. undoing the exact cleanup being performed. So the rewrite is
+    always computed from the live document, never from the snapshot, and is
+    skipped entirely when the live document does not mention any purged store
+    (the normal stranded case: the bytes were orphaned in S3 precisely because
+    the index stopped listing them).
+    """
+    if not live_index or not purged_rels:
+        return None
+    listed: set = set()
+    for key in ("stores", "failures"):
+        entries = live_index.get(key)
+        if isinstance(entries, list):
+            listed |= {e.get("zarr") for e in entries if isinstance(e, dict)}
+    if not (listed & purged_rels):
+        return None
+    return rewrite_index(live_index, purged_rels)
+
+
+def load_snapshot_index(snapshot_dir: str, dataset_id: str) -> dict:
+    """Load `<snapshot_dir>/<dataset_id>.json` as this dataset's index.
+
+    Raises `FileNotFoundError` when there is no snapshot for the dataset,
+    `TypeError` when the file is not a JSON object, and `ValueError` when it is
+    not a `nemar-zarr-index` document for THIS dataset. The caller treats all
+    three the same (a per-dataset `error` row, batch continues); they are
+    distinct so a direct caller can tell "wrong shape" from "wrong dataset".
+    These guards matter more here than for an S3 read: an S3 index key
+    is derived from the dataset id and cannot belong to another dataset, while
+    a local path is whatever the operator typed. Checking `format` and
+    `dataset_id` means a mistyped directory, a half-written file, or a snapshot
+    of the wrong dataset fails loudly instead of authorizing deletes computed
+    from someone else's store list.
+
+    Note what this does NOT need to guard: a snapshot cannot authorize deleting
+    a raw store. Candidate selection runs `is_excluded_from_discovery` over
+    whatever index it is given, so a raw `sub-*/` path is never selected no
+    matter which document it came from, and `safe_store_prefix` plus
+    `assert_within_zarr_prefix` still pin every delete inside this dataset's own
+    `zarr/` tree. Snapshot mode changes where the store list is read from, not
+    what is permitted to be deleted.
+    """
+    path = Path(snapshot_dir) / f"{dataset_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"no index snapshot at {path}")
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise TypeError(f"{path}: not a JSON object")
+    fmt = doc.get("format")
+    if fmt != INDEX_FORMAT:
+        raise ValueError(f"{path}: format is {fmt!r}, expected {INDEX_FORMAT!r}")
+    got = doc.get("dataset_id")
+    if got != dataset_id:
+        raise ValueError(f"{path}: dataset_id is {got!r}, expected {dataset_id!r}")
+    return doc
+
+
+def snapshot_dataset_ids(snapshot_dir: str) -> list[str]:
+    """Dataset ids that have a snapshot in `snapshot_dir`, sorted.
+
+    Used so `--all` in snapshot mode is bounded by the snapshot directory
+    rather than by a bucket listing: the set of datasets with a saved index is
+    exactly the set this mode can act on, and enumerating the bucket instead
+    would report every other dataset as a missing snapshot.
+    """
+    d = Path(snapshot_dir)
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.json") if p.is_file())
+
+
 # --- Pure: per-dataset orchestration decisions ---------------------------
 #
 # These three functions own every decision `purge_dataset` makes about
@@ -345,18 +448,51 @@ def parse_s3_ls_summary(output: str) -> tuple[int, int]:
     """Parse `aws s3 ls --recursive --summarize`'s trailing summary lines into
     `(object_count, total_bytes)`.
 
-    Both default to 0 when the prefix holds no objects at all -- `aws s3 ls`
-    prints nothing whatsoever (not even the summary lines) for a prefix that
-    matches zero keys -- or when the summary lines are absent for any other
-    reason. Absence is always read as "empty," never as "unknown," which is
-    the conservative direction for this tool: it only ever makes a store look
-    like it needs no deletion, never the reverse.
+    Both default to 0 when the summary lines are absent. Absence is always read
+    as "empty," never as "unknown," which is the conservative direction for this
+    tool: it only ever makes a store look like it needs no deletion, never the
+    reverse.
+
+    Note what `aws s3 ls` actually does for a prefix matching zero keys, since
+    an earlier version of this docstring had it wrong: it DOES print a
+    well-formed `Total Objects: 0` / `Total Size: 0` summary, and it exits 1.
+    Deciding whether a non-zero exit is a real failure or just "no keys" is
+    `interpret_s3_ls_result`'s job, not this function's.
     """
     objects_match = _TOTAL_OBJECTS_RE.search(output)
     size_match = _TOTAL_SIZE_RE.search(output)
     count = int(objects_match.group(1)) if objects_match else 0
     total_bytes = int(size_match.group(1)) if size_match else 0
     return count, total_bytes
+
+
+def interpret_s3_ls_result(returncode: int, stdout: str) -> tuple[int, int] | None:
+    """`(object_count, total_bytes)` when `aws s3 ls`'s output can be trusted,
+    `None` when the call genuinely failed and the counts are unknown.
+
+    `aws s3 ls --recursive --summarize` **exits 1 for a prefix that matches zero
+    keys**, while still printing a well-formed `Total Objects: 0` summary and
+    writing nothing to stderr. That is a real answer -- the store is already
+    gone -- not a failure.
+
+    Treating every non-zero exit as an error made the `already_absent` outcome
+    unreachable in practice, which was not merely a reporting wart. An errored
+    target is excluded from `purged_rels` by design (never drop the index entry
+    of a store we are unsure about), so a store deleted by a run whose index
+    rewrite did not complete would be re-statted on the next run, raise, be
+    classed as an error, and keep its index entry -- permanently, across any
+    number of re-runs. The published index would go on advertising stores that
+    return 404. Observed on `nm000172`: 23 stores deleted, index rewrite lost to
+    an expired session, and every subsequent run reported 23 "delete errors"
+    while being unable to ever finish the job.
+
+    The discriminator is the summary itself: a credential, permission, or
+    network failure produces no `Total Objects` line, so it still returns None
+    and still raises upstream.
+    """
+    if returncode == 0 or _TOTAL_OBJECTS_RE.search(stdout):
+        return parse_s3_ls_summary(stdout)
+    return None
 
 
 # --- I/O: S3 + index.json -------------------------------------------------
@@ -379,9 +515,10 @@ def stat_prefix(bucket: str, key_prefix: str, *, timeout: int = _AWS_OP_TIMEOUT)
         env=_aws_env(),
         check=False,
     )
-    if res.returncode != 0:
+    counts = interpret_s3_ls_result(res.returncode, res.stdout)
+    if counts is None:
         raise RuntimeError(f"aws s3 ls {key_prefix} exited {res.returncode}: {res.stderr.strip()}")
-    return parse_s3_ls_summary(res.stdout)
+    return counts
 
 
 def _execute_target_step(bucket: str, dataset_id: str, step: dict, *, execute: bool) -> dict:
@@ -520,6 +657,7 @@ def purge_dataset(
     *,
     execute: bool,
     check_extra: bool = True,
+    snapshot_dir: str | None = None,
 ) -> dict:
     """Run the full purge pipeline for one dataset.
 
@@ -555,17 +693,29 @@ def purge_dataset(
         "index_rewritten": False,
         "bytes_freed": 0,
         "objects_freed": 0,
+        "index_source": "snapshot" if snapshot_dir else "s3",
     }
     index_key = f"{dataset_id}/zarr/index.json"
-    try:
-        index = s3_read_json(bucket, index_key)
-    except Exception as exc:  # noqa: BLE001 - reported, not fatal to the batch
-        result["status"] = "error"
-        result["error"] = f"failed to read index.json: {exc}"
-        return result
-    if index is None:
-        result["status"] = "no_index"
-        return result
+    if snapshot_dir:
+        try:
+            index = load_snapshot_index(snapshot_dir, dataset_id)
+        except FileNotFoundError:
+            result["status"] = "no_snapshot"
+            return result
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal to the batch
+            result["status"] = "error"
+            result["error"] = f"failed to load index snapshot: {exc}"
+            return result
+    else:
+        try:
+            index = s3_read_json(bucket, index_key)
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal to the batch
+            result["status"] = "error"
+            result["error"] = f"failed to read index.json: {exc}"
+            return result
+        if index is None:
+            result["status"] = "no_index"
+            return result
     result["index_found"] = True
 
     candidates, selection_anomalies = select_purge_candidates(index)
@@ -617,7 +767,26 @@ def purge_dataset(
 
     purged_rels = summary["purged_rels"]
     if execute and purged_rels:
-        new_index = rewrite_index(index, purged_rels)
+        if snapshot_dir:
+            # Compute the rewrite from the LIVE document, never the snapshot --
+            # see plan_snapshot_index_rewrite for why publishing the snapshot
+            # would undo the cleanup it is performing.
+            try:
+                live_index = s3_read_json(bucket, index_key)
+            except Exception as exc:  # noqa: BLE001 - surfaced; data is already deleted
+                result["status"] = "error"
+                result["error"] = f"purge succeeded but live index read failed: {exc}"
+                return result
+            new_index = plan_snapshot_index_rewrite(live_index, purged_rels)
+            if new_index is None:
+                result["index_rewrite_skipped"] = (
+                    "no live index.json to rewrite"
+                    if not live_index
+                    else "live index does not list the purged stores"
+                )
+                return result
+        else:
+            new_index = rewrite_index(index, purged_rels)
         try:
             write_index(bucket, dataset_id, new_index)
             result["index_rewritten"] = True
@@ -646,9 +815,18 @@ def dataset_has_issue(result: dict) -> bool:
     depend on an operator noticing them. Scripting `--execute` off `$?` is
     the obvious way to gate a rollout on this tool, so the exit code has to
     agree with what gets printed.
+
+    `no_snapshot` counts as an issue; `no_index` deliberately does not. The
+    asymmetry is the point. A dataset with no `index.json` has nothing to purge
+    and was correctly a no-op. A dataset with no SNAPSHOT was explicitly named
+    as a target and then silently skipped -- a typo in the directory, a file
+    never exported, the wrong path -- and it must not be reported as clean:
+    zero purged and zero errors is the same output a genuinely clean dataset
+    produces, so an operator gating `--execute` on `$?` would get a green light
+    while a named target went untouched.
     """
     return bool(
-        result.get("status") == "error"
+        result.get("status") in ("error", "no_snapshot")
         or result.get("delete_errors")
         or result.get("rejected")
         or result.get("anomalies")
@@ -667,6 +845,16 @@ def _print_dataset_summary(result: dict) -> None:
     dataset_id = result.get("dataset_id")
     if status == "no_index":
         print(f"[purge] {dataset_id}: no zarr index.json -- nothing to do", flush=True)
+        return
+    if status == "no_snapshot":
+        # Must NOT fall through to the counts line: zero purged / zero errors is
+        # indistinguishable from a dataset that was genuinely checked and clean,
+        # and this one was never checked at all.
+        print(
+            f"[purge] {dataset_id}: SKIPPED -- no index snapshot found for this "
+            f"dataset; nothing was examined or deleted",
+            flush=True,
+        )
         return
     if status == "error":
         print(f"[purge] {dataset_id}: ERROR -- {result.get('error')}", flush=True)
@@ -733,11 +921,37 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the S3-vs-index reconciliation listing (faster, less thorough)",
     )
     ap.add_argument("--audit-log", default=None, help="path for the JSON audit record")
+    ap.add_argument(
+        "--from-index-snapshot", default=None, metavar="DIR",
+        help="read each dataset's store list from DIR/<dataset_id>.json (a saved "
+        "index.json) instead of the live one. For stores stranded in S3 after a "
+        "converter rebuild dropped them from the published index: the live index "
+        "no longer lists them, so nothing else can target them. The rewrite is "
+        "still computed from the LIVE index, never from the snapshot. With --all, "
+        "the dataset set is the snapshots present in DIR.",
+    )
     args = ap.parse_args(argv)
 
-    dataset_ids = args.datasets if args.datasets else list_dataset_ids(args.bucket)
+    snapshot_dir = args.from_index_snapshot
+    if snapshot_dir and not Path(snapshot_dir).is_dir():
+        print(f"[purge] --from-index-snapshot: no such directory: {snapshot_dir}", flush=True)
+        return 2
+
+    if args.datasets:
+        dataset_ids = args.datasets
+    elif snapshot_dir:
+        dataset_ids = snapshot_dataset_ids(snapshot_dir)
+    else:
+        dataset_ids = list_dataset_ids(args.bucket)
     if args.all and not dataset_ids:
-        print(f"[purge] no datasets found under s3://{args.bucket}/", flush=True)
+        where = snapshot_dir if snapshot_dir else f"s3://{args.bucket}/"
+        print(f"[purge] no datasets found under {where}", flush=True)
+    if snapshot_dir:
+        print(
+            f"[purge] snapshot mode: store lists read from {snapshot_dir} "
+            f"({len(dataset_ids)} dataset(s)); index rewrites still computed from S3",
+            flush=True,
+        )
 
     audit_path = args.audit_log or _default_audit_path()
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -753,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.bucket, dataset_id,
                 execute=args.execute,
                 check_extra=not args.skip_extra_check,
+                snapshot_dir=snapshot_dir,
             )
         except Exception as exc:  # noqa: BLE001 - one dataset must never abort the batch
             result = {
@@ -768,6 +983,8 @@ def main(argv: list[str] | None = None) -> int:
         "generated_utc": generated,
         "execute": args.execute,
         "bucket": args.bucket,
+        "index_source": "snapshot" if snapshot_dir else "s3",
+        "snapshot_dir": snapshot_dir,
         "datasets": per_dataset,
     }
     write_audit_log(audit_path, report)
