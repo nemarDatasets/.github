@@ -32,14 +32,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from purge_non_raw_stores import (  # type: ignore[import-not-found]
+    INDEX_FORMAT,
     assert_within_zarr_prefix,
     dataset_has_issue,
     decide_target_action,
+    load_snapshot_index,
     parse_s3_ls_summary,
     plan_dataset_operations,
+    plan_snapshot_index_rewrite,
     prepare_targets,
     rewrite_index,
     select_purge_candidates,
+    snapshot_dataset_ids,
     summarize_target_outcomes,
     write_audit_log,
 )
@@ -617,6 +621,149 @@ class WriteAuditLogTests(unittest.TestCase):
             write_audit_log(path, {"run": 2})
             with open(path, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh), {"run": 2})
+
+
+def _index_doc(dataset_id: str, stores: list[dict], **extra) -> dict:
+    doc = {
+        "dataset_id": dataset_id,
+        "format": INDEX_FORMAT,
+        "format_version": 1,
+        "source_commit": "a" * 40,
+        "updated_utc": "2026-08-12T12:00:00Z",
+        "store_count": len(stores),
+        "stores": stores,
+    }
+    doc.update(extra)
+    return doc
+
+
+class LoadSnapshotIndexTests(unittest.TestCase):
+    """Real temp files on disk; nothing about the filesystem is faked."""
+
+    def _write(self, d: Path, name: str, doc) -> Path:
+        p = d / name
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        return p
+
+    def test_loads_a_valid_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            doc = _index_doc(DATASET, [_store("derivatives/x/a_eeg.edf")])
+            self._write(d, f"{DATASET}.json", doc)
+            self.assertEqual(load_snapshot_index(td, DATASET), doc)
+
+    def test_missing_snapshot_raises_file_not_found(self):
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(FileNotFoundError):
+            load_snapshot_index(td, DATASET)
+
+    def test_rejects_snapshot_for_a_different_dataset(self):
+        """The guard that matters most: a local path is whatever was typed, so a
+        snapshot of another dataset must not be able to authorize deletes here."""
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._write(d, f"{DATASET}.json", _index_doc("nm999999", []))
+            with self.assertRaises(ValueError) as cm:
+                load_snapshot_index(td, DATASET)
+            self.assertIn("dataset_id", str(cm.exception))
+
+    def test_rejects_foreign_json_without_the_index_format_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._write(d, f"{DATASET}.json", {"dataset_id": DATASET, "stores": []})
+            with self.assertRaises(ValueError) as cm:
+                load_snapshot_index(td, DATASET)
+            self.assertIn("format", str(cm.exception))
+
+    def test_rejects_non_object_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._write(d, f"{DATASET}.json", [1, 2, 3])
+            with self.assertRaises(TypeError):
+                load_snapshot_index(td, DATASET)
+
+    def test_malformed_json_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / f"{DATASET}.json"
+            p.write_text("{not json", encoding="utf-8")
+            with self.assertRaises(json.JSONDecodeError):
+                load_snapshot_index(td, DATASET)
+
+    def test_a_snapshot_cannot_authorize_purging_a_raw_store(self):
+        """Snapshot mode changes where the store list is read, not what may be
+        deleted. A raw `sub-*/` entry stays unselectable even when a snapshot
+        lists it, because selection re-derives the raw/non-raw split itself."""
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            raw = _store("sub-01/eeg/sub-01_task-a_eeg.edf")
+            nonraw = _store("derivatives/prep/sub-01_task-a_eeg.edf")
+            self._write(d, f"{DATASET}.json", _index_doc(DATASET, [raw, nonraw]))
+            index = load_snapshot_index(td, DATASET)
+            candidates, anomalies = select_purge_candidates(index)
+            self.assertEqual([c["zarr"] for c in candidates], [nonraw["zarr"]])
+            self.assertEqual(anomalies, [])
+
+
+class SnapshotDatasetIdsTests(unittest.TestCase):
+    def test_lists_stems_sorted(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            for name in ("on000002.json", "nm000001.json", "notes.txt"):
+                (d / name).write_text("{}", encoding="utf-8")
+            self.assertEqual(snapshot_dataset_ids(td), ["nm000001", "on000002"])
+
+    def test_missing_directory_is_empty_not_an_error(self):
+        self.assertEqual(snapshot_dataset_ids("/nonexistent/path/for/test"), [])
+
+
+class PlanSnapshotIndexRewriteTests(unittest.TestCase):
+    """The load-bearing property: snapshot mode must never publish the snapshot."""
+
+    def test_skips_when_live_index_does_not_list_the_purged_stores(self):
+        """The normal stranded case. The live index already omits them -- that is
+        exactly why they were unreachable -- so there is nothing to rewrite, and
+        writing anything here would resurrect the entries being cleaned up."""
+        live = _index_doc(DATASET, [_store("sub-01/eeg/sub-01_task-a_eeg.edf")])
+        self.assertIsNone(
+            plan_snapshot_index_rewrite(live, {"derivatives/prep/sub-01_task-a_eeg.zarr"})
+        )
+
+    def test_rewrites_only_the_live_document_when_it_still_lists_them(self):
+        raw = _store("sub-01/eeg/sub-01_task-a_eeg.edf")
+        stale = _store("derivatives/prep/sub-01_task-a_eeg.edf")
+        live = _index_doc(DATASET, [raw, stale], source_commit="b" * 40)
+        out = plan_snapshot_index_rewrite(live, {stale["zarr"]})
+        self.assertIsNotNone(out)
+        self.assertEqual([e["zarr"] for e in out["stores"]], [raw["zarr"]])
+        self.assertEqual(out["store_count"], 1)
+        # Derived from the LIVE document, so the live commit survives; had the
+        # snapshot been used, this would be the snapshot's "a"*40.
+        self.assertEqual(out["source_commit"], "b" * 40)
+
+    def test_matches_a_purged_rel_listed_only_under_failures(self):
+        live = _index_doc(
+            DATASET,
+            [_store("sub-01/eeg/sub-01_task-a_eeg.edf")],
+            failures=[_failure("derivatives/x/a_eeg.edf", "derivatives/x/a_eeg.zarr")],
+            failure_count=1,
+        )
+        out = plan_snapshot_index_rewrite(live, {"derivatives/x/a_eeg.zarr"})
+        self.assertIsNotNone(out)
+        self.assertEqual(out["failures"], [])
+        self.assertEqual(out["failure_count"], 0)
+
+    def test_no_purged_rels_or_no_live_index_is_a_skip(self):
+        live = _index_doc(DATASET, [_store("derivatives/x/a_eeg.edf")])
+        self.assertIsNone(plan_snapshot_index_rewrite(live, set()))
+        self.assertIsNone(plan_snapshot_index_rewrite(None, {"derivatives/x/a_eeg.zarr"}))
+        self.assertIsNone(plan_snapshot_index_rewrite({}, {"derivatives/x/a_eeg.zarr"}))
+
+    def test_does_not_mutate_the_live_index(self):
+        stale = _store("derivatives/prep/a_eeg.edf")
+        live = _index_doc(DATASET, [stale])
+        before = copy.deepcopy(live)
+        plan_snapshot_index_rewrite(live, {stale["zarr"]})
+        self.assertEqual(live, before)
 
 
 if __name__ == "__main__":
