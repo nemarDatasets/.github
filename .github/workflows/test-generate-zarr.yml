@@ -30,3 +30,5 @@ jobs:
         run: python scripts/zarr/test_generate_zarr.py
       - name: Run zarr queue tests
         run: python scripts/zarr/test_zarr_queue.py
+      - name: Run non-raw store purge tests
+        run: python scripts/zarr/test_purge_non_raw_stores.py
