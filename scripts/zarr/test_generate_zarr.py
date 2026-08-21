@@ -698,6 +698,44 @@ class TestFixSourceFileAttr(unittest.TestCase):
                 doc = json.load(fh)
             self.assertNotIn("recording_metadata", doc["attributes"])  # not fabricated
 
+    def test_explicit_null_attributes_does_not_raise(self):
+        # `"attributes": null` makes .get("attributes", {}) return None, so a
+        # chained .get would raise AttributeError rather than skipping cleanly.
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump({"zarr_format": 3, "attributes": None}, fh)
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")  # must not raise
+
+    def test_rewrite_leaves_no_temp_file_and_keeps_zarr_json_parseable(self):
+        # The rewrite goes through a sibling temp + os.replace so an interruption
+        # can never leave a truncated zarr.json that validate_store (which only
+        # checks existence) would wave through.
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "rec.zarr")
+            os.makedirs(store)
+            with open(os.path.join(store, "zarr.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "zarr_format": 3,
+                        "attributes": {
+                            "format": "biosigio-zarr",
+                            "recording_metadata": {"source_file": "/mnt/local/zarr-scratch/t/x.bdf"},
+                        },
+                    },
+                    fh,
+                )
+            fix_source_file_attr(store, "sub-1/eeg/sub-1_task-x_eeg.bdf")
+            self.assertEqual(sorted(os.listdir(store)), ["zarr.json"])  # no .tmp left behind
+            with open(os.path.join(store, "zarr.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)  # parses, i.e. not truncated
+            self.assertEqual(
+                doc["attributes"]["recording_metadata"]["source_file"],
+                "sub-1/eeg/sub-1_task-x_eeg.bdf",
+            )
+            self.assertEqual(doc["attributes"]["format"], "biosigio-zarr")  # siblings intact
+
 
 class TestEventDescriptionsFor(unittest.TestCase):
     def _write(self, root: str, rel: str, body: dict) -> None:

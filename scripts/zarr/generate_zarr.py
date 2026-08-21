@@ -1504,7 +1504,9 @@ def fix_source_file_attr(store_path: str, bids_relpath: str) -> None:
     meta_path = os.path.join(store_path, "zarr.json")
     with open(meta_path, encoding="utf-8") as fh:
         doc = json.load(fh)
-    rec_meta = doc.get("attributes", {}).get("recording_metadata")
+    # `or {}` rather than a `{}` default: an explicit `"attributes": null` makes
+    # `.get("attributes", {})` return None, and the chained .get would then raise.
+    rec_meta = (doc.get("attributes") or {}).get("recording_metadata")
     if not isinstance(rec_meta, dict):
         # Unexpected biosigIO version/shape: nothing to correct, and we must
         # not fabricate a key biosigIO did not write.
@@ -1515,8 +1517,19 @@ def fix_source_file_attr(store_path: str, bids_relpath: str) -> None:
         )
         return
     rec_meta["source_file"] = bids_relpath
-    with open(meta_path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh)
+    # Write to a sibling temp file then os.replace: opening `meta_path` with "w"
+    # truncates it first, so an interruption mid-dump would leave a truncated
+    # zarr.json behind -- and validate_store only checks that the file EXISTS,
+    # not that it parses, so a corrupt one could pass the gate. os.replace is
+    # atomic within a directory, so the store metadata is never half-written.
+    tmp_path = f"{meta_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp_path, meta_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def electrode_positions_for(
