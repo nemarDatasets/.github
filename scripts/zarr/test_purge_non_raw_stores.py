@@ -2,14 +2,18 @@
 """Unit tests for the pure helpers in scripts/zarr/purge_non_raw_stores.py.
 
 No mocks: these exercise candidate selection, the escape-the-prefix guard,
-index rewriting, and S3-listing-output parsing directly, over realistic
-`index.json` documents and path/prefix strings -- no business logic (S3
-calls, subprocess, network) is patched or faked anywhere in this file.
+index rewriting, S3-listing-output parsing, and the plan/decision/summary
+functions that own `purge_dataset`'s ordering and error-isolation
+properties directly, over realistic `index.json` documents and path/prefix
+strings -- no business logic (S3 calls, subprocess, network) is patched or
+faked anywhere in this file. `write_audit_log`'s tests use a real temp
+directory on the local filesystem (not S3), so no I/O is faked there either.
 
-The S3 list/delete/read/write orchestration in `purge_dataset` and its I/O
-helpers (`stat_prefix`, `discover_excluded_stores`, `write_index`,
-`list_dataset_ids`) genuinely require a real S3 client and are deliberately
-NOT exercised here -- see the PR description for what that leaves unverified.
+The S3 list/delete/read/write orchestration itself -- `stat_prefix` and
+`_execute_target_step`'s subprocess/S3 calls, `discover_excluded_stores`,
+`write_index`, `list_dataset_ids`, and `purge_dataset`/`main()` end to end --
+genuinely requires a real S3 client and is deliberately NOT exercised here;
+see the PR description for what that leaves unverified.
 
 Run with:
     python3 scripts/zarr/test_purge_non_raw_stores.py
@@ -19,7 +23,9 @@ Run with:
 from __future__ import annotations
 
 import copy
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,10 +33,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from purge_non_raw_stores import (  # type: ignore[import-not-found]
     assert_within_zarr_prefix,
+    dataset_has_issue,
+    decide_target_action,
     parse_s3_ls_summary,
+    plan_dataset_operations,
     prepare_targets,
     rewrite_index,
     select_purge_candidates,
+    summarize_target_outcomes,
+    write_audit_log,
 )
 
 BUCKET = "nemar"
@@ -121,6 +132,22 @@ class SelectPurgeCandidatesTests(unittest.TestCase):
         self.assertEqual(len(anomalies), 1)
         self.assertIs(anomalies[0]["entry"], entry)
 
+    def test_excluded_zarr_with_no_path_at_all_is_an_anomaly_not_consent(self):
+        # A `path`-less entry must not be read as "no disagreement, so
+        # select it" -- a stripped `path` is itself the shape of corruption
+        # the disagreement check exists to catch.
+        entry = {"zarr": "derivatives/evil.zarr"}
+        candidates, anomalies = select_purge_candidates({"stores": [entry]})
+        self.assertEqual(candidates, [])
+        self.assertEqual(len(anomalies), 1)
+        self.assertIs(anomalies[0]["entry"], entry)
+
+    def test_excluded_zarr_with_non_string_path_is_an_anomaly(self):
+        entry = {"zarr": "derivatives/evil.zarr", "path": None}
+        candidates, anomalies = select_purge_candidates({"stores": [entry]})
+        self.assertEqual(candidates, [])
+        self.assertEqual(len(anomalies), 1)
+
     def test_missing_zarr_field_is_an_anomaly(self):
         entry = {"path": "derivatives/x/sub-01_task-x_eeg.set"}
         candidates, anomalies = select_purge_candidates({"stores": [entry]})
@@ -195,6 +222,27 @@ class PrepareTargetsTests(unittest.TestCase):
         self.assertEqual(len(targets), 1)
         self.assertEqual(len(rejected), 1)
         self.assertEqual(targets[0]["entry"], good)
+
+    def test_duplicate_zarr_value_second_occurrence_is_rejected_not_a_second_target(self):
+        # A well-formed index can never have two `stores` entries sharing one
+        # `zarr` value (it's the dict key in generate_zarr.merge_index), so
+        # this only happens for a hand-edited/corrupted index -- both name
+        # the identical S3 location, so only ONE target (and one stat/delete
+        # attempt) should ever be produced for it.
+        first = {"path": "derivatives/x/sub-01_task-a_eeg.set", "zarr": "derivatives/x/shared.zarr"}
+        second = {"path": "derivatives/y/sub-02_task-b_eeg.set", "zarr": "derivatives/x/shared.zarr"}
+        targets, rejected = prepare_targets(BUCKET, DATASET, [first, second])
+        self.assertEqual(len(targets), 1)
+        self.assertIs(targets[0]["entry"], first)
+        self.assertEqual(len(rejected), 1)
+        self.assertIs(rejected[0]["entry"], second)
+        self.assertIn("duplicate", rejected[0]["reason"])
+
+    def test_three_duplicates_only_the_first_becomes_a_target(self):
+        entries = [{"path": None, "zarr": "code/shared.zarr"} for _ in range(3)]
+        targets, rejected = prepare_targets(BUCKET, DATASET, entries)
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(len(rejected), 2)
 
 
 class AssertWithinZarrPrefixTests(unittest.TestCase):
@@ -417,6 +465,158 @@ class ParseS3LsSummaryTests(unittest.TestCase):
 
     def test_missing_summary_lines_defaults_to_zero(self):
         self.assertEqual(parse_s3_ls_summary("some unrelated garbage\n"), (0, 0))
+
+
+class DecideTargetActionTests(unittest.TestCase):
+    def test_zero_objects_is_always_already_absent_regardless_of_execute(self):
+        self.assertEqual(decide_target_action(0, execute=True), "already_absent")
+        self.assertEqual(decide_target_action(0, execute=False), "already_absent")
+
+    def test_nonzero_objects_dry_run_is_would_purge(self):
+        self.assertEqual(decide_target_action(5, execute=False), "would_purge")
+
+    def test_nonzero_objects_execute_is_delete(self):
+        self.assertEqual(decide_target_action(5, execute=True), "delete")
+
+
+class PlanDatasetOperationsTests(unittest.TestCase):
+    def test_preserves_target_order_and_ends_with_exactly_one_rewrite_step(self):
+        targets = [
+            {"rel_store": "a.zarr", "key_prefix": "s3://b/d/zarr/a.zarr/", "entry": {"path": "a"}},
+            {"rel_store": "b.zarr", "key_prefix": "s3://b/d/zarr/b.zarr/", "entry": {"path": "b"}},
+        ]
+        plan = plan_dataset_operations(targets)
+        self.assertEqual(
+            [s["op"] for s in plan],
+            ["stat_then_maybe_delete", "stat_then_maybe_delete", "rewrite_index"],
+        )
+        self.assertEqual([s["rel_store"] for s in plan[:-1]], ["a.zarr", "b.zarr"])
+        self.assertEqual(plan[-1], {"op": "rewrite_index"})
+
+    def test_no_targets_still_ends_with_the_rewrite_step(self):
+        self.assertEqual(plan_dataset_operations([]), [{"op": "rewrite_index"}])
+
+
+class SummarizeTargetOutcomesTests(unittest.TestCase):
+    def test_purged_rels_excludes_errored_targets(self):
+        # The core error-isolation property: a target this run failed to
+        # stat or failed to delete must NEVER end up in the set that gets
+        # dropped from index.json -- its entry has to survive to be retried.
+        outcomes = [
+            {"rel_store": "a.zarr", "state": "purged", "object_count": 3, "bytes": 300},
+            {"rel_store": "b.zarr", "state": "delete_error", "object_count": 2, "bytes": 200, "error": "boom"},
+            {"rel_store": "c.zarr", "state": "already_absent", "object_count": 0, "bytes": 0},
+            {"rel_store": "d.zarr", "state": "stat_error", "object_count": 0, "bytes": 0, "error": "timeout"},
+            {"rel_store": "e.zarr", "state": "would_purge", "object_count": 1, "bytes": 10},
+        ]
+        summary = summarize_target_outcomes(outcomes)
+        self.assertEqual(summary["purged_rels"], {"a.zarr", "c.zarr"})
+        self.assertEqual(len(summary["delete_errors"]), 2)
+        self.assertEqual({o["rel_store"] for o in summary["delete_errors"]}, {"b.zarr", "d.zarr"})
+        self.assertEqual(summary["bytes_freed"], 300)
+        self.assertEqual(summary["objects_freed"], 3)
+
+    def test_already_absent_never_counted_as_freed_bytes_or_objects(self):
+        # Folding an already-gone target into purged_rels must not inflate
+        # "freed" accounting for data this run did not actually delete.
+        outcomes = [{"rel_store": "a.zarr", "state": "already_absent", "object_count": 0, "bytes": 0}]
+        summary = summarize_target_outcomes(outcomes)
+        self.assertEqual(summary["purged_rels"], {"a.zarr"})
+        self.assertEqual(summary["bytes_freed"], 0)
+        self.assertEqual(summary["objects_freed"], 0)
+
+    def test_preserves_outcome_order_within_each_bucket(self):
+        outcomes = [
+            {"rel_store": "z.zarr", "state": "purged", "object_count": 1, "bytes": 1},
+            {"rel_store": "a.zarr", "state": "purged", "object_count": 1, "bytes": 1},
+        ]
+        summary = summarize_target_outcomes(outcomes)
+        self.assertEqual([o["rel_store"] for o in summary["purged"]], ["z.zarr", "a.zarr"])
+
+    def test_empty_outcomes(self):
+        summary = summarize_target_outcomes([])
+        self.assertEqual(summary["purged_rels"], set())
+        self.assertEqual(summary["purged"], [])
+        self.assertEqual(summary["bytes_freed"], 0)
+        self.assertEqual(summary["objects_freed"], 0)
+
+
+class DatasetHasIssueTests(unittest.TestCase):
+    """The exit code and every printed summary read `dataset_has_issue` as
+    their single source of truth, so this pins exactly which fields flip it
+    -- including the two the bulk exit code previously missed."""
+
+    def test_clean_result_has_no_issue(self):
+        self.assertFalse(dataset_has_issue({"status": "ok", "purged": [{"zarr": "a.zarr"}]}))
+
+    def test_hard_error_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "error", "error": "boom"}))
+
+    def test_delete_errors_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "ok", "delete_errors": [{"zarr": "a.zarr"}]}))
+
+    def test_rejected_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "ok", "rejected": [{"entry": {}}]}))
+
+    def test_anomalies_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "ok", "anomalies": [{"entry": {}}]}))
+
+    def test_extra_on_s3_not_in_index_is_an_issue(self):
+        # This is the exact gap the bulk exit code had: a dry run that finds
+        # real unindexed excluded-tree stores on S3 must not exit 0.
+        self.assertTrue(dataset_has_issue({"status": "ok", "extra_on_s3_not_in_index": ["derivatives/x.zarr"]}))
+
+    def test_extra_on_s3_check_error_is_an_issue(self):
+        self.assertTrue(dataset_has_issue({"status": "ok", "extra_on_s3_check_error": "timeout"}))
+
+    def test_no_index_status_alone_is_not_an_issue(self):
+        self.assertFalse(dataset_has_issue({"status": "no_index"}))
+
+
+class WriteAuditLogTests(unittest.TestCase):
+    """Real local-filesystem I/O (no S3, no faking): these exercise the
+    actual atomic-write behaviour `write_audit_log` promises."""
+
+    def test_writes_valid_json_matching_the_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "audit.json")
+            report = {"format": "nemar-zarr-purge-audit", "datasets": [{"dataset_id": "nm000123"}]}
+            write_audit_log(path, report)
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), report)
+
+    def test_no_leftover_temp_file_after_a_successful_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "audit.json")
+            write_audit_log(path, {"a": 1})
+            leftovers = [p for p in Path(tmp).iterdir() if p.name != "audit.json"]
+            self.assertEqual(leftovers, [])
+
+    def test_second_call_does_not_collide_with_a_concurrent_first_calls_temp_file(self):
+        # Regression check for the fixed bug: a deterministic f"{path}.tmp"
+        # sibling would collide if two runs targeted the same --audit-log
+        # concurrently. Simulate by holding the first call's temp file open
+        # (via NamedTemporaryFile directly, same dir) while the second
+        # `write_audit_log` call runs to completion -- it must not touch or
+        # be blocked by the first's temp file, and must still produce valid
+        # final content.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "audit.json")
+            with tempfile.NamedTemporaryFile(
+                "w", prefix=".purge-audit-", suffix=".json.tmp", dir=tmp, delete=False
+            ) as held:
+                held.write("not json -- simulates another run's in-progress temp file")
+                write_audit_log(path, {"final": True})
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), {"final": True})
+
+    def test_overwrites_an_existing_audit_file_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "audit.json")
+            write_audit_log(path, {"run": 1})
+            write_audit_log(path, {"run": 2})
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), {"run": 2})
 
 
 if __name__ == "__main__":

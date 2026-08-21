@@ -47,11 +47,22 @@ Safety design
 * `index.json` is rewritten (`rewrite_index`) to drop purged store entries and
   any `failures` entries for the same paths, preserving every other top-level
   field and every remaining entry's content and relative order untouched.
-* The pure selection/guard/rewrite/parsing logic is unit tested directly, with
-  no mocking of business logic, in `test_purge_non_raw_stores.py`. The actual
-  S3 list/delete/read/write calls are thin wrappers around that logic and are
-  NOT exercised by the automated test suite here -- see the PR description
-  for exactly what that leaves unverified.
+* The ordering (delete before index rewrite, always exactly once) and
+  error-isolation decisions (an errored target's index entry always
+  survives; an already-absent one is folded in without a second delete
+  attempt) are pure, data-in/data-out functions -- `plan_dataset_operations`,
+  `decide_target_action`, `summarize_target_outcomes` -- not implicit facts
+  about `purge_dataset`'s control flow. `purge_dataset` itself is a thin
+  walk over the plan those return.
+* Every pure function above -- selection, the escape guard, index rewriting,
+  S3-listing-output parsing, and the plan/decision/summary trio -- is unit
+  tested directly, with no mocking of business logic, in
+  `test_purge_non_raw_stores.py`. The actual S3 list/delete/read/write calls
+  themselves (`stat_prefix`'s and `_execute_target_step`'s subprocess/S3
+  calls, `discover_excluded_stores`, `write_index`, `list_dataset_ids`) are
+  thin I/O wrappers around that tested logic and are NOT exercised by the
+  automated test suite here -- see the PR description for exactly what that
+  leaves unverified.
 """
 
 from __future__ import annotations
@@ -96,12 +107,14 @@ def select_purge_candidates(index: dict) -> tuple[list[dict], list[dict]]:
     A candidate is a store entry whose `zarr` rel-path the imported
     `is_excluded_from_discovery` predicate says is excluded (under
     derivatives/sourcedata/code, or a reserved BIDS calibration filename --
-    neither can be a raw recording). An entry only reaches `candidates` when
-    its `path` field (the original BIDS-relative source path), if present,
-    AGREES with `zarr` on that question -- a disagreement (a `path` that
-    looks like an ordinary `sub-*/` recording paired with a `zarr` that looks
-    excluded) is exactly the shape a corrupted or hand-edited index entry
-    would have, and is routed to `anomalies` instead of ever being purged.
+    neither can be a raw recording), AND whose `path` field (the original
+    BIDS-relative source path) AGREES with `zarr` on that question. Both a
+    disagreement (a `path` that looks like an ordinary `sub-*/` recording
+    paired with a `zarr` that looks excluded) and a MISSING or non-string
+    `path` are routed to `anomalies` instead of ever being purged -- a
+    stripped `path` is itself exactly the shape a corrupted or hand-edited
+    entry would have, so its absence must count as a disagreement, not as
+    consent.
 
     An entry missing a well-formed string `zarr` is also an anomaly (a
     well-formed index always carries one -- it is the dict key the entry is
@@ -124,7 +137,10 @@ def select_purge_candidates(index: dict) -> tuple[list[dict], list[dict]]:
         if not is_excluded_from_discovery(zarr):
             continue  # ordinary raw store -- never a candidate, never reported
         path = entry.get("path")
-        if isinstance(path, str) and path and not is_excluded_from_discovery(path):
+        if not isinstance(path, str) or not path:
+            anomalies.append({"entry": entry, "reason": "missing or non-string 'path'"})
+            continue
+        if not is_excluded_from_discovery(path):
             anomalies.append(
                 {"entry": entry, "reason": "'zarr' looks excluded but 'path' does not agree"}
             )
@@ -164,17 +180,38 @@ def prepare_targets(
     resolves outside the dataset's own zarr tree. Nothing in `rejected` is
     ever handed to a delete call; this is the guard's actual unit-testable
     surface for a malicious or malformed index value.
+
+    Also de-duplicates by `rel_store`: a well-formed index can never have two
+    `stores` entries sharing one `zarr` value (`generate_zarr.merge_index`
+    uses it as the dict key), so two candidates naming the same `rel_store`
+    only happens for a hand-edited/corrupted index, and both name the
+    identical S3 location regardless. The first occurrence becomes the (one)
+    target; every later one is routed to `rejected` rather than a second
+    target, so this dataset's stat/delete work -- and its audit trail -- is
+    never duplicated for what is physically one store. `rewrite_index` still
+    drops every `stores` entry sharing that `zarr` value once it is purged,
+    independent of how many targets were built for it.
     """
     targets: list[dict] = []
     rejected: list[dict] = []
+    seen_rel_stores: set[str] = set()
     for entry in candidates:
         rel_store = entry["zarr"]
+        if rel_store in seen_rel_stores:
+            rejected.append(
+                {
+                    "entry": entry,
+                    "reason": f"duplicate 'zarr' value {rel_store!r} across multiple store entries",
+                }
+            )
+            continue
         try:
             prefix = safe_store_prefix(bucket, dataset_id, rel_store)
             assert_within_zarr_prefix(prefix, bucket=bucket, dataset_id=dataset_id)
         except (ValueError, AssertionError) as exc:
             rejected.append({"entry": entry, "reason": str(exc)})
             continue
+        seen_rel_stores.add(rel_store)
         targets.append({"entry": entry, "rel_store": rel_store, "key_prefix": prefix})
     return targets, rejected
 
@@ -216,6 +253,86 @@ def rewrite_index(index: dict, purged_rels: set[str]) -> dict:
         out["failure_count"] = len(kept_failures)
 
     return out
+
+
+# --- Pure: per-dataset orchestration decisions ---------------------------
+#
+# These three functions own every decision `purge_dataset` makes about
+# ordering, error isolation, and what is safe to fold into an index rewrite.
+# They take and return plain data (a list of targets, a list of already-
+# finished per-target outcomes), so a test can pin the ordering and
+# error-isolation properties directly, without any S3 access, and a future
+# refactor that inverted the delete/rewrite order, dropped the `execute`
+# gate, or let an errored target's entry get dropped from the index would
+# fail a test here rather than only being caught by a careful reader.
+
+
+def plan_dataset_operations(targets: list[dict]) -> list[dict]:
+    """The ordered sequence of steps `purge_dataset` runs for one dataset.
+
+    One `{"op": "stat_then_maybe_delete", ...}` step per target, in exactly
+    the order `targets` were given (this tool never reorders or parallelizes
+    across stores), followed by exactly one trailing
+    `{"op": "rewrite_index"}` step. Returning the plan as data -- rather than
+    letting "stat/delete every target, then rewrite the index" be an
+    unstated fact about where a function call sits in `purge_dataset`'s
+    body -- is what makes the delete-before-index-rewrite ordering something
+    a test can assert on directly.
+    """
+    steps = [
+        {
+            "op": "stat_then_maybe_delete",
+            "rel_store": t["rel_store"],
+            "key_prefix": t["key_prefix"],
+            "entry": t["entry"],
+        }
+        for t in targets
+    ]
+    steps.append({"op": "rewrite_index"})
+    return steps
+
+
+def decide_target_action(object_count: int, *, execute: bool) -> str:
+    """The one decision of whether a target already confirmed to hold
+    `object_count` objects on S3 is ever handed to a delete call.
+
+    Returns `"already_absent"` (0 objects -- never delete, regardless of
+    `execute`), `"would_purge"` (objects present, dry run), or `"delete"`
+    (objects present, `--execute`). `_execute_target_step` is the only
+    caller, and only calls `_rm_recursive` when this returns `"delete"`.
+    """
+    if object_count == 0:
+        return "already_absent"
+    return "delete" if execute else "would_purge"
+
+
+def summarize_target_outcomes(outcomes: list[dict]) -> dict:
+    """Pure aggregation over a dataset's finished per-target outcomes.
+
+    Each outcome is a dict with at least `rel_store` and `state`, `state`
+    one of `"purged"`, `"already_absent"`, `"would_purge"`, `"stat_error"`,
+    or `"delete_error"`.
+
+    This is the one place that decides which `zarr` rel-paths are safe to
+    fold into an `index.json` rewrite: `purged_rels` is exactly the
+    `"purged"` and `"already_absent"` states -- NEVER `"stat_error"` or
+    `"delete_error"`. That is the per-target error-isolation property: one
+    store's failed stat or failed delete can never cause the index to claim
+    a store that might still physically exist on S3 is gone; its entry
+    always survives to be retried on the next run. Every returned list
+    preserves `outcomes`' input order (this tool never reorders stores).
+    """
+    purged_rels = {o["rel_store"] for o in outcomes if o["state"] in ("purged", "already_absent")}
+    purged = [o for o in outcomes if o["state"] == "purged"]
+    return {
+        "purged_rels": purged_rels,
+        "purged": purged,
+        "already_absent": [o for o in outcomes if o["state"] == "already_absent"],
+        "would_purge": [o for o in outcomes if o["state"] == "would_purge"],
+        "delete_errors": [o for o in outcomes if o["state"] in ("stat_error", "delete_error")],
+        "bytes_freed": sum(o.get("bytes", 0) for o in purged),
+        "objects_freed": sum(o.get("object_count", 0) for o in purged),
+    }
 
 
 # --- Pure: S3 listing-output parsing -------------------------------------
@@ -265,6 +382,45 @@ def stat_prefix(bucket: str, key_prefix: str, *, timeout: int = _AWS_OP_TIMEOUT)
     if res.returncode != 0:
         raise RuntimeError(f"aws s3 ls {key_prefix} exited {res.returncode}: {res.stderr.strip()}")
     return parse_s3_ls_summary(res.stdout)
+
+
+def _execute_target_step(bucket: str, dataset_id: str, step: dict, *, execute: bool) -> dict:
+    """Run one `plan_dataset_operations` `"stat_then_maybe_delete"` step.
+
+    Thin I/O wrapper: `stat_prefix` and `_rm_recursive` are real S3 calls, so
+    this function itself is not covered by the automated test suite. The
+    decisions it defers to -- whether an object count means "already gone"
+    versus "delete this" (`decide_target_action`) and what a finished batch
+    of these outcomes means for the index (`summarize_target_outcomes`) --
+    are pure and are.
+
+    Returns one outcome dict for `summarize_target_outcomes`, carrying
+    `rel_store`, `path`, `key_prefix`, `state`, `object_count`, `bytes`, and
+    (on a `stat_error`/`delete_error` state) `error`.
+    """
+    rel_store = step["rel_store"]
+    entry = step["entry"]
+    key_prefix = step["key_prefix"]
+    base = {"rel_store": rel_store, "path": entry.get("path"), "key_prefix": key_prefix}
+
+    try:
+        count, total_bytes = stat_prefix(bucket, key_prefix)
+    except Exception as exc:  # noqa: BLE001 - reported as this target's outcome
+        return {**base, "state": "stat_error", "object_count": 0, "bytes": 0, "error": str(exc)}
+
+    action = decide_target_action(count, execute=execute)
+    if action in ("already_absent", "would_purge"):
+        return {**base, "state": action, "object_count": count, "bytes": total_bytes}
+
+    # action == "delete"
+    try:
+        # Redundant, deliberate re-check immediately before the delete call
+        # itself (requirement: a guard right before each delete).
+        assert_within_zarr_prefix(key_prefix, bucket=bucket, dataset_id=dataset_id)
+        _rm_recursive(key_prefix)
+    except Exception as exc:  # noqa: BLE001 - reported as this target's outcome
+        return {**base, "state": "delete_error", "object_count": count, "bytes": total_bytes, "error": str(exc)}
+    return {**base, "state": "purged", "object_count": count, "bytes": total_bytes}
 
 
 def discover_excluded_stores(bucket: str, dataset_id: str) -> set[str]:
@@ -325,10 +481,20 @@ def write_audit_log(path: str, report: dict) -> None:
     `os.replace` -- the direct local-file application of the same pattern
     `write_index`/`fix_source_file_attr` use, so an interrupted run never
     leaves a truncated audit record on disk.
+
+    Uses `tempfile.NamedTemporaryFile` (a unique name), not a deterministic
+    `f"{path}.tmp"` sibling: two concurrent runs sharing an explicit
+    `--audit-log` path would otherwise collide on the same temp file. The
+    temp file is created in `path`'s own directory so `os.replace` is a
+    same-filesystem rename (atomic), not a cross-filesystem copy.
     """
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    with tempfile.NamedTemporaryFile(
+        "w", prefix=".purge-audit-", suffix=".json.tmp", dir=directory,
+        delete=False, encoding="utf-8",
+    ) as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
+        tmp_path = fh.name
     os.replace(tmp_path, path)
 
 
@@ -365,6 +531,13 @@ def purge_dataset(
     read for a reason other than "does not exist"; the CLI's bulk loop
     catches that per dataset too, so one dataset's failure never aborts the
     whole run (requirement: a per-dataset outcome table, not an abort).
+
+    The actual ordering and error-isolation decisions -- delete-before-
+    index-rewrite, never dropping an errored target's index entry, never
+    double-counting an already-absent one -- are NOT made here. They live in
+    `plan_dataset_operations` and `summarize_target_outcomes`, both pure and
+    directly unit tested; this function only walks the plan those return and
+    performs the I/O each step calls for.
     """
     result: dict = {
         "dataset_id": dataset_id,
@@ -401,55 +574,38 @@ def purge_dataset(
     result["anomalies"] = selection_anomalies
     result["rejected"] = rejected
 
-    purged_rels: set[str] = set()
-    for target in targets:
-        rel_store = target["rel_store"]
-        entry = target["entry"]
-        try:
-            count, total_bytes = stat_prefix(bucket, target["key_prefix"])
-        except Exception as exc:  # noqa: BLE001 - collected, other targets still run
-            result["delete_errors"].append(
-                {"zarr": rel_store, "path": entry.get("path"), "stage": "stat", "error": str(exc)}
-            )
-            continue
+    outcomes: list[dict] = []
+    summary: dict = summarize_target_outcomes(outcomes)  # baseline if targets is empty
+    for step in plan_dataset_operations(targets):
+        if step["op"] == "stat_then_maybe_delete":
+            outcomes.append(_execute_target_step(bucket, dataset_id, step, execute=execute))
+        else:  # "rewrite_index" -- plan_dataset_operations always puts exactly
+            # one of these, always last, so `outcomes` is complete here.
+            summary = summarize_target_outcomes(outcomes)
 
-        record = {
+    def _record(o: dict) -> dict:
+        return {
             "dataset_id": dataset_id,
-            "path": entry.get("path"),
-            "zarr": rel_store,
-            "key_prefix": target["key_prefix"],
-            "object_count": count,
-            "bytes": total_bytes,
+            "path": o.get("path"),
+            "zarr": o["rel_store"],
+            "key_prefix": o["key_prefix"],
+            "object_count": o.get("object_count", 0),
+            "bytes": o.get("bytes", 0),
         }
 
-        if count == 0:
-            # Confirmed gone already -- most likely a prior, partial --execute
-            # run. Never call _rm_recursive on it; just fold it into the set
-            # the index rewrite drops, so a re-run converges instead of
-            # erroring or double-counting.
-            result["already_absent"].append(record)
-            purged_rels.add(rel_store)
-            continue
-
-        if not execute:
-            result["purged"].append(record)  # "would purge" under dry-run
-            continue
-
-        try:
-            # Redundant, deliberate re-check immediately before the delete
-            # call itself (requirement: a guard right before each delete).
-            assert_within_zarr_prefix(target["key_prefix"], bucket=bucket, dataset_id=dataset_id)
-            _rm_recursive(target["key_prefix"])
-        except Exception as exc:  # noqa: BLE001 - collected, other targets still run
-            result["delete_errors"].append(
-                {"zarr": rel_store, "path": entry.get("path"), "stage": "delete", "error": str(exc)}
-            )
-            continue
-
-        result["purged"].append(record)
-        result["bytes_freed"] += total_bytes
-        result["objects_freed"] += count
-        purged_rels.add(rel_store)
+    result["purged"] = [_record(o) for o in summary["purged"] + summary["would_purge"]]
+    result["already_absent"] = [_record(o) for o in summary["already_absent"]]
+    result["delete_errors"] = [
+        {
+            "zarr": o["rel_store"],
+            "path": o.get("path"),
+            "stage": "stat" if o["state"] == "stat_error" else "delete",
+            "error": o.get("error"),
+        }
+        for o in summary["delete_errors"]
+    ]
+    result["bytes_freed"] = summary["bytes_freed"]
+    result["objects_freed"] = summary["objects_freed"]
 
     if check_extra:
         try:
@@ -459,6 +615,7 @@ def purge_dataset(
         except Exception as exc:  # noqa: BLE001 - best-effort reconciliation only
             result["extra_on_s3_check_error"] = str(exc)
 
+    purged_rels = summary["purged_rels"]
     if execute and purged_rels:
         new_index = rewrite_index(index, purged_rels)
         try:
@@ -472,6 +629,32 @@ def purge_dataset(
 
 
 # --- CLI --------------------------------------------------------------------
+
+
+def dataset_has_issue(result: dict) -> bool:
+    """True if this dataset's result needs a human's attention: a hard
+    error, any delete error, any rejected or anomalous candidate, any store
+    found on S3 under an excluded tree that `index.json` never listed, or a
+    failed drift-reconciliation check.
+
+    This is the SINGLE source of truth both the bulk exit code and every
+    per-dataset print statement use -- computing it independently in two
+    places (an exit-code expression here, a print statement there) is
+    exactly how the two silently drift apart, which is what happened before:
+    the exit code omitted `extra_on_s3_not_in_index`/`extra_on_s3_check_error`
+    even though the printed summary and the PR's own rollout guidance both
+    depend on an operator noticing them. Scripting `--execute` off `$?` is
+    the obvious way to gate a rollout on this tool, so the exit code has to
+    agree with what gets printed.
+    """
+    return bool(
+        result.get("status") == "error"
+        or result.get("delete_errors")
+        or result.get("rejected")
+        or result.get("anomalies")
+        or result.get("extra_on_s3_not_in_index")
+        or result.get("extra_on_s3_check_error")
+    )
 
 
 def _default_audit_path() -> str:
@@ -497,22 +680,32 @@ def _print_dataset_summary(result: dict) -> None:
         f"{len(result.get('extra_on_s3_not_in_index', []))} store(s) on S3 not in index",
         flush=True,
     )
+    if result.get("extra_on_s3_check_error"):
+        # The S3-vs-index drift check itself failed -- distinct from finding
+        # drift. This landed only in the audit JSON before; an operator
+        # watching a long --all run on stdout alone would never see it.
+        print(
+            f"[purge] {dataset_id}: WARNING -- S3-vs-index drift reconciliation "
+            f"failed: {result['extra_on_s3_check_error']}",
+            flush=True,
+        )
 
 
 def _print_outcome_table(results: list[dict]) -> None:
     print("\n[purge] per-dataset outcome:", flush=True)
     header = (
         f"{'dataset':<14} {'status':<10} {'purged':>7} {'absent':>7} "
-        f"{'flagged':>8} {'errors':>7} {'bytes_freed':>14}"
+        f"{'flagged':>8} {'errors':>7} {'drift':>6} {'bytes_freed':>14}"
     )
     print(header, flush=True)
     print("-" * len(header), flush=True)
     for r in results:
         flagged = len(r.get("anomalies", [])) + len(r.get("rejected", []))
+        drift = "ERR" if r.get("extra_on_s3_check_error") else str(len(r.get("extra_on_s3_not_in_index", [])))
         print(
             f"{r.get('dataset_id', ''):<14} {r.get('status', ''):<10} "
             f"{len(r.get('purged', [])):>7} {len(r.get('already_absent', [])):>7} "
-            f"{flagged:>8} {len(r.get('delete_errors', [])):>7} {r.get('bytes_freed', 0):>14}",
+            f"{flagged:>8} {len(r.get('delete_errors', [])):>7} {drift:>6} {r.get('bytes_freed', 0):>14}",
             flush=True,
         )
 
@@ -581,10 +774,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n[purge] audit log written to {audit_path}", flush=True)
     _print_outcome_table(per_dataset)
 
-    had_issue = any(
-        r.get("status") == "error" or r.get("delete_errors") or r.get("rejected") or r.get("anomalies")
-        for r in per_dataset
-    )
+    had_issue = any(dataset_has_issue(r) for r in per_dataset)
     if not args.execute:
         print(
             "\n[purge] DRY RUN -- nothing was deleted or rewritten. "
