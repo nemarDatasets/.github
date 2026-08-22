@@ -79,6 +79,21 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      # The Tier-2 duration step below runs scripts/patch_duration.py, which
+      # imports generate_zarr (_run, materialize_recording). Both live in
+      # nemarOrg/nemar-cli since nemar-cli#1109 (ADR 0029): the Zarr converter
+      # runs on the SDSC Hallu cron, not in Actions, so it moved to the repo
+      # where it can be developed and tested, and patch_duration.py went with
+      # the module it imports. This checkout is also the single source of the
+      # biosigIO pin -- there is deliberately no requirements file in this repo.
+      # nemar-cli is public, so no token is needed.
+      - name: Checkout nemar-cli (for scripts/patch_duration.py + biosigIO pin)
+        uses: actions/checkout@v4
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: main
+          path: nemar-cli
+
       - name: Set up Python
         id: setup-python
         uses: actions/setup-python@v5
@@ -166,11 +181,11 @@ jobs:
         # Best-effort: Tier-2 duration fill is optional enrichment, so a
         # transient pip/PyPI failure must not fail the publish (the patch step
         # below skips itself when this didn't succeed). Uses `python -m pip`
-        # (as the neuroschema-validate step above does) rather than the sister
-        # zarr workflow's `uv pip`; biosigIO's EDF/BDF/SET/BrainVision path
-        # needs no extra apt deps on ubuntu-latest.
+        # (as the neuroschema-validate step above does); biosigIO's
+        # EDF/BDF/SET/BrainVision path needs no extra apt deps on
+        # ubuntu-latest. The pin comes from the nemar-cli checkout above.
         continue-on-error: true
-        run: python -m pip install --quiet -r scripts/zarr/requirements.txt
+        run: python -m pip install --quiet -r nemar-cli/scripts/zarr/requirements.txt
 
       # --------------------------------------------------------------------
       # Upload the records.json snapshot to the per-version S3 key
@@ -203,7 +218,7 @@ jobs:
           # fail the run. No re-validate needed -- the patch only writes numbers
           # into signal_summary's number|null duration/ntimes fields, so it
           # cannot drift the neuroschema shape.
-          python scripts/patch_duration.py \
+          python nemar-cli/scripts/patch_duration.py \
             --records-path /tmp/out/records.json \
             --dataset-id "$DATASET_ID" \
             --version "$VERSION" \
