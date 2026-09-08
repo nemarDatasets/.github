@@ -114,7 +114,10 @@ jobs:
       - name: Authenticate nemar CLI
         env:
           NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
-        run: nemar auth login --key "$NEMAR_API_KEY"
+        # --yes: the paste path asks "Add a different account?" only when a config
+        # already holds an active account; a runner never should, but a cached one
+        # must not hang the job (nemar-cli v0.10.0, ADR 0047).
+        run: nemar auth login --key "$NEMAR_API_KEY" --yes
       - name: Prepare import
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
@@ -191,7 +194,7 @@ jobs:
       - name: Authenticate nemar CLI
         env:
           NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
-        run: nemar auth login --key "$NEMAR_API_KEY"
+        run: nemar auth login --key "$NEMAR_API_KEY" --yes
       - name: Copy shard
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
@@ -223,7 +226,7 @@ jobs:
       - name: Authenticate nemar CLI
         env:
           NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
-        run: nemar auth login --key "$NEMAR_API_KEY"
+        run: nemar auth login --key "$NEMAR_API_KEY" --yes
       - name: Mark import finalizing
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
