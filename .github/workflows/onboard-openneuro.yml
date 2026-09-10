@@ -130,26 +130,81 @@ jobs:
           set -o pipefail
           nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream 2>&1 \
             | tee "/tmp/prepare-${DATASET_ID}.log"
-      # If prepare failed because OpenNeuro's own data is unreachable (objects
-      # not anonymously public + NEMAR has no signed OpenNeuro login), forward the
-      # CLI's marker into the import-state callback so the backend records a
-      # distinct, listable `upstream_inaccessible` quarantine instead of a generic
-      # prepare miss (#808). Best-effort; the report job's terminal POST backstops.
-      - name: Report upstream-inaccessible (prepare)
+      # Report the REAL reason prepare failed (nemarOrg/nemar-cli#1309, ADR 0051).
+      #
+      # Until this existed, the only failure message that reached the database came
+      # from the `report` job below: `terminal: prepare=failure copy=... finalize=...`,
+      # a stage roll-up carrying no error text at all. Every machine-filed tracking
+      # issue said exactly that, so there was nothing to classify and a human read the
+      # run logs and hand-applied labels instead. That is what this step ends.
+      #
+      # It runs HERE, in the failing job, rather than in `report`, because jobs do not
+      # share a filesystem: `report` cannot read this log, and matrix job outputs
+      # overwrite each other across datasets. The roll-up POST stays as a backstop and
+      # cannot clobber this one -- `lastErrorAssignmentSql` refuses to overwrite a
+      # specific message with a generic one (ADR 0051).
+      - name: Report prepare failure
         if: failure()
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
           NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -uo pipefail
           log="/tmp/prepare-${DATASET_ID}.log"
+          on_id="on${DATASET_ID#ds}"
+
+          # The upstream case keeps its own deliberate wording: the marker is the
+          # classifier's signal for `upstream_inaccessible` and the sentence tells
+          # triage to re-check with an anonymous ranged GET before believing it (#808).
           if [ -f "$log" ] && grep -qF "[openneuro-upstream-inaccessible]" "$log"; then
-            on_id="on${DATASET_ID#ds}"
-            curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
-              -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
-              -d "{\"dataset_id\":\"$on_id\",\"source\":\"openneuro\",\"source_id\":\"$DATASET_ID\",\"stage\":\"prepare\",\"status\":\"failed\",\"error_message\":\"[openneuro-upstream-inaccessible] OpenNeuro objects not anonymously readable; NEMAR has no signed OpenNeuro login (see run log)\",\"workflow_run_url\":\"$RUN_URL\"}" \
-              || echo "::warning::upstream-inaccessible callback failed for $on_id (non-fatal; report job backstops)"
+            msg="[openneuro-upstream-inaccessible] OpenNeuro objects not anonymously readable; NEMAR has no signed OpenNeuro login (see run log)"
+          else
+            # The CLI's own failure line, NOT the log. Two false positives make
+            # whole-log matching actively wrong, both met while diagnosing #1306:
+            # a bare `403` matches apt's "Packages [403 kB]" on every runner, and
+            # this step's own source is echoed into the Actions log, so the marker
+            # appears even in runs that never hit it. Reading the tee'd CLI output
+            # avoids both, which is why the file exists.
+            #
+            # A window rather than one line: `ora().fail()` interpolates subprocess
+            # stderr, and git prints the parts the classifier needs on continuation
+            # lines ("remote: error: GH013:", "hint: ... diverging commits"). Bounded
+            # at 6 lines and 600 chars so a runaway trace cannot become the message.
+            # `grep -nF` for the literal marker, deliberately not an awk bracket
+            # class: ubuntu-latest's `awk` is mawk, which is byte-oriented, so a
+            # multibyte character inside [...] matches its individual BYTES and can
+            # fire on unrelated UTF-8. A line number plus a `sed` window has no such
+            # ambiguity.
+            line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+            if [ -n "$line" ]; then
+              msg="$(sed -n "${line},$((line + 5))p" "$log" \
+                      | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
+                      | tr '\n' ' ' \
+                      | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' \
+                      | cut -c1-600)"
+            fi
           fi
+
+          # Never post an empty message: the classifier treats a null or a roll-up as
+          # `unknown` on purpose, and an empty string would look like a measured
+          # "no reason" rather than a missing capture.
+          if [ -z "$msg" ]; then
+            msg="prepare failed with no CLI failure line captured (see run log)"
+          fi
+
+          # jq builds the payload. The hand-rolled JSON this replaces only ever
+          # carried fixed strings; an error line with a quote, a backslash or a
+          # newline in it would have produced a malformed body and a silent 400.
+          payload="$(jq -nc \
+            --arg id "$on_id" --arg src "$DATASET_ID" --arg msg "$msg" --arg url "$RUN_URL" \
+            '{dataset_id:$id, source:"openneuro", source_id:$src, stage:"prepare", status:"failed", error_message:$msg, workflow_run_url:$url}')"
+
+          echo "reporting prepare failure for $on_id: $msg"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "$payload" \
+            || echo "::warning::prepare-failure callback failed for $on_id (non-fatal; report job backstops)"
       # Import-state tracking (#754). The `preparing` row is seeded server-side
       # by /admin/datasets/import; here we record the copy transition. All
       # callbacks are best-effort -- the scheduled sweep + report job are the
@@ -200,7 +255,51 @@ jobs:
           DATASET_ID: ${{ matrix.dataset_id }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: nemar admin import-openneuro "$DATASET_ID" --phase copy --shard "${{ matrix.shard }}/${{ env.SHARDS }}" --trust-upstream
+        # Tee'd for the failure reporter below, per shard: a shard's own log is the
+        # only place its error appears, and `report` runs in a different job with a
+        # different filesystem.
+        run: |
+          set -o pipefail
+          nemar admin import-openneuro "$DATASET_ID" --phase copy --shard "${{ matrix.shard }}/${{ env.SHARDS }}" --trust-upstream 2>&1 \
+            | tee "/tmp/copy-${DATASET_ID}-${{ matrix.shard }}.log"
+      # Same shape as prepare's reporter above, and deliberately repeated rather
+      # than factored out: this file is deployed by copying it whole into
+      # nemarDatasets/.github, so a composite action would add a second file that
+      # has to be copied in step with it.
+      #
+      # Copy is sharded, so several shards can fail for one dataset and each reports
+      # its own line. The backend keeps the most recent specific message; between two
+      # specific ones there is no principled winner, and either names a real fault.
+      - name: Report copy failure
+        if: failure()
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          log="/tmp/copy-${DATASET_ID}-${{ matrix.shard }}.log"
+          on_id="on${DATASET_ID#ds}"
+          msg=""
+          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+          if [ -n "$line" ]; then
+            msg="$(sed -n "${line},$((line + 5))p" "$log" \
+                    | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
+                    | tr '\n' ' ' \
+                    | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' \
+                    | cut -c1-600)"
+          fi
+          if [ -z "$msg" ]; then
+            msg="copy failed with no CLI failure line captured (see run log)"
+          fi
+          payload="$(jq -nc \
+            --arg id "$on_id" --arg src "$DATASET_ID" --arg msg "$msg" --arg url "$RUN_URL" \
+            '{dataset_id:$id, source:"openneuro", source_id:$src, stage:"copy", status:"failed", error_message:$msg, workflow_run_url:$url}')"
+          echo "reporting copy failure for $on_id: $msg"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "$payload" \
+            || echo "::warning::copy-failure callback failed for $on_id (non-fatal; report job backstops)"
 
   finalize:
     needs: [parse-ids, copy]
@@ -249,7 +348,44 @@ jobs:
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: nemar admin import-openneuro "$DATASET_ID" --phase finalize --trust-upstream
+        run: |
+          set -o pipefail
+          nemar admin import-openneuro "$DATASET_ID" --phase finalize --trust-upstream 2>&1 \
+            | tee "/tmp/finalize-${DATASET_ID}.log"
+      # Same shape as prepare's reporter above, and deliberately repeated rather
+      # than factored out: this file is deployed by copying it whole into
+      # nemarDatasets/.github, so a composite action would add a second file that
+      # has to be copied in step with it.
+      - name: Report finalize failure
+        if: failure()
+        env:
+          DATASET_ID: ${{ matrix.dataset_id }}
+          NEMAR_WEBHOOK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          log="/tmp/finalize-${DATASET_ID}.log"
+          on_id="on${DATASET_ID#ds}"
+          msg=""
+          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+          if [ -n "$line" ]; then
+            msg="$(sed -n "${line},$((line + 5))p" "$log" \
+                    | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
+                    | tr '\n' ' ' \
+                    | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' \
+                    | cut -c1-600)"
+          fi
+          if [ -z "$msg" ]; then
+            msg="finalize failed with no CLI failure line captured (see run log)"
+          fi
+          payload="$(jq -nc \
+            --arg id "$on_id" --arg src "$DATASET_ID" --arg msg "$msg" --arg url "$RUN_URL" \
+            '{dataset_id:$id, source:"openneuro", source_id:$src, stage:"finalize", status:"failed", error_message:$msg, workflow_run_url:$url}')"
+          echo "reporting finalize failure for $on_id: $msg"
+          curl -fsS -X POST "https://api.nemar.org/webhooks/import-state" \
+            -H "X-Webhook-Token: $NEMAR_WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+            -d "$payload" \
+            || echo "::warning::finalize-failure callback failed for $on_id (non-fatal; report job backstops)"
       - name: Mark import complete
         if: success()
         env:
