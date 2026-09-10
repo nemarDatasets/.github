@@ -153,6 +153,10 @@ jobs:
           set -uo pipefail
           log="/tmp/prepare-${DATASET_ID}.log"
           on_id="on${DATASET_ID#ds}"
+          # Initialised because this step runs under `set -u` and the branch below can
+          # leave it unset; the copy and finalize reporters already do this. Without it
+          # the `[ -z "$msg" ]` fallback test itself died with `msg: unbound variable`.
+          msg=""
 
           # The upstream case keeps its own deliberate wording: the marker is the
           # classifier's signal for `upstream_inaccessible` and the sentence tells
@@ -176,7 +180,15 @@ jobs:
             # multibyte character inside [...] matches its individual BYTES and can
             # fire on unrelated UTF-8. A line number plus a `sed` window has no such
             # ambiguity.
-            line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+            # `|| true` is load-bearing, not defensive noise. Actions runs a `run:`
+            # step under `bash -e {0}`, and this step adds `pipefail`, so when the log
+            # holds no marker `grep` exits 1, pipefail promotes it to the pipeline's
+            # status, and `-e` kills the step AT THIS ASSIGNMENT. The fallback below
+            # was then unreachable for exactly the failures it exists for: an OOM, a
+            # runner eviction, a cancellation, or a failure so early the log was never
+            # written. Nothing was posted at all, and the roll-up this whole change
+            # replaced is what landed.
+            line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1 || true)"
             if [ -n "$line" ]; then
               msg="$(sed -n "${line},$((line + 5))p" "$log" \
                       | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
@@ -281,7 +293,9 @@ jobs:
           log="/tmp/copy-${DATASET_ID}-${{ matrix.shard }}.log"
           on_id="on${DATASET_ID#ds}"
           msg=""
-          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+          # `|| true`: see the prepare reporter. Under `bash -e` plus pipefail, a log
+          # with no marker makes grep exit 1 and kills the step before the fallback.
+          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1 || true)"
           if [ -n "$line" ]; then
             msg="$(sed -n "${line},$((line + 5))p" "$log" \
                     | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
@@ -367,7 +381,9 @@ jobs:
           log="/tmp/finalize-${DATASET_ID}.log"
           on_id="on${DATASET_ID#ds}"
           msg=""
-          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+          # `|| true`: see the prepare reporter. Under `bash -e` plus pipefail, a log
+          # with no marker makes grep exit 1 and kills the step before the fallback.
+          line="$(grep -nF '✖' "$log" 2>/dev/null | tail -n 1 | cut -d: -f1 || true)"
           if [ -n "$line" ]; then
             msg="$(sed -n "${line},$((line + 5))p" "$log" \
                     | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/✖//g' \
