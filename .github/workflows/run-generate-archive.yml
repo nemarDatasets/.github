@@ -43,6 +43,14 @@ on:
         required: false
         type: string
         default: "https://api.nemar.org/webhooks/archive-ready"
+      total_bytes:
+        description: "Known total dataset bytes (#1514; optional, manual recovery/testing)"
+        required: false
+        type: string
+      total_files:
+        description: "Known total file count (#1514; optional, manual recovery/testing)"
+        required: false
+        type: string
 
 # Dedupe concurrent dispatches for the same (dataset, version). cancel-in-progress
 # false so a duplicate doesn't kill an in-flight build mid-multipart (the partial
@@ -52,10 +60,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Preflight (#752): datasets over the size/file-count policy skip the zip build
-  # entirely and steer users to the range-resumable per-file direct download.
-  # Runs before the expensive checkout/stream job so an oversized set never spins
-  # up a build that can't finish. Mirrors backend archive-policy.ts.
+  # Preflight (#752, hardened #1514): datasets over the size/file-count policy
+  # skip the zip build entirely and steer users to the range-resumable
+  # per-file direct download. Runs before the expensive checkout/stream job so
+  # an oversized set never spins up a build that can't finish. Mirrors backend
+  # archive-policy.ts.
+  #
+  # #1514 (nm000284): the version manifest this used to be the ONLY source for
+  # is served only for a PUBLISHED, PUBLIC version (loadPublishedDataset), so
+  # it 404s for a private dataset, an anonymous deposit before release, or a
+  # version whose dataset_versions row hasn't landed yet -- exactly the window
+  # nm000284's v1.0.0 and v1.0.1 dispatches landed in, and the preflight's old
+  # single fail-open let a 512 GiB dataset through both times. Each step below
+  # tries ONE source and writes bytes/files outputs on success (never failing
+  # the job on its own miss, so the next tier gets a turn); the last step
+  # (`archive-size-check.sh`) merges whichever tiers resolved, applies the
+  # policy, and POSTs the skip callback -- unit-tested locally, see the PR:
+  #   1. the manifest (unchanged, still the fast/common path once published)
+  #   2. client_payload.total_bytes/total_files, sent by the Worker's
+  #      dispatcher when it already knows the row's declared size (absent
+  #      from an older backend, or from run-version-doi.yml's own dispatch,
+  #      which has no such numbers to send)
+  #   3. a same-job derivation: clone the dataset repo (a plain `git clone`
+  #      never fetches git-annex content -- it lives out-of-band, referenced
+  #      by symlinks/pointer files -- so this is cheap even for a 500 GB
+  #      dataset) and run the SAME manifest emitter the publish pipeline uses
+  #      (scripts/emit_manifest.py), reusing tested code rather than a second
+  #      hand-rolled annex-key parser
+  #   4. ADR 0012's fail-open, now the last resort instead of the only rule.
   preflight:
     name: Archive size preflight
     runs-on: ubuntu-latest
@@ -66,75 +98,112 @@ jobs:
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
-      - name: Check archive size policy
-        id: check
-        env:
-          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
+      - name: Validate inputs
         run: |
           set -euo pipefail
           if [ -z "$DATASET_ID" ] || [ -z "$VERSION" ]; then
             echo "::error::Missing dataset_id/version"
             exit 1
           fi
-          # Mirror backend services/archive-policy.ts (ARCHIVE_MAX_BYTES = 100 GiB,
-          # ARCHIVE_MAX_FILES = 200000). Keep these in lockstep with that module.
-          MAX_BYTES=$((100 * 1024 * 1024 * 1024))
-          MAX_FILES=200000
-          MANIFEST_URL="https://data.nemar.org/${DATASET_ID}/v${VERSION}/manifest.json"
-          # Fail OPEN: if the manifest can't be read, build anyway (the 60-min cap
-          # is the backstop) rather than skip every archive on a transient blip.
-          # ::error:: (not warning) so a transient 404 that lets a doomed build
-          # through is VISIBLE in the run, even though the job itself succeeds.
-          if ! curl -fsS --connect-timeout 10 --max-time 120 "$MANIFEST_URL" -o /tmp/manifest.json; then
-            echo "::error::manifest unavailable at $MANIFEST_URL; proceeding to build (size guard skipped)"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+
+      - name: Checkout .github (for scripts/archive-size-check.sh)
+        uses: actions/checkout@v4
+
+      # Tier 1: the version manifest. Never fails the job -- a 404 or a
+      # malformed body just leaves `bytes` unset so the next tier is tried.
+      - name: Try the version manifest
+        id: manifest
+        run: |
+          set +e
+          if curl -fsS --connect-timeout 10 --max-time 120 \
+               "https://data.nemar.org/${DATASET_ID}/v${VERSION}/manifest.json" \
+               -o /tmp/archive-preflight-manifest.json; then
+            if [ "$(jq -r 'type' /tmp/archive-preflight-manifest.json 2>/dev/null || echo invalid)" = "array" ]; then
+              BYTES=$(jq '[.[].size // 0] | add // 0' /tmp/archive-preflight-manifest.json)
+              FILES=$(jq 'length' /tmp/archive-preflight-manifest.json)
+              echo "bytes=${BYTES}" >> "$GITHUB_OUTPUT"
+              echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+              echo "manifest: ${BYTES} bytes, ${FILES} files"
+            else
+              echo "::warning::manifest is not a JSON array; trying the next size source"
+            fi
+          else
+            echo "::warning::manifest unavailable; trying the next size source"
           fi
-          # Guard the jq sums against an unexpected manifest shape: a non-array
-          # would make `length`/`.[].size` silently yield 0 -> under-threshold ->
-          # the very build we meant to skip. Fail OPEN + visibly instead.
-          if [ "$(jq -r 'type' /tmp/manifest.json 2>/dev/null || echo invalid)" != "array" ]; then
-            echo "::error::manifest is not a JSON array; proceeding to build (size guard skipped)"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          BYTES=$(jq '[.[].size // 0] | add // 0' /tmp/manifest.json)
-          FILES=$(jq 'length' /tmp/manifest.json)
-          echo "total: ${BYTES} bytes, ${FILES} files (limits ${MAX_BYTES} bytes / ${MAX_FILES} files)"
-          REASON=""
-          if [ "$BYTES" -gt "$MAX_BYTES" ]; then
-            GB=$(awk "BEGIN{printf \"%.1f\", ${BYTES}/1073741824}")
-            REASON="dataset ${GB} GB exceeds 100.0 GB archive limit; use direct download"
-          elif [ "$FILES" -gt "$MAX_FILES" ]; then
-            REASON="dataset ${FILES} files exceeds ${MAX_FILES} archive limit; use direct download"
-          fi
-          if [ -z "$REASON" ]; then
-            echo "Under archive limits; building zip."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "::notice::Skipping archive build: ${REASON}"
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-          if [ -z "$CALLBACK_TOKEN" ]; then
-            echo "::warning::NEMAR_WEBHOOK_TOKEN unset; cannot record skipped state"
-            exit 0
-          fi
-          jq -nc --arg id "$DATASET_ID" --arg v "$VERSION" --arg r "$REASON" \
-            '{dataset_id:$id,status:"skipped",version:$v,reason:$r}' > /tmp/skip.json
-          HTTP=$(curl -sS -o /tmp/skip-resp.json -w "%{http_code}" --connect-timeout 10 --max-time 30 \
-            -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
-            -H "X-Webhook-Token: $CALLBACK_TOKEN" -d @/tmp/skip.json) || HTTP=0
-          echo "skip callback HTTP ${HTTP}: $(cat /tmp/skip-resp.json 2>/dev/null || true)"
-          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
-            # FAIL the job (don't exit 0): if we skip the build but never record
-            # archive_skip_reason, the dataset is a silent dead-end (NULL status +
-            # NULL reason = "missing archive" forever). A red preflight is visible
-            # and re-runnable; the gated archive job is skipped on a failed dep, so
-            # there's no doomed build. Re-run is idempotent (re-skips, re-POSTs).
-            echo "::error::skip callback failed (HTTP ${HTTP}); failing so archive_skip_reason is not silently dropped"
-            exit 1
-          fi
+          exit 0
+
+      # Tier 3's derivation. Only attempted when tier 1 came up empty; tier 2
+      # (the dispatch payload) is checked entirely inside archive-size-check.sh
+      # since it needs no separate step. Every step here is best-effort
+      # (continue-on-error / internal `|| true`): a failure just leaves
+      # `bytes` unset, which falls through to tier 4 in the final check.
+      - name: Mint per-repo App token for derivation
+        id: derive-token
+        if: steps.manifest.outputs.bytes == ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+
+      - name: Set up Python
+        if: steps.manifest.outputs.bytes == '' && steps.derive-token.outcome == 'success'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Clone dataset repo at tag (no annex content fetched)
+        id: clone
+        if: steps.manifest.outputs.bytes == '' && steps.derive-token.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.derive-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/archive-preflight-repo
+          git clone --quiet --depth 1 --branch "v${VERSION}" --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/nemarDatasets/${DATASET_ID}.git" \
+            /tmp/archive-preflight-repo
+
+      - name: Derive totals from the git tree
+        id: derive
+        if: steps.clone.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/archive-preflight-derive
+          python scripts/emit_manifest.py \
+            --dataset-id "$DATASET_ID" --version "$VERSION" \
+            --repo-dir /tmp/archive-preflight-repo \
+            --out-dir /tmp/archive-preflight-derive \
+            --no-verify-canary
+          BYTES=$(jq '.bytes' /tmp/archive-preflight-derive/totals.json)
+          FILES=$(jq '.files' /tmp/archive-preflight-derive/totals.json)
+          echo "bytes=${BYTES}" >> "$GITHUB_OUTPUT"
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+          echo "derived: ${BYTES} bytes, ${FILES} files"
+
+      # Always runs: picks the first tier that produced a number (manifest ->
+      # dispatch payload -> derivation), applies the policy, and POSTs the
+      # skip callback exactly as before #1514. All the fetching already
+      # happened in the steps above; this one only merges and decides, which
+      # is what makes it the part unit-tested locally (see the PR: three
+      # sample runs of this exact script, manifest-present / payload-present /
+      # everything-absent).
+      - name: Check archive size policy
+        id: check
+        env:
+          CALLBACK_TOKEN: ${{ secrets.NEMAR_WEBHOOK_TOKEN }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
+          MANIFEST_BYTES: ${{ steps.manifest.outputs.bytes }}
+          MANIFEST_FILES: ${{ steps.manifest.outputs.files }}
+          PAYLOAD_TOTAL_BYTES: ${{ github.event.client_payload.total_bytes || inputs.total_bytes }}
+          PAYLOAD_TOTAL_FILES: ${{ github.event.client_payload.total_files || inputs.total_files }}
+          DERIVED_BYTES: ${{ steps.derive.outputs.bytes }}
+          DERIVED_FILES: ${{ steps.derive.outputs.files }}
+        run: bash .github/scripts/archive-size-check.sh
 
   archive:
     name: Generate Dataset Archive
