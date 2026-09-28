@@ -203,7 +203,7 @@ jobs:
           PAYLOAD_TOTAL_FILES: ${{ github.event.client_payload.total_files || inputs.total_files }}
           DERIVED_BYTES: ${{ steps.derive.outputs.bytes }}
           DERIVED_FILES: ${{ steps.derive.outputs.files }}
-        run: bash .github/scripts/archive-size-check.sh
+        run: bash scripts/archive-size-check.sh
 
   archive:
     name: Generate Dataset Archive
