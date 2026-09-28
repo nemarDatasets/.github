@@ -522,7 +522,14 @@ jobs:
             });
 
             var s3 = new S3Client({ region: REGION });
-            var s3Key = DATASET_ID + "/archives/v" + VERSION + ".zip";
+            // #1491: the file name in a presigned download URL's path is the
+            // browser's Save-As name, so putting the dataset id in the key's
+            // file name (not just its directory) is what makes a download
+            // named "<id>_v<version>.zip" instead of the pre-#1491 bare
+            // "v<version>.zip". Must match archiveKey() in
+            // nemarOrg/nemar-cli backend/src/services/s3.ts exactly -- that
+            // is what readers look for first.
+            var s3Key = DATASET_ID + "/archives/" + DATASET_ID + "_v" + VERSION + ".zip";
 
             var upload = new Upload({
               client: s3,
@@ -531,6 +538,14 @@ jobs:
                 Key: s3Key,
                 Body: passThrough,
                 ContentType: "application/zip",
+                // #1518 backstop: tag every archive object so a bucket
+                // lifecycle rule can expire noncurrent archive versions even
+                // if the cleanup step below never runs (a cancelled job, a
+                // crashed runner). The going-forward cleanup step is the
+                // primary mechanism; this tag is what the lifecycle rule
+                // filters on since "<id>/archives/" isn't a single prefix
+                // the bucket-wide rule can match.
+                Tagging: "nemar-kind=archive",
               },
               // 6 parts in flight x 100 MB = ~600 MB buffered, comfortably under
               // the runner's memory; modestly faster than 4 for sub-threshold sets
@@ -756,7 +771,12 @@ jobs:
           # this is defense-in-depth. Use `force=true` (workflow_dispatch) to
           # rebuild over a partial/corrupt archive.
           FORCE="${{ github.event.client_payload.force || inputs.force || 'false' }}"
-          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          # #1491: new key includes the dataset id in the file name. Writers
+          # only ever write this name -- no old-name fallback here, that
+          # exists solely on the read side (nemarOrg/nemar-cli
+          # services/s3.ts resolveArchiveKey) during the rename sweep's
+          # transition window.
+          KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
           if [ "$FORCE" = "true" ]; then
             echo "force=true -- rebuilding archive regardless of existing object."
           else
@@ -822,7 +842,7 @@ jobs:
             echo "No callback URL configured; skipping callback POST"
             exit 0
           fi
-          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
           # The zip is present (just uploaded, or already existed on the
           # idempotent skip path). Read its size for datasets.archive_size; a
           # HEAD failure just omits the size (the Worker tolerates a null size).
@@ -871,6 +891,87 @@ jobs:
             exit 1
           fi
           echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS, size=${SIZE:-unknown})"
+
+      # nemarOrg/nemar-cli#1518: only the latest version keeps a retained
+      # archive. Runs here (in the workflow), not in the backend webhook,
+      # because this job already holds the AWS credentials the upload used
+      # and because the Worker's per-invocation S3 subrequest budget
+      # (services/s3.ts's applyObjectLockBatch documents the same Cloudflare
+      # Workers cap) is the wrong place to run an unbounded
+      # list-object-versions + delete-objects pair -- a dataset with many
+      # historical rebuilds could blow that budget inside a webhook call
+      # that also has to answer the workflow's HTTP request. Gated on the
+      # PREVIOUS step's own success (not just `success()`, which is also
+      # true before this step runs) so cleanup only ever follows a
+      # CONFIRMED-complete new zip and a D1 row that already reflects it --
+      # never delete the only-known-good archive because of a step ordering
+      # assumption. Idempotent: it lists the CURRENT state of
+      # `<id>/archives/` every time and deletes whatever is not the just-
+      # uploaded key's current version, so a re-run (retry, or a second
+      # dispatch that landed after this one) finds nothing left to remove.
+      - name: Clean up older archive versions (#1518)
+        if: steps.post-success.outcome == 'success'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          KEEP_KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
+          PREFIX="${DATASET_ID}/archives/"
+          echo "Cleaning up ${PREFIX} -- keeping only the current version of ${KEEP_KEY}"
+
+          aws s3api list-object-versions --bucket nemar --prefix "$PREFIX" \
+            --output json > /tmp/archive-versions.json
+
+          # Never touch anything outside <id>/archives/: list-object-versions
+          # is already prefix-scoped above, and this guard fails loudly if a
+          # future edit widens the prefix by mistake rather than silently
+          # deleting the wrong dataset's objects.
+          OUT_OF_SCOPE=$(jq --arg p "$PREFIX" \
+            '[(.Versions // []), (.DeleteMarkers // [])] | flatten | map(select(.Key | startswith($p) | not)) | length' \
+            /tmp/archive-versions.json)
+          if [ "$OUT_OF_SCOPE" != "0" ]; then
+            echo "::error::list-object-versions returned $OUT_OF_SCOPE key(s) outside $PREFIX; refusing to delete anything"
+            exit 1
+          fi
+
+          # Delete every (key, versionId): older-version zips, noncurrent
+          # versions of the just-uploaded key from a prior rebuild, and any
+          # delete marker -- everything except the CURRENT version of
+          # KEEP_KEY. Chunked at 1000 objects per call (S3's Multi-Object
+          # Delete limit); in practice one dataset's archives/ prefix holds a
+          # handful of objects at most.
+          jq -c --arg keep "$KEEP_KEY" \
+            '[(.Versions // [])[] | select(.Key != $keep or .IsLatest != true) | {Key, VersionId}]
+             + [(.DeleteMarkers // [])[] | {Key, VersionId}]' \
+            /tmp/archive-versions.json > /tmp/archive-to-delete.json
+
+          COUNT=$(jq 'length' /tmp/archive-to-delete.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nothing to clean up under ${PREFIX} (already retention-clean)."
+            exit 0
+          fi
+          echo "Deleting ${COUNT} object version(s):"
+          jq -r '.[] | "  " + .Key + "  (versionId " + .VersionId + ")"' /tmp/archive-to-delete.json
+
+          # Loop in case a dataset somehow exceeds 1000 stale versions; the
+          # common case is one batch.
+          REMAINING=$(jq -c '.' /tmp/archive-to-delete.json)
+          while [ "$(echo "$REMAINING" | jq 'length')" -gt 0 ]; do
+            echo "$REMAINING" | jq -c '{Objects: .[0:1000], Quiet: false}' > /tmp/archive-delete-batch.json
+            aws s3api delete-objects --bucket nemar --delete file:///tmp/archive-delete-batch.json \
+              --output json > /tmp/archive-delete-result.json
+            echo "delete-objects result:"
+            cat /tmp/archive-delete-result.json
+            ERR_COUNT=$(jq '.Errors // [] | length' /tmp/archive-delete-result.json)
+            if [ "$ERR_COUNT" != "0" ]; then
+              echo "::error::${ERR_COUNT} object version(s) failed to delete under ${PREFIX}"
+              exit 1
+            fi
+            REMAINING=$(echo "$REMAINING" | jq -c '.[1000:]')
+          done
+          echo "Cleanup complete: ${PREFIX} now holds only the current version of ${KEEP_KEY}."
 
       - name: POST failure callback (best-effort)
         # Only on a HARD failure (clone/install/stream crash, an incomplete
