@@ -132,14 +132,57 @@ jobs:
           fi
           exit 0
 
-      # Tier 3's derivation. Only attempted when tier 1 came up empty; tier 2
-      # (the dispatch payload) is checked entirely inside archive-size-check.sh
-      # since it needs no separate step. Every step here is best-effort
-      # (continue-on-error / internal `|| true`): a failure just leaves
-      # `bytes` unset, which falls through to tier 4 in the final check.
+      # Resolves the dispatch payload's raw total_bytes/total_files ONCE, so
+      # both the tier-3 gate below and the final decision step read the same
+      # value instead of two copies of the same fallback expression drifting.
+      # `||` is deliberately NOT used to combine the two sources: GitHub
+      # Actions expression truthiness treats 0 as falsy, so a genuinely
+      # zero-byte dataset's `client_payload.total_bytes: 0` would silently
+      # fall through to `inputs.total_bytes` (review finding #7). Bash's
+      # `${A:-B}` checks for unset-or-empty, not falsiness, and a JSON number
+      # 0 interpolates as the STRING "0", which is non-empty -- so this picks
+      # the first source that is actually PRESENT. Always runs; cheap.
+      - name: Resolve dispatch payload totals
+        id: payload-raw
+        env:
+          BYTES_EVENT: ${{ github.event.client_payload.total_bytes }}
+          BYTES_INPUT: ${{ inputs.total_bytes }}
+          FILES_EVENT: ${{ github.event.client_payload.total_files }}
+          FILES_INPUT: ${{ inputs.total_files }}
+        run: |
+          echo "total_bytes=${BYTES_EVENT:-$BYTES_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "total_files=${FILES_EVENT:-$FILES_INPUT}" >> "$GITHUB_OUTPUT"
+
+      # Tier 2 as a GATE for tier 3 (review finding #4): a cheap presence +
+      # shape check, so the derivation's git clone and Python setup are
+      # skipped whenever the dispatch payload already has something usable --
+      # without this, tier 3 ran whenever tier 1 (the manifest) was empty,
+      # which is the common case for exactly the private/pre-row datasets
+      # tier 2 exists to cover, making "tier 2 is the cheap path" false in
+      # practice. Mirrors is_uint() in archive-size-check.sh, which
+      # re-validates independently regardless -- drift here only costs an
+      # unnecessary (or wrongly skipped) derivation, never a wrong verdict.
+      - name: Check whether the dispatch payload already has a usable size
+        id: payload
+        if: steps.manifest.outputs.bytes == ''
+        env:
+          PAYLOAD_TOTAL_BYTES: ${{ steps.payload-raw.outputs.total_bytes }}
+        run: |
+          case "$PAYLOAD_TOTAL_BYTES" in
+            '' | *[!0-9]*) exit 0 ;;
+          esac
+          if [ "${#PAYLOAD_TOTAL_BYTES}" -le 18 ]; then
+            echo "bytes=${PAYLOAD_TOTAL_BYTES}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Tier 3's derivation. Only attempted when BOTH tier 1 (the manifest)
+      # and tier 2 (the dispatch payload) came up empty. Every step here is
+      # best-effort (continue-on-error / internal `|| true`): a failure just
+      # leaves `bytes` unset, which falls through to tier 4 in the final
+      # check.
       - name: Mint per-repo App token for derivation
         id: derive-token
-        if: steps.manifest.outputs.bytes == ''
+        if: steps.manifest.outputs.bytes == '' && steps.payload.outputs.bytes == ''
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -149,14 +192,14 @@ jobs:
           repositories: ${{ env.DATASET_ID }}
 
       - name: Set up Python
-        if: steps.manifest.outputs.bytes == '' && steps.derive-token.outcome == 'success'
+        if: steps.manifest.outputs.bytes == '' && steps.payload.outputs.bytes == '' && steps.derive-token.outcome == 'success'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Clone dataset repo at tag (no annex content fetched)
         id: clone
-        if: steps.manifest.outputs.bytes == '' && steps.derive-token.outcome == 'success'
+        if: steps.manifest.outputs.bytes == '' && steps.payload.outputs.bytes == '' && steps.derive-token.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.derive-token.outputs.token }}
@@ -199,8 +242,8 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || 'https://api.nemar.org/webhooks/archive-ready' }}
           MANIFEST_BYTES: ${{ steps.manifest.outputs.bytes }}
           MANIFEST_FILES: ${{ steps.manifest.outputs.files }}
-          PAYLOAD_TOTAL_BYTES: ${{ github.event.client_payload.total_bytes || inputs.total_bytes }}
-          PAYLOAD_TOTAL_FILES: ${{ github.event.client_payload.total_files || inputs.total_files }}
+          PAYLOAD_TOTAL_BYTES: ${{ steps.payload-raw.outputs.total_bytes }}
+          PAYLOAD_TOTAL_FILES: ${{ steps.payload-raw.outputs.total_files }}
           DERIVED_BYTES: ${{ steps.derive.outputs.bytes }}
           DERIVED_FILES: ${{ steps.derive.outputs.files }}
         run: bash scripts/archive-size-check.sh
