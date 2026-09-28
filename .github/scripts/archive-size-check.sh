@@ -74,6 +74,24 @@ is_uint() {
   [ "${#1}" -le 18 ]
 }
 
+# Thousands-separated form of a plain non-negative integer string, matching
+# JS's `Number.prototype.toLocaleString()` (used for the equivalent reason in
+# backend/src/services/archive-policy.ts): "214000" -> "214,000". Built with
+# plain awk string slicing rather than `printf "%'d"`, which depends on the
+# runner's locale (grouping character, or no grouping at all in "C"/"POSIX").
+thousands() {
+  awk -v n="$1" 'BEGIN {
+    len = length(n);
+    rem = len % 3;
+    if (rem == 0) rem = 3;
+    out = substr(n, 1, rem);
+    for (i = rem + 1; i <= len; i += 3) {
+      out = out "," substr(n, i, 3);
+    }
+    print out;
+  }'
+}
+
 if [ -z "${DATASET_ID:-}" ] || [ -z "${VERSION:-}" ]; then
   echo "::error::Missing dataset_id/version"
   exit 1
@@ -128,7 +146,7 @@ if [ "$BYTES" -gt "$MAX_BYTES" ]; then
   GB=$(awk "BEGIN{printf \"%.1f\", ${BYTES}/1073741824}")
   REASON="dataset ${GB} GB exceeds 100.0 GB archive limit; use direct download"
 elif is_uint "${FILES:-}" && [ "$FILES" -gt "$MAX_FILES" ]; then
-  REASON="dataset ${FILES} files exceeds ${MAX_FILES} archive limit; use direct download"
+  REASON="dataset $(thousands "$FILES") files exceeds $(thousands "$MAX_FILES") archive limit; use direct download"
 fi
 
 if [ -z "$REASON" ]; then
