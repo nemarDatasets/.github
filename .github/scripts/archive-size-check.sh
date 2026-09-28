@@ -53,12 +53,25 @@ set_output() {
   fi
 }
 
-# A plain non-negative integer string (no leading/trailing junk, no sign).
+# A plain non-negative integer string (no leading/trailing junk, no sign),
+# bounded at 18 digits (safely under bash's 64-bit signed integer range).
+# The bound matters, not just the digit-only check: bash's `-gt` on an
+# operand it can't represent as an integer prints "integer expected" to
+# stderr and the COMPARISON EVALUATES FALSE rather than aborting the script
+# (verified: `[ 99999999999999999999999999 -gt 100 ]` exits 1 with that
+# warning, not a hard error) -- so an unbounded digit string here would make
+# an absurdly large value silently compare as "under the limit" a few lines
+# down, the opposite of what a size GATE must do with a value it cannot
+# trust. Treated the same as any other malformed input: falls through to the
+# next tier instead of being trusted.
 is_uint() {
   case "$1" in
     '' | *[!0-9]*) return 1 ;;
-    *) return 0 ;;
   esac
+  # A digit-only length check, not a glob-count of "?" placeholders: the
+  # latter is exactly the kind of off-by-one this bound exists to avoid
+  # getting wrong in the first place.
+  [ "${#1}" -le 18 ]
 }
 
 if [ -z "${DATASET_ID:-}" ] || [ -z "${VERSION:-}" ]; then
