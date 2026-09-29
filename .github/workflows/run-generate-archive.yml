@@ -324,6 +324,20 @@ jobs:
           ref: v${{ env.VERSION }}
           token: ${{ steps.app-token.outputs.token }}
 
+      # Runs AFTER the dataset checkout above, and into its own `path:`,
+      # deliberately: that checkout targets the default workspace root with
+      # no `path:` of its own, and actions/checkout's clean step is scoped
+      # to whatever directory it is checking out into. Checking out .github
+      # first at a subdirectory and the dataset repo second (at the
+      # workspace root, the common ordering mistake) would let the dataset
+      # checkout's `git clean -ffdx` -- recursive from the root -- remove
+      # this subdirectory as untracked before the cleanup step below ever
+      # reads scripts/archive-cleanup-plan.sh from it.
+      - name: Checkout .github (for scripts/archive-cleanup-plan.sh)
+        uses: actions/checkout@v4
+        with:
+          path: nemar-dotgithub
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -522,7 +536,14 @@ jobs:
             });
 
             var s3 = new S3Client({ region: REGION });
-            var s3Key = DATASET_ID + "/archives/v" + VERSION + ".zip";
+            // #1491: the file name in a presigned download URL's path is the
+            // browser's Save-As name, so putting the dataset id in the key's
+            // file name (not just its directory) is what makes a download
+            // named "<id>_v<version>.zip" instead of the pre-#1491 bare
+            // "v<version>.zip". Must match archiveKey() in
+            // nemarOrg/nemar-cli backend/src/services/s3.ts exactly -- that
+            // is what readers look for first.
+            var s3Key = DATASET_ID + "/archives/" + DATASET_ID + "_v" + VERSION + ".zip";
 
             var upload = new Upload({
               client: s3,
@@ -531,6 +552,11 @@ jobs:
                 Key: s3Key,
                 Body: passThrough,
                 ContentType: "application/zip",
+                // #1518: NOT tagged here. nemar-actions-datasets' policy
+                // grants PutObject but not PutObjectTagging, so a Tagging
+                // param on the upload itself would 403 every build. Tagging
+                // happens in its own best-effort step below, after the
+                // upload has already succeeded.
               },
               // 6 parts in flight x 100 MB = ~600 MB buffered, comfortably under
               // the runner's memory; modestly faster than 4 for sub-threshold sets
@@ -756,7 +782,12 @@ jobs:
           # this is defense-in-depth. Use `force=true` (workflow_dispatch) to
           # rebuild over a partial/corrupt archive.
           FORCE="${{ github.event.client_payload.force || inputs.force || 'false' }}"
-          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          # #1491: new key includes the dataset id in the file name. Writers
+          # only ever write this name -- no old-name fallback here, that
+          # exists solely on the read side (nemarOrg/nemar-cli
+          # services/s3.ts resolveArchiveKey) during the rename sweep's
+          # transition window.
+          KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
           if [ "$FORCE" = "true" ]; then
             echo "force=true -- rebuilding archive regardless of existing object."
           else
@@ -802,6 +833,35 @@ jobs:
             exit "$rc"
           fi
 
+      # #1518 backstop, separate from the upload step: nemar-actions-datasets'
+      # current IAM policy grants s3:PutObject but not s3:PutObjectTagging, so
+      # tagging cannot happen inline in the Upload call (that would 403 every
+      # build). Best-effort and non-fatal: a failure here means the lifecycle
+      # rule's noncurrent-version-expiration backstop will not cover this
+      # object until the lead applies s3:PutObjectTagging (see the policy
+      # JSON in this PR's description) and a later rebuild retags it. It does
+      # NOT affect the per-build cleanup step below, which deletes by version
+      # id directly and does not depend on tags.
+      - name: Tag archive object for lifecycle (#1518, best-effort)
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
+          set +e
+          TAG_OUT=$(aws s3api put-object-tagging --bucket nemar --key "$KEY" \
+            --tagging '{"TagSet":[{"Key":"nemar-kind","Value":"archive"}]}' 2>&1)
+          TAG_RC=$?
+          set -e
+          if [ "$TAG_RC" -ne 0 ]; then
+            echo "::warning::could not tag $KEY with nemar-kind=archive ($TAG_OUT); the lifecycle backstop will not cover this object until the lead applies s3:PutObjectTagging."
+          else
+            echo "Tagged $KEY with nemar-kind=archive."
+          fi
+
       # Mirror of run-generate-zarr.yml's zarr-ready callback. Records the
       # latest-only archive state on the dataset's D1 row so the observability
       # dashboard (dashboard.nemar.org/observability) reports archive coverage
@@ -822,7 +882,7 @@ jobs:
             echo "No callback URL configured; skipping callback POST"
             exit 0
           fi
-          KEY="${DATASET_ID}/archives/v${VERSION}.zip"
+          KEY="${DATASET_ID}/archives/${DATASET_ID}_v${VERSION}.zip"
           # The zip is present (just uploaded, or already existed on the
           # idempotent skip path). Read its size for datasets.archive_size; a
           # HEAD failure just omits the size (the Worker tolerates a null size).
@@ -871,6 +931,161 @@ jobs:
             exit 1
           fi
           echo "Callback POSTed to $CALLBACK_URL (HTTP $HTTP_STATUS, size=${SIZE:-unknown})"
+
+      # nemarOrg/nemar-cli#1518: only the latest version keeps a retained
+      # archive. Runs here (in the workflow), not in the backend webhook,
+      # because this job already holds the AWS credentials the upload used
+      # and because the Worker's per-invocation S3 subrequest budget
+      # (services/s3.ts's applyObjectLockBatch documents the same Cloudflare
+      # Workers cap) is the wrong place to run an unbounded
+      # list-object-versions + delete-objects pair -- a dataset with many
+      # historical rebuilds could blow that budget inside a webhook call
+      # that also has to answer the workflow's HTTP request. Gated on the
+      # PREVIOUS step's own success (not just `success()`, which is also
+      # true before this step runs) so cleanup only ever follows a
+      # CONFIRMED-complete new zip and a D1 row that already reflects it --
+      # never delete the only-known-good archive because of a step ordering
+      # assumption.
+      #
+      # PR review finding (data loss, reproduced): the earlier version of
+      # this step kept only the exact key `<id>/archives/<id>_v$VERSION.zip`
+      # and deleted everything else under the prefix. `concurrency` here is
+      # per (dataset_id, version), so two versions of the SAME dataset can
+      # finish in either order -- a retry or manual re-dispatch of an OLDER
+      # version completing AFTER a newer one would have deleted the real
+      # latest archive, and so would a legacy-named (pre-#1491) archive for
+      # a version newer than the one just built. Fixed by comparing the
+      # SEMANTIC VERSION parsed from each key's file name against $VERSION,
+      # not by string-equality against one canonical key:
+      #   - version < $VERSION (strictly): always deleted (a superseded
+      #     build, whatever its name or current/noncurrent state).
+      #   - version == $VERSION: every entry is deleted EXCEPT the one
+      #     current, new-name Version entry -- that is the single object
+      #     this run is allowed to keep. This covers noncurrent versions and
+      #     delete markers of both the new and legacy names for this exact
+      #     version, and the legacy-name object for this exact version once
+      #     the new-name object's presence as the current version is
+      #     confirmed by this same listing (see archive-cleanup-plan.sh's
+      #     abort guard below -- if that object is not found, NOTHING is
+      #     deleted and the step fails loudly rather than guess).
+      #   - version > $VERSION (strictly): NEVER touched. This is what
+      #     protects a genuinely newer archive (new- or legacy-named) from
+      #     an out-of-order or retried older build's cleanup; the residual
+      #     cost is that such an archive is only actually cleaned up the
+      #     next time ITS OWN version's build runs, not by this one.
+      #   - a key whose file name does not parse as either shape: reported
+      #     (a ::warning::) and left untouched, never deleted.
+      #
+      # PR review finding (permissions, verified against the deployed IAM
+      # policy for nemar-actions-datasets): that identity has no
+      # s3:ListBucketVersions or s3:DeleteObjectVersion. Both AWS calls below
+      # degrade to a non-fatal ::warning:: + exit 0 on Access Denied, so a
+      # dataset simply keeps its older archives until the lead applies the
+      # policy in this PR's description -- it must never fail the job (the
+      # zip itself is already uploaded and correct).
+      #
+      # Idempotent: it lists the CURRENT state of `<id>/archives/` every
+      # time and recomputes the same plan from that snapshot, so a re-run
+      # (retry, or a second dispatch landing after this one) either finds
+      # nothing left to remove or reaches the same answer again.
+      #
+      # PR review (#122 round 2): the selection logic above is the
+      # highest-risk code in this change, so it is no longer inline here --
+      # it lives in scripts/archive-cleanup-plan.sh (checked out above into
+      # nemar-dotgithub/, since this job's only other checkout overwrites
+      # the default workspace with the target DATASET repo) where
+      # scripts/test_archive_cleanup_plan.py exercises it directly, with no
+      # AWS calls, in CI. This step still makes every AWS call itself
+      # (list-object-versions, delete-objects); the script only decides,
+      # from an already-fetched listing, what to delete, and classifies
+      # AccessDenied.
+      - name: Clean up older archive versions (#1518)
+        if: steps.post-success.outcome == 'success'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          PLAN_SCRIPT="${GITHUB_WORKSPACE}/nemar-dotgithub/scripts/archive-cleanup-plan.sh"
+          PREFIX="${DATASET_ID}/archives/"
+          NEW_NAME="${DATASET_ID}_v${VERSION}.zip"
+          echo "Cleaning up ${PREFIX} for dispatched version ${VERSION} (keeping only the current ${NEW_NAME})"
+
+          set +e
+          LIST_OUT=$(aws s3api list-object-versions --bucket nemar --prefix "$PREFIX" --output json 2>&1)
+          LIST_RC=$?
+          set -e
+          if [ "$LIST_RC" -ne 0 ]; then
+            if echo "$LIST_OUT" | bash "$PLAN_SCRIPT" is-access-denied; then
+              echo "::warning::list-object-versions denied for ${PREFIX} (missing s3:ListBucketVersions?); skipping cleanup until the lead applies the IAM policy in this PR's description."
+              exit 0
+            fi
+            echo "::error::list-object-versions failed for ${PREFIX}: ${LIST_OUT}"
+            exit 1
+          fi
+          echo "$LIST_OUT" > /tmp/archive-versions.json
+
+          # Plan the cleanup from the listing: archive-cleanup-plan.sh parses
+          # each key's file name (new "<id>_v<ver>.zip" or legacy
+          # "v<ver>.zip"), compares its version against the dispatched
+          # $VERSION with a numeric (not lexical) semver comparison, and
+          # classifies. See the step comment above for the exact rule per
+          # bucket. It also owns the out-of-scope guard (any key outside
+          # $PREFIX) and the abort guard (the current new-name object at
+          # $VERSION not found); either failure exits 1 with its own
+          # ::error:: already on stderr, and prints one ::warning:: per
+          # unparseable key it left untouched -- nothing to delete anything
+          # in that case, so this step just has to stop.
+          set +e
+          DELETE_LIST=$(bash "$PLAN_SCRIPT" plan /tmp/archive-versions.json)
+          PLAN_RC=$?
+          set -e
+          if [ "$PLAN_RC" -ne 0 ]; then
+            exit 1
+          fi
+          echo "$DELETE_LIST" > /tmp/archive-to-delete.json
+
+          COUNT=$(jq 'length' /tmp/archive-to-delete.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nothing to clean up under ${PREFIX} (already retention-clean)."
+            exit 0
+          fi
+          echo "Deleting ${COUNT} object version(s):"
+          jq -r '.[] | "  " + .Key + "  (versionId " + .VersionId + ")"' /tmp/archive-to-delete.json
+
+          # Loop in case a dataset somehow exceeds 1000 stale versions; the
+          # common case is one batch.
+          REMAINING=$(jq -c '.' /tmp/archive-to-delete.json)
+          while [ "$(echo "$REMAINING" | jq 'length')" -gt 0 ]; do
+            echo "$REMAINING" | jq -c '{Objects: .[0:1000], Quiet: false}' > /tmp/archive-delete-batch.json
+            set +e
+            DEL_OUT=$(aws s3api delete-objects --bucket nemar --delete file:///tmp/archive-delete-batch.json --output json 2>&1)
+            DEL_RC=$?
+            set -e
+            if [ "$DEL_RC" -ne 0 ]; then
+              if echo "$DEL_OUT" | bash "$PLAN_SCRIPT" is-access-denied; then
+                echo "::warning::delete-objects denied for ${PREFIX} (missing s3:DeleteObjectVersion?); leaving old archive versions in place until the lead applies the IAM policy in this PR's description."
+                exit 0
+              fi
+              echo "::error::delete-objects failed for ${PREFIX}: ${DEL_OUT}"
+              exit 1
+            fi
+            echo "$DEL_OUT" > /tmp/archive-delete-result.json
+            echo "delete-objects result:"
+            cat /tmp/archive-delete-result.json
+            ERR_COUNT=$(jq '.Errors // [] | length' /tmp/archive-delete-result.json)
+            if [ "$ERR_COUNT" != "0" ]; then
+              if bash "$PLAN_SCRIPT" delete-errors-are-access-denied /tmp/archive-delete-result.json; then
+                echo "::warning::${ERR_COUNT} object version(s) denied by IAM under ${PREFIX}; leaving them in place until the lead applies the policy in this PR's description."
+                exit 0
+              fi
+              echo "::error::${ERR_COUNT} object version(s) failed to delete under ${PREFIX} (not all AccessDenied)"
+              exit 1
+            fi
+            REMAINING=$(echo "$REMAINING" | jq -c '.[1000:]')
+          done
+          echo "Cleanup complete: ${PREFIX} now holds only the current version of ${NEW_NAME} (plus any strictly newer version this run correctly left untouched)."
 
       - name: POST failure callback (best-effort)
         # Only on a HARD failure (clone/install/stream crash, an incomplete
