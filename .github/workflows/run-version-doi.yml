@@ -313,6 +313,8 @@ jobs:
       - name: Dispatch archive generation
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TOTAL_BYTES: ${{ github.event.client_payload.total_bytes }}
+          TOTAL_FILES: ${{ github.event.client_payload.total_files }}
         run: |
           set -euo pipefail
           # Phase 3 (#10): the archive workflow now lives on
@@ -324,10 +326,30 @@ jobs:
           # generate-archive.yml in the same cutover.
           echo "Triggering archive generation for $DATASET_ID v$VERSION"
 
-          gh api "repos/nemarDatasets/.github/dispatches" \
-            -f event_type=generate-archive \
-            -f "client_payload[dataset_id]=$DATASET_ID" \
+          args=(
+            -f event_type=generate-archive
+            -f "client_payload[dataset_id]=$DATASET_ID"
             -f "client_payload[version]=$VERSION"
+          )
+          # #1514: forward the row's declared size when the tag-push webhook
+          # sent one (triggerVersionDoiRun, nemarOrg/nemar-cli's
+          # routes/webhooks/github.ts), so run-generate-archive.yml's
+          # preflight has a fallback when the version manifest 404s -- the
+          # exact nm000284 incident window, where the dataset_versions row
+          # publish-doi's own webhook call writes doesn't exist yet at
+          # dispatch time. Empty for a workflow_dispatch run of THIS
+          # workflow (no such input defined here) or an older backend;
+          # added conditionally so an absent value is never sent as the
+          # literal string "". -F (not -f) sends a JSON number, matching the
+          # Worker's own dispatch shape.
+          if [ -n "$TOTAL_BYTES" ]; then
+            args+=(-F "client_payload[total_bytes]=$TOTAL_BYTES")
+          fi
+          if [ -n "$TOTAL_FILES" ]; then
+            args+=(-F "client_payload[total_files]=$TOTAL_FILES")
+          fi
+
+          gh api "repos/nemarDatasets/.github/dispatches" "${args[@]}"
 
   trigger-records:
     name: Trigger Records Generation
