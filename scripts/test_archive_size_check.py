@@ -22,7 +22,6 @@ import http.server
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -80,6 +79,7 @@ def run_script(overrides: dict[str, str], *, github_output: Path | None = None):
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,  # exit codes (0 and 1) are asserted on by the caller
     )
 
 
@@ -106,7 +106,7 @@ class CallbackServer:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802 (stdlib naming)
+            def do_POST(self):  # stdlib method name, not ours to rename
                 length = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(length) if length else b""
                 outer.requests.append(
@@ -121,8 +121,10 @@ class CallbackServer:
                 self.end_headers()
                 self.wfile.write(outer.body)
 
-            def log_message(self, *_args):  # silence stdlib access logging
-                pass
+            def log_message(self, format: str, *args: object) -> None:
+                # Silence stdlib access logging; signature must match the
+                # base class (format: str, *args: object) -> None.
+                return
 
         self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
