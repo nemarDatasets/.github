@@ -256,6 +256,42 @@ class UnderLimitTests(unittest.TestCase):
             self.assertEqual(read_output(out).get("skip"), "false")
 
 
+class LiteralZeroTests(unittest.TestCase):
+    """`is_uint` and the tier `[ -z "$BYTES" ]` "already resolved" checks
+    test for an EMPTY string, not a falsy/zero one -- a genuinely empty
+    dataset (0 bytes, 0 files) must be picked up as a real, present value
+    from whichever tier reports it, not treated the same as "absent" and
+    passed through to the next tier (NIT, #1514 review)."""
+
+    def test_manifest_zero_bytes_and_files_reports_source_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "gh_output"
+            proc = run_script(
+                {"MANIFEST_BYTES": "0", "MANIFEST_FILES": "0"},
+                github_output=out,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("source: manifest", proc.stdout)
+            self.assertIn("0 bytes, 0 files", proc.stdout)
+            self.assertIn("Under archive limits", proc.stdout)
+            self.assertEqual(read_output(out).get("skip"), "false")
+
+    def test_payload_zero_bytes_is_used_not_skipped_to_derivation(self):
+        # No MANIFEST_BYTES, so tier 1 is empty; PAYLOAD_TOTAL_BYTES=0 must
+        # be treated as a resolved (zero) value from tier 2, not as absent
+        # -- which would otherwise fall through to tier 3's derivation.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "gh_output"
+            proc = run_script(
+                {"PAYLOAD_TOTAL_BYTES": "0", "DERIVED_BYTES": "999999999999"},
+                github_output=out,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("source: dispatch payload", proc.stdout)
+            self.assertNotIn("source: annex-key derivation", proc.stdout)
+            self.assertEqual(read_output(out).get("skip"), "false")
+
+
 class MalformedPayloadFallthroughTests(unittest.TestCase):
     """A malformed (non-digit) payload value must warn and fall through to
     the next tier rather than being trusted or aborting the script."""
