@@ -84,6 +84,18 @@ jobs:
       AWS_DEFAULT_REGION: us-east-2
       S3_BUCKET: nemar
     steps:
+      # CALLBACK_TOKEN (above) comes from client_payload, not `secrets.*`, so
+      # Actions has no reason to know it's sensitive and won't redact it from
+      # logs on its own -- unlike a `secrets.NEMAR_WEBHOOK_TOKEN` reference,
+      # which is masked automatically. Register the mask before any later
+      # step gets a chance to print it (a failure handler did exactly that in
+      # a public log, one-shot token, low but real exposure).
+      - name: Mask the callback token
+        run: |
+          if [ -n "${CALLBACK_TOKEN:-}" ]; then
+            echo "::add-mask::${CALLBACK_TOKEN}"
+          fi
+
       - name: Validate inputs
         id: validate
         run: |
