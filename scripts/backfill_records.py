@@ -6,7 +6,7 @@ workflow (via `workflow_dispatch`) for each public `nm`/`on` dataset, so every
 dataset gets a records.json snapshot at
 `s3://nemar/<id>/version/v<X.Y.Z>-records.json`, served at
 `data.nemar.org/<id>/<version>/records.json`. Dataset enumeration mirrors
-`scripts/zarr/patch_power_line_frequency.py` (paginated GET /datasets).
+`nemar-cli:scripts/zarr/patch_power_line_frequency.py` (paginated GET /datasets).
 
 DRY-RUN by default; pass `--apply` to actually dispatch. Idempotent: the
 records.json emit is a pure function of the immutable tag, so re-dispatching
