@@ -1,0 +1,34 @@
+name: Test archive-cleanup-plan
+
+# Runs scripts/test_archive_cleanup_plan.py on PRs touching scripts/.
+# 18 real-subprocess assertions (no mocks) against scripts/archive-cleanup-plan.sh:
+# out-of-order completion under both key forms, v1.10.0 vs v1.9.0 in both
+# directions, pre-release/build suffixes and stray files reported and not
+# deleted, a delete marker current on a higher version, a noncurrent version
+# of a higher version surviving, the empty-listing and non-current-upload
+# abort guard, the out-of-scope guard, the legacy copy of the dispatched
+# version being deleted, and the AccessDenied classifications (#1518).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-archive-cleanup-plan.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-archive-cleanup-plan.yml"
+  workflow_dispatch:
+
+jobs:
+  python-unit-test:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run scripts tests
+        run: python scripts/test_archive_cleanup_plan.py

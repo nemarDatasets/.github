@@ -324,6 +324,20 @@ jobs:
           ref: v${{ env.VERSION }}
           token: ${{ steps.app-token.outputs.token }}
 
+      # Runs AFTER the dataset checkout above, and into its own `path:`,
+      # deliberately: that checkout targets the default workspace root with
+      # no `path:` of its own, and actions/checkout's clean step is scoped
+      # to whatever directory it is checking out into. Checking out .github
+      # first at a subdirectory and the dataset repo second (at the
+      # workspace root, the common ordering mistake) would let the dataset
+      # checkout's `git clean -ffdx` -- recursive from the root -- remove
+      # this subdirectory as untracked before the cleanup step below ever
+      # reads scripts/archive-cleanup-plan.sh from it.
+      - name: Checkout .github (for scripts/archive-cleanup-plan.sh)
+        uses: actions/checkout@v4
+        with:
+          path: nemar-dotgithub
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -951,9 +965,9 @@ jobs:
       #     delete markers of both the new and legacy names for this exact
       #     version, and the legacy-name object for this exact version once
       #     the new-name object's presence as the current version is
-      #     confirmed by this same listing (see the REQUIRE_KEEP guard
-      #     below -- if that object is not found, NOTHING is deleted and the
-      #     step fails loudly rather than guess).
+      #     confirmed by this same listing (see archive-cleanup-plan.sh's
+      #     abort guard below -- if that object is not found, NOTHING is
+      #     deleted and the step fails loudly rather than guess).
       #   - version > $VERSION (strictly): NEVER touched. This is what
       #     protects a genuinely newer archive (new- or legacy-named) from
       #     an out-of-order or retried older build's cleanup; the residual
@@ -974,6 +988,17 @@ jobs:
       # time and recomputes the same plan from that snapshot, so a re-run
       # (retry, or a second dispatch landing after this one) either finds
       # nothing left to remove or reaches the same answer again.
+      #
+      # PR review (#122 round 2): the selection logic above is the
+      # highest-risk code in this change, so it is no longer inline here --
+      # it lives in scripts/archive-cleanup-plan.sh (checked out above into
+      # nemar-dotgithub/, since this job's only other checkout overwrites
+      # the default workspace with the target DATASET repo) where
+      # scripts/test_archive_cleanup_plan.py exercises it directly, with no
+      # AWS calls, in CI. This step still makes every AWS call itself
+      # (list-object-versions, delete-objects); the script only decides,
+      # from an already-fetched listing, what to delete, and classifies
+      # AccessDenied.
       - name: Clean up older archive versions (#1518)
         if: steps.post-success.outcome == 'success'
         env:
@@ -982,6 +1007,7 @@ jobs:
           AWS_DEFAULT_REGION: us-east-2
         run: |
           set -euo pipefail
+          PLAN_SCRIPT="${GITHUB_WORKSPACE}/nemar-dotgithub/scripts/archive-cleanup-plan.sh"
           PREFIX="${DATASET_ID}/archives/"
           NEW_NAME="${DATASET_ID}_v${VERSION}.zip"
           echo "Cleaning up ${PREFIX} for dispatched version ${VERSION} (keeping only the current ${NEW_NAME})"
@@ -991,7 +1017,7 @@ jobs:
           LIST_RC=$?
           set -e
           if [ "$LIST_RC" -ne 0 ]; then
-            if echo "$LIST_OUT" | grep -qi "AccessDenied"; then
+            if echo "$LIST_OUT" | bash "$PLAN_SCRIPT" is-access-denied; then
               echo "::warning::list-object-versions denied for ${PREFIX} (missing s3:ListBucketVersions?); skipping cleanup until the lead applies the IAM policy in this PR's description."
               exit 0
             fi
@@ -1000,72 +1026,25 @@ jobs:
           fi
           echo "$LIST_OUT" > /tmp/archive-versions.json
 
-          # Never touch anything outside <id>/archives/: list-object-versions
-          # is already prefix-scoped above, and this guard fails loudly if a
-          # future edit widens the prefix by mistake rather than silently
-          # deleting the wrong dataset's objects.
-          OUT_OF_SCOPE=$(jq --arg p "$PREFIX" \
-            '[(.Versions // []), (.DeleteMarkers // [])] | flatten | map(select(.Key | startswith($p) | not)) | length' \
-            /tmp/archive-versions.json)
-          if [ "$OUT_OF_SCOPE" != "0" ]; then
-            echo "::error::list-object-versions returned $OUT_OF_SCOPE key(s) outside $PREFIX; refusing to delete anything"
+          # Plan the cleanup from the listing: archive-cleanup-plan.sh parses
+          # each key's file name (new "<id>_v<ver>.zip" or legacy
+          # "v<ver>.zip"), compares its version against the dispatched
+          # $VERSION with a numeric (not lexical) semver comparison, and
+          # classifies. See the step comment above for the exact rule per
+          # bucket. It also owns the out-of-scope guard (any key outside
+          # $PREFIX) and the abort guard (the current new-name object at
+          # $VERSION not found); either failure exits 1 with its own
+          # ::error:: already on stderr, and prints one ::warning:: per
+          # unparseable key it left untouched -- nothing to delete anything
+          # in that case, so this step just has to stop.
+          set +e
+          DELETE_LIST=$(bash "$PLAN_SCRIPT" plan /tmp/archive-versions.json)
+          PLAN_RC=$?
+          set -e
+          if [ "$PLAN_RC" -ne 0 ]; then
             exit 1
           fi
-
-          # Plan the cleanup from the listing: parse each key's file name
-          # (new "<id>_v<ver>.zip" or legacy "v<ver>.zip"), compare its
-          # version against the dispatched $VERSION with a numeric (not
-          # lexical) semver comparison, and classify. See the step comment
-          # above for the exact rule per bucket.
-          jq -c \
-            --arg id "$DATASET_ID" \
-            --arg prefix "$PREFIX" \
-            --arg dispatched "$VERSION" '
-            def isSemver:
-              test("^[0-9]+\\.[0-9]+\\.[0-9]+$");
-            def toParts:
-              split(".") | map(tonumber);
-            def semverCmp($a; $b):
-              ($a | toParts) as $pa | ($b | toParts) as $pb |
-              if $pa[0] != $pb[0] then ($pa[0] - $pb[0])
-              elif $pa[1] != $pb[1] then ($pa[1] - $pb[1])
-              else ($pa[2] - $pb[2])
-              end;
-            def parseArchiveKey:
-              (.Key[($prefix | length):]) as $fn |
-              ($id + "_v") as $newPrefix |
-              if ($fn | startswith($newPrefix)) and ($fn | endswith(".zip")) then
-                ($fn[($newPrefix | length):-4]) as $v |
-                if ($v | isSemver) then {kind:"new", version:$v} else {kind:"unparsed", version:null} end
-              elif ($fn | startswith("v")) and ($fn | endswith(".zip")) then
-                ($fn[1:-4]) as $v |
-                if ($v | isSemver) then {kind:"legacy", version:$v} else {kind:"unparsed", version:null} end
-              else
-                {kind:"unparsed", version:null}
-              end;
-            ( [(.Versions // [])[] | . + {isMarker:false}]
-              + [(.DeleteMarkers // [])[] | . + {isMarker:true}]
-            ) | map(. + parseArchiveKey) | map(
-              if .kind == "unparsed" then . + {action:"report"}
-              elif (semverCmp(.version; $dispatched) < 0) then . + {action:"delete"}
-              elif (semverCmp(.version; $dispatched) > 0) then . + {action:"keep-newer"}
-              elif (.kind == "new") and (.IsLatest == true) and (.isMarker == false) then
-                . + {action:"keep-current"}
-              else . + {action:"delete"}
-              end
-            )
-          ' /tmp/archive-versions.json > /tmp/archive-plan.json
-
-          jq -r '.[] | select(.action == "report") | "  " + .Key + " (versionId " + .VersionId + ")"' /tmp/archive-plan.json \
-            | while IFS= read -r line; do echo "::warning::unparseable archive key under ${PREFIX}, left untouched: ${line}"; done
-
-          KEEP_COUNT=$(jq '[.[] | select(.action == "keep-current")] | length' /tmp/archive-plan.json)
-          if [ "$KEEP_COUNT" -ne 1 ]; then
-            echo "::error::expected exactly 1 current object named ${NEW_NAME} under ${PREFIX}, found ${KEEP_COUNT}; refusing to delete anything until this is understood (a fresh upload should always leave exactly one)."
-            exit 1
-          fi
-
-          jq -c '[.[] | select(.action == "delete") | {Key, VersionId}]' /tmp/archive-plan.json > /tmp/archive-to-delete.json
+          echo "$DELETE_LIST" > /tmp/archive-to-delete.json
 
           COUNT=$(jq 'length' /tmp/archive-to-delete.json)
           if [ "$COUNT" -eq 0 ]; then
@@ -1085,7 +1064,7 @@ jobs:
             DEL_RC=$?
             set -e
             if [ "$DEL_RC" -ne 0 ]; then
-              if echo "$DEL_OUT" | grep -qi "AccessDenied"; then
+              if echo "$DEL_OUT" | bash "$PLAN_SCRIPT" is-access-denied; then
                 echo "::warning::delete-objects denied for ${PREFIX} (missing s3:DeleteObjectVersion?); leaving old archive versions in place until the lead applies the IAM policy in this PR's description."
                 exit 0
               fi
@@ -1097,8 +1076,7 @@ jobs:
             cat /tmp/archive-delete-result.json
             ERR_COUNT=$(jq '.Errors // [] | length' /tmp/archive-delete-result.json)
             if [ "$ERR_COUNT" != "0" ]; then
-              ACCESS_DENIED_COUNT=$(jq '[.Errors[] | select(.Code == "AccessDenied")] | length' /tmp/archive-delete-result.json)
-              if [ "$ACCESS_DENIED_COUNT" = "$ERR_COUNT" ]; then
+              if bash "$PLAN_SCRIPT" delete-errors-are-access-denied /tmp/archive-delete-result.json; then
                 echo "::warning::${ERR_COUNT} object version(s) denied by IAM under ${PREFIX}; leaving them in place until the lead applies the policy in this PR's description."
                 exit 0
               fi
