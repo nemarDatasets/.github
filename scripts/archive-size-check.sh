@@ -15,9 +15,11 @@
 #      guard fell through with nothing to fall back on.
 #   2. PAYLOAD_TOTAL_BYTES/PAYLOAD_TOTAL_FILES -- the repository_dispatch
 #      client_payload's total_bytes/total_files, sent by the Worker's
-#      dispatcher when it already has the row's declared size. Empty when
-#      the dispatch came from an older backend, or from run-version-doi.yml's
-#      own dispatch (which has no such numbers to send).
+#      dispatcher when it already has the row's declared size, OR forwarded
+#      by run-version-doi.yml's own dispatch when ITS client_payload carried
+#      them (the first-publish path, nemar-cli review finding #1/#6). Empty
+#      when the dispatch came from an older backend, or from either dispatch
+#      path when neither had a number to offer.
 #   3. DERIVED_BYTES/DERIVED_FILES -- computed by a separate, best-effort
 #      workflow step that clones the dataset repo (a plain `git clone` never
 #      fetches git-annex content -- it lives out-of-band, referenced by

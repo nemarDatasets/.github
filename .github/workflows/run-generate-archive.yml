@@ -78,9 +78,11 @@ jobs:
   # policy, and POSTs the skip callback -- unit-tested locally, see the PR:
   #   1. the manifest (unchanged, still the fast/common path once published)
   #   2. client_payload.total_bytes/total_files, sent by the Worker's
-  #      dispatcher when it already knows the row's declared size (absent
-  #      from an older backend, or from run-version-doi.yml's own dispatch,
-  #      which has no such numbers to send)
+  #      dispatcher when it already knows the row's declared size, or
+  #      forwarded by run-version-doi.yml's own dispatch when ITS
+  #      client_payload carried them (the first-publish path, nemar-cli
+  #      review finding #1/#6). Absent from an older backend, or from either
+  #      dispatch path when neither had a number to offer.
   #   3. a same-job derivation: clone the dataset repo (a plain `git clone`
   #      never fetches git-annex content -- it lives out-of-band, referenced
   #      by symlinks/pointer files -- so this is cheap even for a 500 GB
