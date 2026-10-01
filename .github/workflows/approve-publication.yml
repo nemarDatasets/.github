@@ -1,0 +1,267 @@
+name: Approve Publication
+
+# Runs a publication approval to completion on a GitHub runner.
+#
+# Approval is not one request. The backend runs the sixteen-step orchestrator,
+# and its S3 Object Lock step works in batches of 100 objects that the CALLER
+# must keep requesting. The `nemar` CLI is that caller: it loops, retries across
+# Worker invocations, and resumes. Running the loop inside a Cloudflare Worker
+# would cost too much, so an executor drives it instead. This workflow is one
+# such executor (a terminal running the CLI is the other), which is why the
+# backend route stays the contract and nothing here is special to it.
+#
+# Triggered by:
+#   - repository_dispatch[approve-publication] from api.nemar.org when an admin
+#     clicks Approve on nemar.org (POST /admin/publish/:id/approve-dispatch).
+#     client_payload: { dataset_id, request_id, resume, environment }.
+#   - workflow_dispatch (manual run, same inputs minus request_id).
+#
+# What it does: validate the inputs, pick credentials for the environment,
+# check the key is an admin key before anything irreversible, run
+# `nemar admin publish approve`, then read the request's final state back from
+# the API and fail unless it is `published`.
+#
+# Why the final state is read back: the CLI exits 0 when an approval fails
+# (its error handler only prints, and an unauthenticated or declined run just
+# returns), so a green exit code does not mean a published dataset.
+#
+# Required secrets on nemarDatasets/.github:
+#   NEMAR_ADMIN_API_KEY      admin key for api.nemar.org (also used by
+#                            onboard-openneuro.yml)
+#   NEMAR_ADMIN_API_KEY_DEV  admin key for api-test.nemar.org; only needed for
+#                            environment=dev
+
+on:
+  repository_dispatch:
+    types: [approve-publication]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm000290)"
+        required: true
+        type: string
+      resume:
+        description: "Resume a partly finished approval (skips completed steps)"
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: "Which NEMAR backend to approve on"
+        required: true
+        type: choice
+        options:
+          - production
+          - dev
+        default: production
+
+# No default token scope: nothing here touches this repository or GitHub's API.
+permissions: {}
+
+# One approval per dataset and environment at a time. A second dispatch waits
+# for the first instead of running beside it (the orchestrator's steps are
+# idempotent, but two runs would still double the load and interleave progress).
+# GitHub keeps only one WAITING run per group, so a third dispatch replaces the
+# second; the backend already refuses a new dispatch while one is in flight.
+concurrency:
+  group: approve-publication-${{ github.event.client_payload.environment || inputs.environment }}-${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: Approve Publication
+    runs-on: ubuntu-latest
+    # Matches the import copy job. S3 Object Lock on a large dataset is the long
+    # step: 100 objects per call, so hundreds of thousands of files take hours.
+    timeout-minutes: 350
+    permissions: {}
+    env:
+      # Everything below is UNTRUSTED input from the dispatch payload. It is
+      # only ever read by the validation step, which writes the validated,
+      # canonical values (DATASET_ID, NEMAR_ENV, RESUME, API_URL) to GITHUB_ENV.
+      # No other step uses a RAW_ name, and none interpolates ${{ }} into a
+      # script.
+      RAW_DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      RAW_ENVIRONMENT: ${{ github.event.client_payload.environment || inputs.environment }}
+      RAW_RESUME: ${{ github.event.client_payload.resume || inputs.resume }}
+      RAW_REQUEST_ID: ${{ github.event.client_payload.request_id }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          # The id is used in a URL path and as a CLI argument: allow only the
+          # two shapes the backend mints (nm and on, six digits). The rejected
+          # value is deliberately not echoed, so a crafted payload cannot write
+          # workflow commands into the log.
+          case "$RAW_DATASET_ID" in
+            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::dataset_id must be nm or on followed by six digits"; exit 1 ;;
+          esac
+
+          # The environment picks BOTH the API host and the credential, from a
+          # fixed map. A URL is never taken from the payload, so an approval
+          # key cannot be steered to a host of the sender's choosing. A missing
+          # environment fails closed: defaulting to production would let a
+          # dev-bound dispatch act on the real system.
+          case "$RAW_ENVIRONMENT" in
+            production)
+              api_url="https://api.nemar.org"
+              ;;
+            dev)
+              api_url="https://api-test.nemar.org"
+              # The CLI reads its API host from TEST_API_URL ahead of any
+              # stored config; this is how the dev backend is targeted. It
+              # must be present for every CLI step, hence GITHUB_ENV.
+              echo "TEST_API_URL=${api_url}" >> "$GITHUB_ENV"
+              ;;
+            *) echo "::error::environment must be production or dev"; exit 1 ;;
+          esac
+
+          # Absent means false: a manual run that leaves the box unticked.
+          case "$RAW_RESUME" in
+            true) resume=true ;;
+            false|"") resume=false ;;
+            *) echo "::error::resume must be true or false"; exit 1 ;;
+          esac
+
+          # Informational only (shown in the summary), so a bad value is
+          # dropped rather than failing an approval.
+          case "$RAW_REQUEST_ID" in
+            ""|*[!0-9]*) request_id="n/a" ;;
+            *) request_id="$RAW_REQUEST_ID" ;;
+          esac
+
+          {
+            echo "DATASET_ID=${RAW_DATASET_ID}"
+            echo "NEMAR_ENV=${RAW_ENVIRONMENT}"
+            echo "RESUME=${resume}"
+            echo "API_URL=${api_url}"
+            echo "REQUEST_ID=${request_id}"
+          } >> "$GITHUB_ENV"
+          echo "Inputs OK: dataset_id=${RAW_DATASET_ID} environment=${RAW_ENVIRONMENT} resume=${resume}"
+
+      # One step per environment, each seeing only its own secret. A single
+      # `cond && secrets.DEV || secrets.PROD` expression would fall back to the
+      # production key whenever the dev secret is empty.
+      - name: Select credentials (production)
+        if: env.NEMAR_ENV == 'production'
+        env:
+          KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then echo "::error::NEMAR_ADMIN_API_KEY is not set"; exit 1; fi
+          # A newline would write extra variables into GITHUB_ENV.
+          case "$KEY" in *$'\n'*) echo "::error::NEMAR_ADMIN_API_KEY must be a single line"; exit 1 ;; esac
+          echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
+
+      - name: Select credentials (dev)
+        if: env.NEMAR_ENV == 'dev'
+        env:
+          KEY: ${{ secrets.NEMAR_ADMIN_API_KEY_DEV }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then echo "::error::NEMAR_ADMIN_API_KEY_DEV is not set"; exit 1; fi
+          # A newline would write extra variables into GITHUB_ENV.
+          case "$KEY" in *$'\n'*) echo "::error::NEMAR_ADMIN_API_KEY_DEV must be a single line"; exit 1 ;; esac
+          echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
+
+      # Fail before anything irreversible if the key is wrong, expired, or not
+      # an admin key, or the API host is unreachable. The list route is
+      # admin-only, so a 200 proves both. The header goes through curl's config
+      # on stdin so the key is not on the command line.
+      - name: Preflight admin access
+        run: |
+          set -euo pipefail
+          code=$(printf 'header = "Authorization: Bearer %s"\n' "$NEMAR_API_KEY" \
+            | curl -sS -o /dev/null -w '%{http_code}' -m 30 -K - \
+                -H "Accept: application/json" \
+                "${API_URL}/admin/publish/requests?status=approving") || code=000
+          if [ "$code" != "200" ]; then
+            echo "::error::Admin preflight against ${API_URL} failed (HTTP ${code}). Check the API key secret for ${NEMAR_ENV}."
+            exit 1
+          fi
+          echo "Admin key accepted by ${API_URL}"
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install nemar CLI
+        run: bun install -g nemar-cli
+
+      - name: Authenticate nemar CLI
+        # --yes: a runner never has a stored account to replace, but a cached
+        # one must not hang the job on the "add a different account?" prompt
+        # (same as onboard-openneuro.yml).
+        run: nemar auth login --key "$NEMAR_API_KEY" --yes
+
+      - name: Approve and publish
+        id: approve
+        run: |
+          set -uo pipefail
+          # --yes skips the confirmation. Without it a declined or non-TTY run
+          # prints "Skipped" and exits 0. --skip-ci-check is never passed: an
+          # admin override of BIDS validation is not something a button click
+          # should carry.
+          args=(admin publish approve "$DATASET_ID" --yes)
+          if [ "$RESUME" = "true" ]; then args+=(--resume); fi
+
+          # Actions runs this under `bash -e`: without turning errexit off, a
+          # failing CLI would abort the script before its exit code is recorded.
+          set +e
+          nemar "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/approve.log"
+          cli_exit=${PIPESTATUS[0]}
+          set -e
+          echo "cli_exit=${cli_exit}" >> "$GITHUB_OUTPUT"
+          exit "$cli_exit"
+
+      # Authoritative outcome. Runs even when the step above failed, so the
+      # summary says where the request stands either way, and fails the job
+      # unless the request really is published (the CLI's exit code alone is
+      # not trustworthy, see the header).
+      - name: Verify final state
+        if: always() && steps.approve.outcome != 'skipped'
+        env:
+          CLI_EXIT: ${{ steps.approve.outputs.cli_exit }}
+        run: |
+          set -uo pipefail
+          body=$(printf 'header = "Authorization: Bearer %s"\n' "$NEMAR_API_KEY" \
+            | curl -fsS -m 30 -K - -H "Accept: application/json" \
+                "${API_URL}/datasets/${DATASET_ID}/publish/status") || body=""
+          final=$(printf '%s' "$body" | jq -r '.status // "unknown"' 2>/dev/null) || final="unknown"
+          step=$(printf '%s' "$body" | jq -r '.current_step // empty' 2>/dev/null) || step=""
+          last_error=$(printf '%s' "$body" | jq -r '.last_error // empty' 2>/dev/null) || last_error=""
+          # Only a known status word is ever printed outside the summary file.
+          case "$final" in
+            none|requested|approving|published|denied|blocked) ;;
+            *) final="unknown" ;;
+          esac
+
+          # Server text is written only to the summary FILE, where Actions does
+          # not parse workflow commands, and with backticks removed so it
+          # cannot close the code fence.
+          {
+            echo "### Approve publication: ${DATASET_ID}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Environment | ${NEMAR_ENV} |"
+            echo "| Resume | ${RESUME} |"
+            echo "| Request | ${REQUEST_ID} |"
+            echo "| CLI exit code | ${CLI_EXIT:-not run} |"
+            echo "| Final status | ${final} |"
+            if [ -n "$step" ]; then echo "| Current step | $(printf '%s' "$step" | tr -d '`|') |"; fi
+            if [ -n "$last_error" ]; then
+              echo
+              echo "Last error:"
+              echo
+              echo '```'
+              printf '%s\n' "$last_error" | tr -d '`'
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$final" != "published" ]; then
+            echo "::error::${DATASET_ID} is not published (status: ${final}). Run this workflow again with resume, or run: nemar admin publish approve ${DATASET_ID} --resume"
+            exit 1
+          fi
+          echo "${DATASET_ID} is published."
