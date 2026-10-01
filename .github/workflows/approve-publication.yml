@@ -194,8 +194,11 @@ jobs:
       #    active request for the dataset (requested, approving or blocked) when
       #    it runs, not the one that was clicked. A run that waited in a queue
       #    while an admin denied that request and the owner asked again would
-      #    otherwise approve a request no admin saw. Manual runs carry no
-      #    request id and skip this part.
+      #    otherwise approve a request no admin saw. The request must also carry
+      #    the admin who clicked, which is what attribution relies on. Manual
+      #    runs carry no request id and skip this part.
+      #
+      # Either way it also decides whether this run resumes (see below).
       - name: Preflight admin access and request
         run: |
           set -euo pipefail
@@ -207,7 +210,7 @@ jobs:
                   "${API_URL}/admin/publish/requests?status=$1" || printf '\n000'
           }
 
-          newest=""
+          newest=""; newest_status=""; newest_claimed=""
           for status in requested approving blocked; do
             out=$(list "$status")
             code=${out##*$'\n'}
@@ -216,11 +219,29 @@ jobs:
               echo "::error::Admin preflight against ${API_URL} failed (HTTP ${code}). Check the API key secret for ${NEMAR_ENV}."
               exit 1
             fi
-            id=$(printf '%s' "$body" | jq -r --arg d "$DATASET_ID" \
-              '[.requests[] | select(.dataset_id == $d) | .id] | max // empty')
-            if [ -n "$id" ] && { [ -z "$newest" ] || [ "$id" -gt "$newest" ]; }; then newest="$id"; fi
+            row=$(printf '%s' "$body" | jq -c --arg d "$DATASET_ID" \
+              '[.requests[] | select(.dataset_id == $d)] | max_by(.id) // empty')
+            if [ -n "$row" ]; then
+              id=$(printf '%s' "$row" | jq -r '.id')
+              if [ -z "$newest" ] || [ "$id" -gt "$newest" ]; then
+                newest="$id"
+                newest_status="$status"
+                newest_claimed=$(printf '%s' "$row" | jq -r 'if .approval_requested_by == null then "no" else "yes" end')
+              fi
+            fi
           done
           echo "Admin key accepted by ${API_URL}"
+
+          # Resume is decided HERE, from the request's real state, not from the
+          # flag the click carried. A click-time flag goes stale: if a first
+          # dispatch started and a second was sent after it, the second still says
+          # "fresh" while steps have already run, and a fresh run restarts the
+          # step list. `--resume` on a request with no finished steps is the same
+          # as a fresh run, so forcing it for an approving request is always safe.
+          if [ "$newest_status" = "approving" ] && [ "$RESUME" != "true" ]; then
+            echo "Request ${newest} is already approving, so this run resumes it."
+            echo "RESUME=true" >> "$GITHUB_ENV"
+          fi
 
           if [ "$REQUEST_ID" = "n/a" ]; then
             echo "No request id in this run (manual); approving the newest active request, ${newest:-none}."
@@ -234,7 +255,14 @@ jobs:
             echo "::error::This run was dispatched for request ${REQUEST_ID}, but the newest active request for ${DATASET_ID} is now ${newest}. Not approving a request nobody clicked; dispatch it again from the admin page."
             exit 1
           fi
-          echo "Request ${REQUEST_ID} is the newest active request for ${DATASET_ID}."
+          # The website records the admin who clicked on the request itself. A
+          # dispatched run whose request carries no such admin would be recorded
+          # under this workflow's key instead, so something is wrong.
+          if [ "$newest_claimed" != "yes" ]; then
+            echo "::error::Request ${REQUEST_ID} was dispatched but no admin has claimed it, so the approval would be recorded under this workflow's key. Dispatch it again from the admin page."
+            exit 1
+          fi
+          echo "Request ${REQUEST_ID} is the newest active request for ${DATASET_ID}, claimed by an admin."
 
       - name: Authenticate nemar CLI
         # The CLI reads NEMAR_API_KEY itself, so the key stays off the command
