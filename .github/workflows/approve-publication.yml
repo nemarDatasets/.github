@@ -25,6 +25,12 @@ name: Approve Publication
 # (its error handler only prints, and an unauthenticated or declined run just
 # returns), so a green exit code does not mean a published dataset.
 #
+# Known limit: the S3 lock continuation token lives only in the CLI process, so
+# a resumed run restarts that step from its first page (already-locked objects
+# count as success, so it is safe, only slow). A dataset whose lock phase needs
+# longer than this job's timeout cannot finish from here; approve those from a
+# terminal, which has no cap.
+#
 # Required secrets on nemarDatasets/.github:
 #   NEMAR_ADMIN_API_KEY      admin key for api.nemar.org (also used by
 #                            onboard-openneuro.yml)
@@ -49,10 +55,12 @@ on:
         description: "Which NEMAR backend to approve on"
         required: true
         type: choice
+        # dev first and the default: this step is irreversible, so a manual run
+        # must have to ask for production.
         options:
-          - production
           - dev
-        default: production
+          - production
+        default: dev
 
 # No default token scope: nothing here touches this repository or GitHub's API.
 permissions: {}
@@ -89,32 +97,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The id is used in a URL path and as a CLI argument: allow only the
-          # two shapes the backend mints (nm and on, six digits). The rejected
-          # value is deliberately not echoed, so a crafted payload cannot write
-          # workflow commands into the log.
-          case "$RAW_DATASET_ID" in
-            nm[0-9][0-9][0-9][0-9][0-9][0-9]|on[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
-            *) echo "::error::dataset_id must be nm or on followed by six digits"; exit 1 ;;
-          esac
-
           # The environment picks BOTH the API host and the credential, from a
           # fixed map. A URL is never taken from the payload, so an approval
           # key cannot be steered to a host of the sender's choosing. A missing
           # environment fails closed: defaulting to production would let a
           # dev-bound dispatch act on the real system.
           case "$RAW_ENVIRONMENT" in
-            production)
-              api_url="https://api.nemar.org"
-              ;;
-            dev)
-              api_url="https://api-test.nemar.org"
-              # The CLI reads its API host from TEST_API_URL ahead of any
-              # stored config; this is how the dev backend is targeted. It
-              # must be present for every CLI step, hence GITHUB_ENV.
-              echo "TEST_API_URL=${api_url}" >> "$GITHUB_ENV"
-              ;;
+            production) api_url="https://api.nemar.org" ;;
+            dev) api_url="https://api-test.nemar.org" ;;
             *) echo "::error::environment must be production or dev"; exit 1 ;;
+          esac
+          # Target the same host for the CLI as for the curl steps below, by
+          # construction rather than by whatever the CLI's config or default
+          # happens to be. The CLI reads TEST_API_URL ahead of any stored config.
+          echo "TEST_API_URL=${api_url}" >> "$GITHUB_ENV"
+
+          # The id is used in a URL path and as a CLI argument: allow only the
+          # shapes the backend mints for that environment. The dev catalog also
+          # holds the xx exemplar fleet (the off-production pipeline test),
+          # which production never does. The rejected value is deliberately not
+          # echoed, so a crafted payload cannot write workflow commands into
+          # the log.
+          case "${RAW_ENVIRONMENT}:${RAW_DATASET_ID}" in
+            production:nm[0-9][0-9][0-9][0-9][0-9][0-9] | production:on[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            dev:nm[0-9][0-9][0-9][0-9][0-9][0-9] | dev:on[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            dev:xx[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::dataset_id is not valid for this environment (nm or on plus six digits; xx plus six digits on dev only)"; exit 1 ;;
           esac
 
           # Absent means false: a manual run that leaves the box unticked.
@@ -139,6 +147,16 @@ jobs:
             echo "REQUEST_ID=${request_id}"
           } >> "$GITHUB_ENV"
           echo "Inputs OK: dataset_id=${RAW_DATASET_ID} environment=${RAW_ENVIRONMENT} resume=${resume}"
+
+      # Install BEFORE any credential is selected. The admin key can publish DOIs
+      # and make repositories public, and it must not sit in the environment of
+      # a third-party action or a package install (onboard-openneuro.yml keeps
+      # it away from them the same way).
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install nemar CLI
+        run: bun install -g nemar-cli
 
       # One step per environment, each seeing only its own secret. A single
       # `cond && secrets.DEV || secrets.PROD` expression would fall back to the
@@ -165,41 +183,76 @@ jobs:
           case "$KEY" in *$'\n'*) echo "::error::NEMAR_ADMIN_API_KEY_DEV must be a single line"; exit 1 ;; esac
           echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
 
-      # Fail before anything irreversible if the key is wrong, expired, or not
-      # an admin key, or the API host is unreachable. The list route is
-      # admin-only, so a 200 proves both. The header goes through curl's config
-      # on stdin so the key is not on the command line.
-      - name: Preflight admin access
+      # Fail before anything irreversible, in two parts.
+      #
+      # 1. The key is accepted and is an admin key, and the API host answers:
+      #    the list route is admin-only, so a 200 proves all three. The header
+      #    goes through curl's config on stdin so the key is not on the command
+      #    line.
+      # 2. The request this run was dispatched for is still the request the
+      #    approval will act on. `nemar admin publish approve` picks the NEWEST
+      #    active request for the dataset (requested, approving or blocked) when
+      #    it runs, not the one that was clicked. A run that waited in a queue
+      #    while an admin denied that request and the owner asked again would
+      #    otherwise approve a request no admin saw. Manual runs carry no
+      #    request id and skip this part.
+      - name: Preflight admin access and request
         run: |
           set -euo pipefail
-          code=$(printf 'header = "Authorization: Bearer %s"\n' "$NEMAR_API_KEY" \
-            | curl -sS -o /dev/null -w '%{http_code}' -m 30 -K - \
-                -H "Accept: application/json" \
-                "${API_URL}/admin/publish/requests?status=approving") || code=000
-          if [ "$code" != "200" ]; then
-            echo "::error::Admin preflight against ${API_URL} failed (HTTP ${code}). Check the API key secret for ${NEMAR_ENV}."
-            exit 1
-          fi
+
+          list() {
+            printf 'header = "Authorization: Bearer %s"\n' "$NEMAR_API_KEY" \
+              | curl -sS -m 30 -K - -w '\n%{http_code}' \
+                  -H "Accept: application/json" \
+                  "${API_URL}/admin/publish/requests?status=$1" || printf '\n000'
+          }
+
+          newest=""
+          for status in requested approving blocked; do
+            out=$(list "$status")
+            code=${out##*$'\n'}
+            body=${out%$'\n'*}
+            if [ "$code" != "200" ]; then
+              echo "::error::Admin preflight against ${API_URL} failed (HTTP ${code}). Check the API key secret for ${NEMAR_ENV}."
+              exit 1
+            fi
+            id=$(printf '%s' "$body" | jq -r --arg d "$DATASET_ID" \
+              '[.requests[] | select(.dataset_id == $d) | .id] | max // empty')
+            if [ -n "$id" ] && { [ -z "$newest" ] || [ "$id" -gt "$newest" ]; }; then newest="$id"; fi
+          done
           echo "Admin key accepted by ${API_URL}"
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install nemar CLI
-        run: bun install -g nemar-cli
+          if [ "$REQUEST_ID" = "n/a" ]; then
+            echo "No request id in this run (manual); approving the newest active request, ${newest:-none}."
+            exit 0
+          fi
+          if [ -z "$newest" ]; then
+            echo "::error::${DATASET_ID} has no active publication request, so there is nothing to approve."
+            exit 1
+          fi
+          if [ "$newest" != "$REQUEST_ID" ]; then
+            echo "::error::This run was dispatched for request ${REQUEST_ID}, but the newest active request for ${DATASET_ID} is now ${newest}. Not approving a request nobody clicked; dispatch it again from the admin page."
+            exit 1
+          fi
+          echo "Request ${REQUEST_ID} is the newest active request for ${DATASET_ID}."
 
       - name: Authenticate nemar CLI
-        # --yes: a runner never has a stored account to replace, but a cached
-        # one must not hang the job on the "add a different account?" prompt
-        # (same as onboard-openneuro.yml).
-        run: nemar auth login --key "$NEMAR_API_KEY" --yes
+        # The CLI reads NEMAR_API_KEY itself, so the key stays off the command
+        # line. --yes: a runner never has a stored account to replace, but a
+        # cached one must not hang the job on the "add a different account?"
+        # prompt (same as onboard-openneuro.yml).
+        run: nemar auth login --yes
 
       - name: Approve and publish
         id: approve
+        # Shorter than the job's timeout, so a step that runs out of time fails
+        # normally and the verify step below still posts where the request
+        # stands (an always() step after a job-level cancel is not guaranteed).
+        timeout-minutes: 340
         run: |
           set -uo pipefail
           # --yes skips the confirmation. Without it a declined or non-TTY run
-          # prints "Skipped" and exits 0. --skip-ci-check is never passed: an
+          # prints "Cancelled" and exits 0. --skip-ci-check is never passed: an
           # admin override of BIDS validation is not something a button click
           # should carry.
           args=(admin publish approve "$DATASET_ID" --yes)
@@ -208,8 +261,8 @@ jobs:
           # Actions runs this under `bash -e`: without turning errexit off, a
           # failing CLI would abort the script before its exit code is recorded.
           set +e
-          nemar "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/approve.log"
-          cli_exit=${PIPESTATUS[0]}
+          nemar "${args[@]}"
+          cli_exit=$?
           set -e
           echo "cli_exit=${cli_exit}" >> "$GITHUB_OUTPUT"
           exit "$cli_exit"
@@ -245,6 +298,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Environment | ${NEMAR_ENV} |"
+            echo "| Triggered by | ${GITHUB_EVENT_NAME} (${GITHUB_ACTOR}) |"
             echo "| Resume | ${RESUME} |"
             echo "| Request | ${REQUEST_ID} |"
             echo "| CLI exit code | ${CLI_EXIT:-not run} |"
@@ -261,7 +315,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$final" != "published" ]; then
-            echo "::error::${DATASET_ID} is not published (status: ${final}). Run this workflow again with resume, or run: nemar admin publish approve ${DATASET_ID} --resume"
+            # What to do depends on where the request stands, and "run it again"
+            # is wrong for a request that needs a person.
+            case "$final" in
+              approving) hint="It stopped partway. Run this workflow again with resume, or run: nemar admin publish approve ${DATASET_ID} --resume" ;;
+              blocked) hint="The request is blocked: the owner has to fix it first (the reason is on the admin page)." ;;
+              denied) hint="The request was denied; there is nothing to approve." ;;
+              *) hint="The approval did not start. Read the approve step above, then dispatch it again from the admin page." ;;
+            esac
+            echo "::error::${DATASET_ID} is not published (status: ${final}). ${hint}"
             exit 1
           fi
           echo "${DATASET_ID} is published."
