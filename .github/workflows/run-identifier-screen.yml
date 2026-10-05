@@ -42,8 +42,11 @@ name: Run Identifier Screen
 #
 # Required secrets on nemarDatasets/.github:
 #   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY      per-repo clone token
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY read access to s3://nemar (the same pair
-#                                            generate-records.yml uses)
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY the pair generate-records.yml uses. The screen
+#                                            only READS s3://nemar, but this pair can also
+#                                            write it, and the script is checked out from
+#                                            nemar-cli `main`: a dedicated read-only key
+#                                            would shrink that blast radius.
 
 on:
   repository_dispatch:
@@ -81,26 +84,35 @@ jobs:
     timeout-minutes: 45
     permissions: {}
     env:
+      # CALLBACK_TOKEN is deliberately NOT here. The runner prints a step's job-level and
+      # step-level `env:` in its header before the step runs, and a value taken from the
+      # dispatch payload is not a secret to Actions, so it is shown in the PUBLIC log
+      # unless a mask was registered first. The token is declared per step below, after
+      # the mask step has registered it (a masked value prints as ***).
       # UNTRUSTED input from the dispatch payload. Validated by the second step; none
       # of it is interpolated into a script with ${{ }}, only read from the environment.
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
       REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
       REQUEST_ID: ${{ github.event.client_payload.request_id || inputs.request_id || '0' }}
-      CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
       CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
       # Honored for workflow_dispatch only; a dispatch payload cannot pick the code.
       NEMAR_CLI_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.nemar_cli_ref || 'main' }}
     steps:
-      # CALLBACK_TOKEN comes from client_payload, not `secrets.*`, so Actions has no
-      # reason to know it is sensitive and will not redact it unless told. Register the
-      # mask before any later step can print it (as run-prescreen.yml does).
+      # The token comes from client_payload, not `secrets.*`, so Actions has no reason to
+      # know it is sensitive and will not redact it unless told. This step must be the
+      # first to run and must not itself carry the token in `env:` (its own header would
+      # print it before the mask exists), so it reads the event file instead.
       - name: Mask the callback token
         run: |
-          if [ -n "${CALLBACK_TOKEN:-}" ]; then
-            echo "::add-mask::${CALLBACK_TOKEN}"
+          set -euo pipefail
+          token=$(jq -r '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$token" ]; then
+            echo "::add-mask::${token}"
           fi
 
       - name: Validate inputs
+        env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
         run: |
           set -euo pipefail
           # A rejected value is never echoed, so a crafted payload cannot write
@@ -127,6 +139,11 @@ jobs:
           if ! valid_ref "$REF"; then echo "::error::ref is not a plain git ref"; exit 1; fi
           if ! valid_ref "$NEMAR_CLI_REF"; then echo "::error::nemar_cli_ref is not a plain git ref"; exit 1; fi
           if [[ ! "$REQUEST_ID" =~ $num_re ]]; then echo "::error::request_id must be a number"; exit 1; fi
+          # A dispatched screen with nowhere to report would finish green and drop its
+          # verdict; only a manual run may have no callback.
+          if [ "${GITHUB_EVENT_NAME}" = "repository_dispatch" ] && [ -z "${CALLBACK_URL:-}" ]; then
+            echo "::error::a dispatched screen needs a callback_url"; exit 1
+          fi
           if [ -n "${CALLBACK_URL:-}" ]; then
             if [[ ! "$CALLBACK_URL" =~ $url_re ]]; then
               echo "::error::callback_url must be a plain https URL"; exit 1
@@ -150,6 +167,8 @@ jobs:
           private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
           owner: nemarDatasets
           repositories: ${{ env.DATASET_ID }}
+          # Cloning needs nothing else; the script runs next to this token.
+          permission-contents: read
 
       # nemar-cli is public, so no token is needed (generate-records.yml does the same).
       # The checkout keeps its .git: the script reports `identifier-scan@<its HEAD>`.
@@ -181,11 +200,12 @@ jobs:
       - name: Run identifier screen
         id: screen
         env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           S3_BUCKET: nemar
           SCREEN_DEADLINE_MS: "2100000"
-        run: bun run nemar-cli/scripts/identifier-screen-ci.ts
+        run: bun run --no-install nemar-cli/scripts/identifier-screen-ci.ts
 
       # The screen did not deliver a report: validation failed, a step crashed, the job
       # was cancelled or timed out, or the callback itself was refused. Tell the Worker,
@@ -194,6 +214,8 @@ jobs:
       # late cancellation must not replace a real result with a failure.
       - name: Report failure callback
         if: (failure() || cancelled()) && steps.screen.outcome != 'success' && env.CALLBACK_URL != ''
+        env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
         run: |
           set -uo pipefail
           # Never post the token anywhere but a plain https URL (validated again here,
