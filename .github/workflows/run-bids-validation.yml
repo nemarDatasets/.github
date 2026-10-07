@@ -49,7 +49,9 @@ jobs:
   validate:
     name: BIDS Validation
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Validator time grows with file count: nm000359 (22.5k files) needs ~12 min of one
+    # fast core, i.e. >20 min on a hosted runner. 120 min stays far below GitHub's 360.
+    timeout-minutes: 120
     permissions: {}
     env:
       DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
