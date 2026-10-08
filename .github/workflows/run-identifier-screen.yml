@@ -1,0 +1,243 @@
+name: Run Identifier Screen
+
+# Publication-time identifier screen (nemarOrg/nemar-cli ADR 0086, epic #1610).
+#
+# Sixteen datasets reached the public bucket with patient names, birth dates and
+# record numbers in EDF/BDF headers, because publication review never opened a
+# recording. When a user requests publication, the Worker fires
+# repository_dispatch[run-identifier-screen] here and HOLDS the admin's request
+# email until this workflow reports. This workflow:
+#   1. mints a per-repo App token and checks out nemarOrg/nemar-cli (public) for
+#      the screen script, so the scanner is the one the CLI and the fleet scan use,
+#   2. runs scripts/identifier-screen-ci.ts, which clones the dataset WITHOUT file
+#      contents, reads every EDF/BDF header (256 bytes, a ranged read of the S3
+#      object through a presigned URL), the sidecars, the participants and scans
+#      tables, small code and text files, and every path that ever existed on any
+#      ref, and
+#   3. POSTs a report to the Worker (client_payload.callback_url) with the one-shot
+#      callback token. The script validates the report against the Worker's own
+#      contract (shared/identifier-screen-report.ts) before it sends it.
+#
+# THE LOG IS PUBLIC. The Actions logs of this repository are readable by anyone, so
+# nothing here, and nothing the script prints, may be a value: no path, header, name,
+# finding, token, presigned URL or clone URL. The script prints counts and fixed words
+# only, and not the verdict; the result goes to the Worker, never to a log or an
+# artifact. A manual (workflow_dispatch) run has no callback, so it shows counts and
+# nothing else: it proves the plumbing (clone, credentials, reads), not a dataset.
+#
+# Unknown is never healthy. A run that fails, is cancelled or times out posts a
+# `workflow-failed` report in the last step, so the request is held for a re-run
+# instead of waiting for the Worker's watchdog. The script's own deadline (35 minutes)
+# is inside this job's timeout (45), so a slow dataset reports `unchecked` rather than
+# vanishing.
+#
+# ROLLOUT ORDER. The script lives in nemarOrg/nemar-cli and is checked out at `main`,
+# so it must be released there before this workflow can pass. Until then a dispatch
+# fails at the script step and the failure callback produces the Worker's "did not
+# run" path, which is the designed degradation and not an outage.
+#
+# `nemar_cli_ref` exists for workflow_dispatch only (testing a script change before it
+# reaches main). A repository_dispatch payload can never choose which code runs with
+# the storage credentials.
+#
+# Required secrets on nemarDatasets/.github:
+#   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY      per-repo clone token
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY the pair generate-records.yml uses. The screen
+#                                            only READS s3://nemar, but this pair can also
+#                                            write it, and the script is checked out from
+#                                            nemar-cli `main`: a dedicated read-only key
+#                                            would shrink that blast radius.
+
+on:
+  repository_dispatch:
+    types: [run-identifier-screen]
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: "Dataset id (e.g. nm000290); sandbox xx datasets are exempt"
+        required: true
+        type: string
+      ref:
+        description: "Git ref of the dataset to screen (branch, tag or commit)"
+        required: false
+        type: string
+        default: "main"
+      request_id:
+        description: "publication_requests.id (0 = manual run, no callback)"
+        required: false
+        type: string
+        default: "0"
+      nemar_cli_ref:
+        description: "nemarOrg/nemar-cli ref that holds the screen script"
+        required: false
+        type: string
+        default: "main"
+
+# Zero default GITHUB_TOKEN scope: the dataset clone uses a per-repo App token, the
+# nemar-cli checkout is a public repository, and the callback is token-authenticated.
+permissions: {}
+
+jobs:
+  screen:
+    name: Run Identifier Screen
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {}
+    env:
+      # CALLBACK_TOKEN is deliberately NOT here. The runner prints a step's job-level and
+      # step-level `env:` in its header before the step runs, and a value taken from the
+      # dispatch payload is not a secret to Actions, so it is shown in the PUBLIC log
+      # unless a mask was registered first. The token is declared per step below, after
+      # the mask step has registered it (a masked value prints as ***).
+      # UNTRUSTED input from the dispatch payload. Validated by the second step; none
+      # of it is interpolated into a script with ${{ }}, only read from the environment.
+      DATASET_ID: ${{ github.event.client_payload.dataset_id || inputs.dataset_id }}
+      REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+      REQUEST_ID: ${{ github.event.client_payload.request_id || inputs.request_id || '0' }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      # Honored for workflow_dispatch only; a dispatch payload cannot pick the code.
+      NEMAR_CLI_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.nemar_cli_ref || 'main' }}
+    steps:
+      # The token comes from client_payload, not `secrets.*`, so Actions has no reason to
+      # know it is sensitive and will not redact it unless told. This step must be the
+      # first to run and must not itself carry the token in `env:` (its own header would
+      # print it before the mask exists), so it reads the event file instead.
+      - name: Mask the callback token
+        run: |
+          set -euo pipefail
+          token=$(jq -r '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$token" ]; then
+            echo "::add-mask::${token}"
+          fi
+
+      - name: Validate inputs
+        env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+        run: |
+          set -euo pipefail
+          # A rejected value is never echoed, so a crafted payload cannot write
+          # workflow commands into a public log.
+          # Patterns live in variables: an unquoted regex with & or ( in a [[ ]] is parsed
+          # as shell syntax, not as a regex.
+          id_re='^(nm|on)[0-9]{6}$'
+          ref_re='^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$'
+          num_re='^[0-9]{1,15}$'
+          url_re='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/?=&+:-]*)?$'
+          token_re='^[A-Za-z0-9._~+/=-]{1,255}$'
+          if [ -z "${DATASET_ID:-}" ]; then echo "::error::Missing dataset_id"; exit 1; fi
+          case "$DATASET_ID" in
+            xx*) echo "::error::Sandbox (xx) datasets are exempt from the identifier screen"; exit 1 ;;
+          esac
+          if [[ ! "$DATASET_ID" =~ $id_re ]]; then
+            echo "::error::dataset_id must be nm or on plus six digits"; exit 1
+          fi
+          valid_ref() {
+            local r="$1"
+            [[ "$r" =~ $ref_re ]] \
+              && [[ "$r" != *..* ]] && [[ "$r" != *//* ]] && [[ "$r" != */ ]] && [[ "$r" != *.lock ]]
+          }
+          if ! valid_ref "$REF"; then echo "::error::ref is not a plain git ref"; exit 1; fi
+          if ! valid_ref "$NEMAR_CLI_REF"; then echo "::error::nemar_cli_ref is not a plain git ref"; exit 1; fi
+          if [[ ! "$REQUEST_ID" =~ $num_re ]]; then echo "::error::request_id must be a number"; exit 1; fi
+          # A dispatched screen with nowhere to report would finish green and drop its
+          # verdict; only a manual run may have no callback.
+          if [ "${GITHUB_EVENT_NAME}" = "repository_dispatch" ] && [ -z "${CALLBACK_URL:-}" ]; then
+            echo "::error::a dispatched screen needs a callback_url"; exit 1
+          fi
+          if [ -n "${CALLBACK_URL:-}" ]; then
+            if [[ ! "$CALLBACK_URL" =~ $url_re ]]; then
+              echo "::error::callback_url must be a plain https URL"; exit 1
+            fi
+            if [ -z "${CALLBACK_TOKEN:-}" ]; then
+              echo "::error::callback_url is set but callback_token is missing"; exit 1
+            fi
+            # The token reaches curl's config on stdin in the failure step: no quote,
+            # backslash or newline may be in it.
+            if [[ ! "$CALLBACK_TOKEN" =~ $token_re ]]; then
+              echo "::error::callback_token has characters outside the expected set"; exit 1
+            fi
+          fi
+          echo "Inputs OK: dataset_id=$DATASET_ID request_id=$REQUEST_ID"
+
+      - name: Mint per-repo App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+          # Cloning needs nothing else; the script runs next to this token.
+          permission-contents: read
+
+      # nemar-cli is public, so no token is needed (generate-records.yml does the same).
+      # The checkout keeps its .git: the script reports `identifier-scan@<its HEAD>`.
+      - name: Checkout nemar-cli (for scripts/identifier-screen-ci.ts)
+        uses: actions/checkout@v4
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: ${{ env.NEMAR_CLI_REF }}
+          fetch-depth: 1
+          path: nemar-cli
+          persist-credentials: false
+
+      # The script imports only Bun, Node built-ins and files in the same checkout, so
+      # there is deliberately no `bun install`: nothing from a package registry runs
+      # next to the storage credentials.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      # Prints counts and fixed words only (see the header). Exits 0 when the report
+      # reached the Worker (even a report that says the screen could not run), 1 when
+      # it did not, 2 for a bad configuration.
+      - name: Run identifier screen
+        id: screen
+        env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          S3_BUCKET: nemar
+          SCREEN_DEADLINE_MS: "2100000"
+        run: bun run --no-install nemar-cli/scripts/identifier-screen-ci.ts
+
+      # The screen did not deliver a report: validation failed, a step crashed, the job
+      # was cancelled or timed out, or the callback itself was refused. Tell the Worker,
+      # so the request is held for a re-run now instead of after its 40 minute watchdog.
+      # Skipped when the script step succeeded: a report is already delivered, and a
+      # late cancellation must not replace a real result with a failure.
+      - name: Report failure callback
+        if: (failure() || cancelled()) && steps.screen.outcome != 'success' && env.CALLBACK_URL != ''
+        env:
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+        run: |
+          set -uo pipefail
+          # Never post the token anywhere but a plain https URL (validated again here,
+          # because this step also runs when validation was the step that failed).
+          case "$CALLBACK_URL" in
+            https://*@*|*[[:space:]]*|*\"*|*\'*) echo "callback_url is not a plain https URL; not posting"; exit 0 ;;
+            https://*) ;;
+            *) echo "callback_url is not a plain https URL; not posting"; exit 0 ;;
+          esac
+          token_re='^[A-Za-z0-9._~+/=-]{1,255}$'
+          if [[ ! "${CALLBACK_TOKEN:-}" =~ $token_re ]]; then
+            echo "callback_token missing or malformed; cannot report failure"; exit 0
+          fi
+          case "${REQUEST_ID:-0}" in ""|*[!0-9]*) rid=0 ;; *) rid="$REQUEST_ID" ;; esac
+          BODY=$(jq -nc \
+            --arg d "${DATASET_ID:-}" --argjson rid "$rid" --arg run "${GITHUB_RUN_ID}" \
+            '{dataset_id:$d, request_id:$rid, workflow_run_id:$run,
+              report:{version:1, scanner:null, head:null, error:"workflow-failed"}}') || exit 0
+          # Best-effort: the Worker has a watchdog for a report that never arrives. The
+          # token goes through curl's config on stdin so it is on no command line, and
+          # the response body is discarded, so only the status reaches the log.
+          printf 'header = "X-Webhook-Token: %s"\n' "$CALLBACK_TOKEN" \
+            | curl -sS -K - -o /dev/null -w 'failure-report HTTP %{http_code}\n' \
+                --connect-timeout 10 --max-time 30 \
+                -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -d "$BODY" || true
