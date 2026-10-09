@@ -164,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           find . -type l -not -path './.git/*' -printf '/%P\n' > /tmp/annex-files.txt 2>/dev/null || true
-          find . -type f -not -path './.git/*' -size -1k -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' >> /tmp/annex-files.txt || true
+          find . -type f -not -path './.git/*' -size -1024c -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' >> /tmp/annex-files.txt || true
           sort -u /tmp/annex-files.txt -o /tmp/annex-files.txt
           ANNEX_COUNT=$(wc -l < /tmp/annex-files.txt | tr -d ' ')
           if [ "$ANNEX_COUNT" -gt 0 ]; then
