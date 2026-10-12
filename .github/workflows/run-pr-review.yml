@@ -1,0 +1,314 @@
+# Dataset pull-request review (ADR 0092)
+#
+# Deploy to: nemarDatasets/.github/.github/workflows/run-pr-review.yml
+#
+# The NEMAR Worker receives every pull_request event for a dataset repository (forks included,
+# once the NEMAR GitHub App is subscribed to Pull request events), decides whether to spend a
+# review on it, and dispatches this workflow with the review's coordinates. This job CLAIMS the
+# review, reads the change as git data, asks Claude Haiku 5.5 (high effort) three questions about
+# it, and posts a closed-vocabulary report back to the Worker, which derives the verdict and
+# publishes the check-run and the pull-request comment.
+#
+# THE CLAIM COMES FIRST. The dispatch carries a one-shot token the Worker signed for this review.
+# Once the token is masked and the fields are checked, the first real step presents it to the
+# Worker, which accepts it once. A dispatch that cannot (it was forged by someone holding a dataset
+# repository's workflow credentials, it was already claimed, or a newer Worker-recorded delivery
+# exists) stops there, before anything is installed, minted or sent to a model. That is what makes
+# the Worker's spend caps binding. A claim that could not be decided (the Worker was unreachable or
+# answered with an error) fails the job loudly instead: it is neither forged nor known stale, and
+# nobody would otherwise learn that the review never started. The later review script checks the
+# fetched pull ref and current API head against the dispatched SHA before calling the model.
+#
+# WHAT EACH STEP CAN HOLD. The step that calls the model has the federated Anthropic identity and
+# the callback token in its environment, and no GitHub credential in it. The GitHub App's private
+# key is used by exactly one step, which mints a read-only token (contents and pull requests:
+# read) for ONE dataset repository, one hour at most. That token is passed to the two steps that
+# read the repository, and the fetch step also leaves it in the repository's git config, because
+# the model step's git reads fetch blobs lazily (the clone is blob-less) and need it. So the model
+# step can USE the read-only token through git; it cannot print it, send it anywhere, or write with
+# it, and nothing from the pull request runs. Apart from the one-shot callback token, which can
+# post one report for this review and nothing else, the job has no credential that can write to
+# GitHub or to NEMAR. `id-token: write` puts the OIDC request variables in every step's
+# environment, which the federation rule's conditions (this repository, this workflow, main) bound.
+#
+# THE CALLBACK TOKEN IS MASKED BEFORE ANYTHING CAN PRINT IT. This repository's logs are public and
+# Actions prints a step's `env:` in its header, so the token is never in job-level env, the first
+# step registers it as a secret, and only the steps that use it carry it (each header then shows
+# ***). Without that, anyone could read the token from a live log and post a report of their own.
+#
+# NOTHING FROM THE PULL REQUEST IS EXECUTED. The repository is fetched with init and fetch, never
+# checkout, so it has no working tree and no hook, filter or script in the pull request can run; a
+# fork's commits are read through the pull ref on the BASE repository exactly like a branch's. The
+# only code that runs is checked out of nemarOrg/nemar-cli main into ./tool.
+#
+# THE DISPATCH PAYLOAD IS UNTRUSTED. The shims in the dataset repositories hold the credentials to
+# send any dispatch, so every field is validated here, reaches the shell only through env, and is
+# cross-checked against GitHub's own record of the pull request (it must still be open, still
+# target main, and still be at head_sha) before the model is called.
+#
+# ORG VARIABLES (nemarDatasets, visible to this repository), the identifiers the federation rule
+# was created with. They name the rule; the rule's own conditions are what authorize this job:
+#   ANTHROPIC_FEDERATION_RULE_ID  ANTHROPIC_ORGANIZATION_ID
+#   ANTHROPIC_SERVICE_ACCOUNT_ID  ANTHROPIC_WORKSPACE_ID
+# The rule should accept only this repository's default branch and this workflow file
+# (subject repo:nemarDatasets/.github:ref:refs/heads/main, job_workflow_ref
+# nemarDatasets/.github/.github/workflows/run-pr-review.yml@refs/heads/main).
+#
+# THIS LOG IS PUBLIC. Nothing here prints a dataset's content, a pull request's text, or the
+# model's output; the script prints a review id, fixed words, class names and HTTP statuses.
+
+name: Run PR Review
+
+on:
+  repository_dispatch:
+    types: [run-pr-review]
+
+permissions: {}
+
+# One group per workflow execution. GitHub keeps only one pending run per group, so grouping on
+# client payload would let an untrusted dispatch replace a legitimate pending run. The Worker
+# decides whether its latest recorded delivery may be claimed. Later, the review script checks the
+# fetched pull ref and current API head against the dispatched SHA before the model call.
+concurrency:
+  group: pr-review-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    # Not secret. The callback token is deliberately NOT here: see the header.
+    env:
+      DATASET_ID: ${{ github.event.client_payload.dataset_id }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+      HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+      REVIEW_ID: ${{ github.event.client_payload.review_id }}
+      ENVIRONMENT: ${{ github.event.client_payload.environment }}
+    steps:
+      # First, with no env at all: after this step the token is a registered secret, and every later
+      # step's log (its header included) shows it as ***.
+      - name: Mask the callback token
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = context.payload.client_payload && context.payload.client_payload.callback_token;
+            if (typeof token === 'string' && token.length > 0) core.setSecret(token);
+
+      - name: Validate the dispatch
+        env:
+          PR_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+        run: |
+          set -euo pipefail
+          [[ "$DATASET_ID" =~ ^(nm|xx|on)[0-9]{6}$ ]] || { echo "::error::malformed dataset id"; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]{1,9}$ ]] || { echo "::error::malformed pull request number"; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::malformed head sha"; exit 1; }
+          [[ "$REVIEW_ID" =~ ^[0-9]{1,12}$ ]] || { echo "::error::malformed review id"; exit 1; }
+          [[ "$ENVIRONMENT" == "production" || "$ENVIRONMENT" == "dev" ]] || { echo "::error::malformed environment"; exit 1; }
+          [[ -n "$PR_REVIEW_CALLBACK_TOKEN" ]] || { echo "::error::no callback token"; exit 1; }
+          # The workflow's copy of the API origin table, keyed by the environment's NAME and never
+          # built from the payload. scripts/ci/pr-review.ts holds the same table; a test keeps the
+          # two equal.
+          case "$ENVIRONMENT" in
+            production) origin="https://api.nemar.org" ;;
+            dev) origin="https://api-test.nemar.org" ;;
+          esac
+          echo "ORIGIN=$origin" >> "$GITHUB_ENV"
+          # A dependency-free reporter, written now so it works however far the job gets: it needs
+          # no checkout and no install, which a failure may have been about. It never fails the
+          # step it runs in, and it says what the Worker answered, so a report that was refused
+          # shows in the log instead of leaving the Worker to time the review out.
+          cat > "$RUNNER_TEMP/report-error.sh" <<'REPORTER'
+          #!/usr/bin/env bash
+          # usage: report-error.sh <error word from the Worker's closed list>
+          code=000
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+              "$ORIGIN/webhooks/pr-review-result" \
+              -H 'Content-Type: application/json' \
+              -H "X-Webhook-Token: $PR_REVIEW_CALLBACK_TOKEN" \
+              --data "{\"review_id\":$REVIEW_ID,\"dataset_id\":\"$DATASET_ID\",\"outcome\":\"error\",\"error\":\"$1\"}") || code=000
+            case "$code" in 2??|4??) break ;; esac
+            if [ "$attempt" -lt 3 ]; then sleep "$attempt"; fi
+          done
+          echo "review $REVIEW_ID: reported $1 (HTTP $code)"
+          exit 0
+          REPORTER
+          chmod +x "$RUNNER_TEMP/report-error.sh"
+
+      # Present the token to the Worker before anything is installed, minted or sent anywhere. The
+      # Worker accepts it once. A dispatch it refuses (HTTP 401: forged or replayed; 409: already
+      # claimed, superseded, no longer reviewable, or unsettled) ends the job here, green, having
+      # spent nothing. Any other answer, or none, means the Worker could not decide: the job fails,
+      # because the review exists and is waiting, and a green run would hide that. A transient error
+      # is retried first.
+      # (If the Worker claimed and the answer was lost, the retry is refused as already claimed and
+      # the review is later reported as not finished; the watchdog says so.)
+      - name: Claim the review
+        id: claim
+        env:
+          PR_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+        run: |
+          set -uo pipefail
+          # Three tries for a Worker that is briefly unreachable or answers with a server error. Any
+          # answer below 500 is final. (curl's own --retry fails with -o /dev/null on a retried
+          # transfer, which is why this is a loop.)
+          code=000
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+              "$ORIGIN/webhooks/pr-review-claim" \
+              -H 'Content-Type: application/json' \
+              -H "X-Webhook-Token: $PR_REVIEW_CALLBACK_TOKEN" \
+              --data "{\"review_id\":$REVIEW_ID,\"dataset_id\":\"$DATASET_ID\"}") || code=000
+            case "$code" in 2??|3??|4??) break ;; esac
+            if [ "$attempt" -lt 3 ]; then sleep "$attempt"; fi
+          done
+          case "$code" in
+            200)
+              echo "claimed=true" >> "$GITHUB_OUTPUT"
+              echo "review $REVIEW_ID claimed"
+              ;;
+            401|409)
+              echo "claimed=false" >> "$GITHUB_OUTPUT"
+              echo "review $REVIEW_ID not claimed (HTTP $code); nothing was spent"
+              ;;
+            *)
+              echo "claimed=false" >> "$GITHUB_OUTPUT"
+              echo "::error::the claim for review $REVIEW_ID could not be decided (HTTP $code)"
+              exit 1
+              ;;
+          esac
+
+      - name: Check out the review script
+        if: steps.claim.outputs.claimed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: main
+          path: tool
+          persist-credentials: false
+
+      - name: Set up Bun
+        if: steps.claim.outputs.claimed == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install the review script's dependencies
+        if: steps.claim.outputs.claimed == 'true'
+        working-directory: tool
+        run: bun install --frozen-lockfile
+
+      # Fail early and say why, rather than let the SDK fail to find a credential. The Worker turns
+      # this into a check that says the review service could not sign in.
+      - name: Check the federation configuration
+        if: steps.claim.outputs.claimed == 'true'
+        env:
+          PR_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ACCOUNT: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          WORKSPACE: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          if [[ -z "$RULE" || -z "$ORG" || -z "$ACCOUNT" || -z "$WORKSPACE" ]]; then
+            echo "::error::the ANTHROPIC_* organization variables are not all set"
+            "$RUNNER_TEMP/report-error.sh" auth_failed
+            exit 1
+          fi
+
+      # Read-only, one repository. This token is handed to the next two steps and to no other; the
+      # fetch step also stores it in the repository's git config (see the header).
+      - name: Mint a read-only token for the dataset repository
+        if: steps.claim.outputs.claimed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      # init + fetch, never checkout: there is no working tree, so nothing in the pull request can
+      # run. The base is main's tip; the head is the pull ref on THIS repository, which is where
+      # GitHub puts a fork's commits too.
+      - name: Fetch the pull request as git data
+        if: steps.claim.outputs.claimed == 'true'
+        id: fetch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/repo"
+          mkdir -p "$repo"
+          cd "$repo"
+          git init -q .
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git config core.hooksPath /dev/null
+          git config extensions.partialClone origin
+          git remote add origin "https://github.com/nemarDatasets/${DATASET_ID}.git"
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          git fetch -q --no-tags --filter=blob:none origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          echo "base=$(git rev-parse refs/remotes/origin/main)" >> "$GITHUB_OUTPUT"
+          echo "fetched=$(git rev-parse refs/remotes/pr/head)" >> "$GITHUB_OUTPUT"
+
+      - name: Read the pull request from the API
+        if: steps.claim.outputs.claimed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/nemarDatasets/${DATASET_ID}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
+
+      # Minted last, so it has not aged when the script exchanges it. The audience is the one the
+      # federation rule expects.
+      - name: Fetch the GitHub OIDC token for Anthropic
+        if: steps.claim.outputs.claimed == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const token = await core.getIDToken('https://api.anthropic.com');
+            core.setSecret(token);
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/anthropic-oidc.jwt`, token, { mode: 0o600 });
+
+      # The model step: the federated identity and the callback token in its environment, and no
+      # GitHub credential in it (git reads the stored read-only token, see the header).
+      - name: Review
+        if: steps.claim.outputs.claimed == 'true'
+        working-directory: tool
+        env:
+          PR_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          BASE_SHA: ${{ steps.fetch.outputs.base }}
+          FETCHED_SHA: ${{ steps.fetch.outputs.fetched }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/anthropic-oidc.jwt
+        run: |
+          bun run scripts/ci/pr-review.ts review \
+            --repo-dir "$RUNNER_TEMP/repo" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --fetched-head "$FETCHED_SHA" \
+            --pr-json "$RUNNER_TEMP/pr.json" \
+            --review-id "$REVIEW_ID" \
+            --dataset "$DATASET_ID" \
+            --environment "$ENVIRONMENT"
+
+      # If a claimed job failed or was cancelled before the script could report, say so. It needs
+      # nothing the job may have failed to install. A report already delivered makes this a
+      # harmless 401 (the token is spent); a job that never claimed has nothing to report.
+      - name: Report that the job failed
+        if: (failure() || cancelled()) && steps.claim.outputs.claimed == 'true'
+        env:
+          PR_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+        run: '"$RUNNER_TEMP/report-error.sh" workflow_failed'
