@@ -124,7 +124,6 @@ jobs:
           fi
 
       - name: Validate inputs
-        id: validate
         run: |
           set -euo pipefail
 
@@ -187,6 +186,7 @@ jobs:
       # a third-party action or a package install (onboard-openneuro.yml keeps
       # it away from them the same way).
       - name: Install bun
+        id: bun
         uses: oven-sh/setup-bun@v2
 
       # The CLI that matches the backend this run is for: the staging backend runs
@@ -231,18 +231,6 @@ jobs:
           # A newline would write extra variables into GITHUB_ENV.
           case "$KEY" in *$'\n'*) echo "::error::NEMAR_ADMIN_API_KEY_DEV must be a single line"; exit 1 ;; esac
           echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
-
-      # The dispatch token, handed to the CLI now that the package install is
-      # behind us (so it is not part of the environment the install runs in). It is
-      # already a registered secret, so every later step header shows ***. Empty means
-      # no token: the CLI then sends none and the backend records the caller.
-      - name: Select the dispatch token
-        run: |
-          set -euo pipefail
-          token=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
-          if [ -n "$token" ]; then
-            echo "NEMAR_APPROVAL_DISPATCH_TOKEN=${token}" >> "$GITHUB_ENV"
-          fi
 
       # Fail before anything irreversible, in two parts.
       #
@@ -348,6 +336,14 @@ jobs:
           args=(admin publish approve "$DATASET_ID" --yes)
           if [ "$RESUME" = "true" ]; then args+=(--resume); fi
 
+          # The dispatch token reaches the CLI here, in this step's own shell and
+          # only now that the package install is behind us; it is never written to
+          # GITHUB_ENV, so no other step has it in its environment. It has been a
+          # registered secret since the first step. Empty means no token: the CLI
+          # then sends none and the backend records the caller.
+          token=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$token" ]; then export NEMAR_APPROVAL_DISPATCH_TOKEN="$token"; fi
+
           # Actions runs this under `bash -e`: without turning errexit off, a
           # failing CLI would abort the script before its exit code is recorded.
           set +e
@@ -426,12 +422,13 @@ jobs:
       # an older backend (no token) is simply not told. The host comes from the
       # fixed environment map above, never from the payload.
       - name: Release the approval claim
-        # Tests the payload, not an exported variable: the token is exported to the
-        # environment only after the install (below), so a run that failed BEFORE that
+        # Tests the payload, not an exported variable: the token reaches the
+        # environment only inside the approve step, so a run that failed BEFORE that
         # (a failed install, a missing secret, a cancel) would otherwise never report,
-        # and those are the failures this step exists for. API_URL is set by the
-        # validation step, so a run whose inputs were rejected has no validated host
-        # and is skipped (it never claimed anything it can name).
+        # and those are the failures this step exists for. API_URL is written by the
+        # validation step only after every input check passed, so a run whose inputs
+        # were rejected has no validated host and is skipped (it never claimed
+        # anything it can name).
         if: (failure() || cancelled()) && github.event.client_payload.dispatch_token != '' && env.API_URL != ''
         continue-on-error: true
         # Step outcomes are fixed words (success, failure, cancelled, skipped),
@@ -439,7 +436,7 @@ jobs:
         # into the script.
         env:
           RUN_CANCELLED: ${{ cancelled() }}
-          OUTCOME_VALIDATE: ${{ steps.validate.outcome }}
+          OUTCOME_BUN: ${{ steps.bun.outcome }}
           OUTCOME_INSTALL: ${{ steps.install.outcome }}
           OUTCOME_CREDENTIALS_PRODUCTION: ${{ steps.credentials_production.outcome }}
           OUTCOME_CREDENTIALS_DEV: ${{ steps.credentials_dev.outcome }}
@@ -452,9 +449,7 @@ jobs:
           if [ -z "$NEMAR_APPROVAL_DISPATCH_TOKEN" ]; then echo "No dispatch token; nothing to release."; exit 0; fi
           if [ "$RUN_CANCELLED" = "true" ]; then
             reason=workflow_cancelled
-          elif [ "$OUTCOME_VALIDATE" = "failure" ]; then
-            reason=input_rejected
-          elif [ "$OUTCOME_INSTALL" = "failure" ]; then
+          elif [ "$OUTCOME_BUN" = "failure" ] || [ "$OUTCOME_INSTALL" = "failure" ]; then
             reason=install_failed
           elif [ "$OUTCOME_CREDENTIALS_PRODUCTION" = "failure" ] || [ "$OUTCOME_CREDENTIALS_DEV" = "failure" ]; then
             reason=secret_missing
