@@ -1,0 +1,196 @@
+# Publication review calibration (ADR 0102, call 6; nemar-cli design note, section 7)
+#
+# Deploy to: nemarDatasets/.github/.github/workflows/calibrate-publication-review.yml
+#
+# A one-off, operator-run measurement of the publication review's model before the review is turned
+# on: it builds the calibration corpus (published datasets' root documents, plus mutated copies that
+# each carry one known defect) and runs the review's own prompt and model call over it. It posts
+# nothing: no Worker route, no callback, no GitHub write. The only network traffic besides the
+# clones of public dataset repositories is the model call, made with the federated Anthropic
+# identity of this repository's `main` (the same identity the pull-request review uses).
+#
+# Dispatch only (`workflow_dispatch`), so it runs when a person with write access to this
+# repository starts it. The script comes from nemar-cli at a commit the operator names, which must
+# be an ancestor of that repository's `dev` or `main` (checked below), so a commit on a branch or
+# a fork cannot receive the federated identity.
+#
+# THIS LOG AND ITS ARTIFACT ARE PUBLIC. The script prints counts and fixed words. The artifact is
+# the results file: ids, labels, closed words, token counts and timings, never a document's text
+# and never a word the model wrote. The review sheet (the model's own words, for the maintainer's
+# judgments) is NOT produced here; that needs an operator's machine.
+#
+# THE FEDERATED IDENTITY. This uses the pull-request review's service account and rule (the
+# ANTHROPIC_FEDERATION_RULE_ID and ANTHROPIC_SERVICE_ACCOUNT_ID organization variables), because
+# the rule accepts this repository's `main` and does not pin a workflow file. The rule is the real
+# control: `id-token: write` puts the token request variables in every step's environment, so the
+# checked-out script (and the SDK it imports) could ask for a token itself. What stops a stray
+# commit from getting one is the ancestor check below, `--ignore-scripts`, and the rule.
+#
+# THE TOKEN IS REFRESHED. A GitHub OIDC token lives about five minutes and the SDK reads the token
+# file again for every new client, one per model call, so the Calibrate step mints a fresh token
+# every three minutes into the same file (written beside it and moved into place) for as long as
+# the script runs.
+#
+# THE ARTIFACT HOLDS A VERDICT PER NAMED PUBLIC DATASET, so it is kept for one day only; the
+# operator downloads it and deletes it. The step summary carries counts only.
+#
+# Remove this file when the calibration is recorded: a workflow that can use the federated
+# identity should exist only while it is needed.
+
+name: Calibrate Publication Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "nemar-cli commit (40 hex characters) on dev or main that holds the calibration script"
+        required: true
+        type: string
+      ids:
+        description: "Dataset ids to calibrate on, comma separated (nm or on, six digits)"
+        required: true
+        type: string
+      model:
+        description: "Model to calibrate"
+        required: true
+        type: choice
+        default: claude-haiku-5-5
+        options:
+          - claude-haiku-5-5
+          - claude-sonnet-5-5
+      limit:
+        description: "Stop after this many entries (empty for the whole corpus)"
+        required: false
+        type: string
+      mutate_per_defect:
+        description: "Mutated copies to make per defect kind"
+        required: false
+        default: "6"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: calibrate-publication-review
+  cancel-in-progress: false
+
+jobs:
+  calibrate:
+    name: Calibrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Inputs reach the shell only through the environment, and each is checked against a closed
+      # shape before anything else runs.
+      - name: Check the inputs
+        id: inputs
+        env:
+          REF: ${{ inputs.ref }}
+          IDS: ${{ inputs.ids }}
+          LIMIT: ${{ inputs.limit }}
+          MUTATE: ${{ inputs.mutate_per_defect }}
+          GH_TOKEN: ${{ github.token }}
+          RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ACCOUNT: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          WORKSPACE: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RULE" || -z "$ORG" || -z "$ACCOUNT" || -z "$WORKSPACE" ]]; then
+            echo "::error::the ANTHROPIC_* organization variables are not all set"; exit 1
+          fi
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a 40-character commit id"; exit 1; }
+          [[ "$IDS" =~ ^((nm|on)[0-9]{6},)*(nm|on)[0-9]{6}$ ]] || { echo "::error::ids must be comma separated dataset ids"; exit 1; }
+          [[ -z "$LIMIT" || "$LIMIT" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "::error::limit must be a whole number"; exit 1; }
+          [[ "$MUTATE" =~ ^(0|[1-9][0-9]?)$ ]] || { echo "::error::mutate_per_defect must be a whole number"; exit 1; }
+          # The commit must already be part of dev or main of nemar-cli.
+          ok=false
+          for branch in dev main; do
+            status=$(gh api "repos/nemarOrg/nemar-cli/compare/${branch}...${REF}" --jq .status 2>/dev/null || true)
+            if [[ "$status" == "identical" || "$status" == "behind" ]]; then ok=true; fi
+          done
+          [[ "$ok" == true ]] || { echo "::error::the commit is not on dev or main of nemar-cli"; exit 1; }
+          printf '%s\n' "$IDS" | tr ',' '\n' > "$RUNNER_TEMP/ids.txt"
+          count=$(wc -l < "$RUNNER_TEMP/ids.txt")
+          [[ "$count" -le 300 ]] || { echo "::error::at most 300 ids"; exit 1; }
+          echo "entries requested: $count"
+
+      - name: Check out the calibration script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: ${{ inputs.ref }}
+          path: tool
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+
+      # No lifecycle script runs. Not `--production`: the Anthropic SDK is a development dependency.
+      - name: Install the script's dependencies
+        working-directory: tool
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      # Public repositories, cloned without blobs and without a credential.
+      - name: Build the corpus
+        working-directory: tool
+        env:
+          MUTATE: ${{ inputs.mutate_per_defect }}
+        run: |
+          bun run scripts/ci/publication-review.ts calibrate corpus \
+            --ids-file "$RUNNER_TEMP/ids.txt" \
+            --out "$RUNNER_TEMP/corpus" \
+            --mutate-per-defect "$MUTATE"
+
+      - name: Calibrate
+        working-directory: tool
+        env:
+          MODEL: ${{ inputs.model }}
+          LIMIT: ${{ inputs.limit }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/anthropic-oidc.jwt
+        run: |
+          set -euo pipefail
+          mint() {
+            local t
+            t=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" | jq -r .value) || return 1
+            [[ -n "$t" && "$t" != "null" ]] || return 1
+            echo "::add-mask::$t"
+            ( umask 077; printf '%s' "$t" > "${ANTHROPIC_IDENTITY_TOKEN_FILE}.tmp" )
+            mv "${ANTHROPIC_IDENTITY_TOKEN_FILE}.tmp" "$ANTHROPIC_IDENTITY_TOKEN_FILE"
+          }
+          mint
+          ( while sleep 180; do mint || true; done ) &
+          refresher=$!
+          trap 'kill "$refresher" 2>/dev/null || true' EXIT
+          args=(calibrate run --corpus "$RUNNER_TEMP/corpus" --out "$RUNNER_TEMP/results.jsonl" --model "$MODEL")
+          if [[ -n "$LIMIT" ]]; then args+=(--limit "$LIMIT"); fi
+          bun run scripts/ci/publication-review.ts "${args[@]}"
+
+      # Counts only, to the step summary: the outcome of each label, and how many records errored.
+      - name: Summarize
+        if: always()
+        run: |
+          [[ -s "$RUNNER_TEMP/results.jsonl" ]] || { echo "no results file"; exit 0; }
+          {
+            echo "### Outcomes by label"
+            jq -r -s 'group_by(.label)[] | "\(.[0].label): \(length) records, " + ([.[].outcome] | group_by(.) | map("\(.[0]) \(length)") | join(", "))' "$RUNNER_TEMP/results.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the results file
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: calibration-results
+          path: ${{ runner.temp }}/results.jsonl
+          if-no-files-found: warn
+          retention-days: 1
