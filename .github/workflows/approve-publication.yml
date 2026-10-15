@@ -13,7 +13,14 @@ name: Approve Publication
 # Triggered by:
 #   - repository_dispatch[approve-publication] from api.nemar.org when an admin
 #     clicks Approve on nemar.org (POST /admin/publish/:id/approve-dispatch).
-#     client_payload: { dataset_id, request_id, resume, environment }.
+#     client_payload: { dataset_id, request_id, resume, environment,
+#     dispatch_token }. The dispatch token is a bearer credential for THIS
+#     approval only: it proves to the backend that the run belongs to the
+#     click, so the approval is recorded under the administrator who clicked
+#     (and under nobody else for a call without it). It is masked first,
+#     handed to the CLI only after the install, and used to release the
+#     claim if the run fails. An older backend sends none, and the run then
+#     behaves as it did before.
 #   - workflow_dispatch (manual run, same inputs minus request_id).
 #
 # What it does: validate the inputs, pick credentials for the environment,
@@ -93,7 +100,31 @@ jobs:
       RAW_RESUME: ${{ github.event.client_payload.resume || inputs.resume }}
       RAW_REQUEST_ID: ${{ github.event.client_payload.request_id }}
     steps:
+      # FIRST, before any other step: register the dispatch token as a secret so
+      # no later step header or log line can show it. It is read from the event
+      # file, never copied into this step's or the job's `env:` (the RAW_ values
+      # above are, and an env value is printed in the step header before a
+      # step can mask it). The token is NOT exported here: it reaches the CLI in
+      # a later step, after the package install, the way the admin key does. (The
+      # event file itself stays readable by every step of the job, the install
+      # included; that is harmless, because the token alone can only release its own
+      # claim, and the installed CLI later holds both the key and the token.)
+      - name: Mask the dispatch token
+        run: |
+          set -euo pipefail
+          token=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
+          # Absent is fine (a manual run, or a backend that predates the token).
+          if [ -n "$token" ]; then
+            # The rejected value is deliberately not echoed.
+            if [ "${#token}" -ne 64 ] || [ -n "${token//[0-9a-f]/}" ]; then
+              echo "::error::dispatch_token is malformed"
+              exit 1
+            fi
+            echo "::add-mask::${token}"
+          fi
+
       - name: Validate inputs
+        id: validate
         run: |
           set -euo pipefail
 
@@ -113,7 +144,10 @@ jobs:
           echo "TEST_API_URL=${api_url}" >> "$GITHUB_ENV"
 
           # The id is used in a URL path and as a CLI argument: allow only the
-          # shapes the backend mints for that environment. The dev catalog also
+          # shapes the backend mints for that environment. The same shapes are
+          # declared once in the CLI repository's shared/publication-limits.ts
+          # (APPROVAL_DISPATCH_ID_RE), which the Worker checks first; keep the
+          # two in step. The dev catalog also
           # holds the xx exemplar fleet (the off-production pipeline test),
           # which production never does. The rejected value is deliberately not
           # echoed, so a crafted payload cannot write workflow commands into
@@ -155,13 +189,27 @@ jobs:
       - name: Install bun
         uses: oven-sh/setup-bun@v2
 
+      # The CLI that matches the backend this run is for: the staging backend runs
+      # unreleased code and the matching CLI is published under the `dev` tag, while
+      # production waits for the release (`latest`). Installing `latest` for a staging
+      # run would send no dispatch token to a backend that requires one. The
+      # environment was validated above, so the tag comes from a fixed choice.
       - name: Install nemar CLI
-        run: bun install -g nemar-cli
+        id: install
+        run: |
+          set -euo pipefail
+          case "$NEMAR_ENV" in
+            production) tag=latest ;;
+            dev) tag=dev ;;
+            *) echo "::error::environment must be production or dev"; exit 1 ;;
+          esac
+          bun install -g "nemar-cli@${tag}"
 
       # One step per environment, each seeing only its own secret. A single
       # `cond && secrets.DEV || secrets.PROD` expression would fall back to the
       # production key whenever the dev secret is empty.
       - name: Select credentials (production)
+        id: credentials_production
         if: env.NEMAR_ENV == 'production'
         env:
           KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
@@ -173,6 +221,7 @@ jobs:
           echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
 
       - name: Select credentials (dev)
+        id: credentials_dev
         if: env.NEMAR_ENV == 'dev'
         env:
           KEY: ${{ secrets.NEMAR_ADMIN_API_KEY_DEV }}
@@ -182,6 +231,18 @@ jobs:
           # A newline would write extra variables into GITHUB_ENV.
           case "$KEY" in *$'\n'*) echo "::error::NEMAR_ADMIN_API_KEY_DEV must be a single line"; exit 1 ;; esac
           echo "NEMAR_API_KEY=${KEY}" >> "$GITHUB_ENV"
+
+      # The dispatch token, handed to the CLI now that the package install is
+      # behind us (so it is not part of the environment the install runs in). It is
+      # already a registered secret, so every later step header shows ***. Empty means
+      # no token: the CLI then sends none and the backend records the caller.
+      - name: Select the dispatch token
+        run: |
+          set -euo pipefail
+          token=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$token" ]; then
+            echo "NEMAR_APPROVAL_DISPATCH_TOKEN=${token}" >> "$GITHUB_ENV"
+          fi
 
       # Fail before anything irreversible, in two parts.
       #
@@ -200,6 +261,7 @@ jobs:
       #
       # Either way it also decides whether this run resumes (see below).
       - name: Preflight admin access and request
+        id: preflight
         run: |
           set -euo pipefail
 
@@ -355,3 +417,69 @@ jobs:
             exit 1
           fi
           echo "${DATASET_ID} is published."
+
+      # The backend cannot see a run that fails before it reaches the API (a
+      # missing secret, a failed install, a rejected input): without this step
+      # the click's claim would hold the request "in progress" until the lease
+      # lapses. Tell the backend, with the token that proves the run belongs to
+      # the click. Best effort: it never fails the job, tries three times, and
+      # an older backend (no token) is simply not told. The host comes from the
+      # fixed environment map above, never from the payload.
+      - name: Release the approval claim
+        # Tests the payload, not an exported variable: the token is exported to the
+        # environment only after the install (below), so a run that failed BEFORE that
+        # (a failed install, a missing secret, a cancel) would otherwise never report,
+        # and those are the failures this step exists for. API_URL is set by the
+        # validation step, so a run whose inputs were rejected has no validated host
+        # and is skipped (it never claimed anything it can name).
+        if: (failure() || cancelled()) && github.event.client_payload.dispatch_token != '' && env.API_URL != ''
+        continue-on-error: true
+        # Step outcomes are fixed words (success, failure, cancelled, skipped),
+        # passed through env like every other value here, never interpolated
+        # into the script.
+        env:
+          RUN_CANCELLED: ${{ cancelled() }}
+          OUTCOME_VALIDATE: ${{ steps.validate.outcome }}
+          OUTCOME_INSTALL: ${{ steps.install.outcome }}
+          OUTCOME_CREDENTIALS_PRODUCTION: ${{ steps.credentials_production.outcome }}
+          OUTCOME_CREDENTIALS_DEV: ${{ steps.credentials_dev.outcome }}
+          OUTCOME_PREFLIGHT: ${{ steps.preflight.outcome }}
+        run: |
+          set -uo pipefail
+          # The token comes from the event file (it has been a masked secret since the
+          # first step), never from the job environment.
+          NEMAR_APPROVAL_DISPATCH_TOKEN=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$NEMAR_APPROVAL_DISPATCH_TOKEN" ]; then echo "No dispatch token; nothing to release."; exit 0; fi
+          if [ "$RUN_CANCELLED" = "true" ]; then
+            reason=workflow_cancelled
+          elif [ "$OUTCOME_VALIDATE" = "failure" ]; then
+            reason=input_rejected
+          elif [ "$OUTCOME_INSTALL" = "failure" ]; then
+            reason=install_failed
+          elif [ "$OUTCOME_CREDENTIALS_PRODUCTION" = "failure" ] || [ "$OUTCOME_CREDENTIALS_DEV" = "failure" ]; then
+            reason=secret_missing
+          elif [ "$OUTCOME_PREFLIGHT" = "failure" ]; then
+            reason=preflight_failed
+          else
+            reason=workflow_failed
+          fi
+          case "$REQUEST_ID" in
+            ""|*[!0-9]*) echo "No request id; nothing to release."; exit 0 ;;
+          esac
+          body=$(jq -n --arg d "$DATASET_ID" --argjson r "$REQUEST_ID" --arg why "$reason" \
+            '{dataset_id: $d, request_id: $r, reason: $why}')
+          for attempt in 1 2 3; do
+            code=$(printf 'header = "X-Approval-Dispatch-Token: %s"\n' "$NEMAR_APPROVAL_DISPATCH_TOKEN" \
+              | curl -sS -m 30 -K - -o /dev/null -w '%{http_code}' \
+                  -X POST -H "Content-Type: application/json" \
+                  --data "$body" "${API_URL}/webhooks/approval-release") || code=000
+            if [ "$code" = "200" ]; then echo "Released the approval claim (${reason})."; exit 0; fi
+            # 401 is the one answer for "no live claim to release": the request
+            # was published, denied, taken over by a terminal approval, or already
+            # released. There is nothing to retry.
+            if [ "$code" = "401" ]; then echo "Nothing to release (the claim is already gone)."; exit 0; fi
+            echo "Release attempt ${attempt} answered HTTP ${code}."
+            sleep 5
+          done
+          echo "::warning::The approval claim was not released; it lapses on its own after the lease."
+          exit 0
