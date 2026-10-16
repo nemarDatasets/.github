@@ -33,11 +33,12 @@
 # environment, which the federation rule's conditions (this repository, this workflow, main) bound.
 #
 # THE ORDER AFTER THE MINT. The checkout of the review script, the Bun setup and the install of its
-# dependencies all run after the step that is given the GitHub App's private key, and the install
-# passes --ignore-scripts, so nothing the checked-out tree or a setup action brings runs before
-# that step and no script of the tree's (its prepare and postinstall, or a dependency's) runs
-# during the install: the first two of the three things run-publication-review.yml closes, which
-# also says what is left open.
+# dependencies run after the step that is given the GitHub App's private key and before the fetch
+# step writes the dataset token to the clone's configuration. The install passes --ignore-scripts,
+# so no script of the checked-out tree (its prepare and postinstall) and no script of a dependency
+# runs. With the mint first, this closes the three things run-publication-review.yml closes: code
+# planted before the mint, install-time scripts, and a token in a configuration file that the
+# install could read.
 #
 # THE CALLBACK TOKEN IS MASKED BEFORE ANYTHING CAN PRINT IT. This repository's logs are public and
 # Actions prints a step's `env:` in its header, so the token is never in job-level env, the first
@@ -213,8 +214,8 @@ jobs:
             exit 1
           fi
 
-      # Read-only, one repository. This token is handed to the next two steps and to no other; the
-      # fetch step also stores it in the repository's git config (see the header).
+      # Read-only, one repository. This token goes to the two steps that read the repository and to
+      # no other; the fetch step also stores it in the repository's git config (see the header).
       - name: Mint a read-only token for the dataset repository
         if: steps.claim.outputs.claimed == 'true'
         id: app-token
@@ -226,6 +227,30 @@ jobs:
           repositories: ${{ env.DATASET_ID }}
           permission-contents: read
           permission-pull-requests: read
+
+      # The checkout, the Bun setup and the install come after the mint and before the fetch on
+      # purpose: see the header.
+      - name: Check out the review script
+        if: steps.claim.outputs.claimed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: main
+          path: tool
+          persist-credentials: false
+
+      - name: Set up Bun
+        if: steps.claim.outputs.claimed == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      # No lifecycle script runs: the review script needs no build step. Not --production: the
+      # Anthropic SDK it imports is a development dependency of this repository.
+      - name: Install the review script's dependencies
+        if: steps.claim.outputs.claimed == 'true'
+        working-directory: tool
+        run: bun install --frozen-lockfile --ignore-scripts
 
       # init + fetch, never checkout: there is no working tree, so nothing in the pull request can
       # run. The base is main's tip; the head is the pull ref on THIS repository, which is where
@@ -260,29 +285,6 @@ jobs:
         run: |
           set -euo pipefail
           gh api "repos/nemarDatasets/${DATASET_ID}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
-
-      # The checkout, the Bun setup and the install come after the mint on purpose: see the header.
-      - name: Check out the review script
-        if: steps.claim.outputs.claimed == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: nemarOrg/nemar-cli
-          ref: main
-          path: tool
-          persist-credentials: false
-
-      - name: Set up Bun
-        if: steps.claim.outputs.claimed == 'true'
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.3
-
-      # No lifecycle script runs: the review script needs no build step. Not --production: the
-      # Anthropic SDK it imports is a development dependency of this repository.
-      - name: Install the review script's dependencies
-        if: steps.claim.outputs.claimed == 'true'
-        working-directory: tool
-        run: bun install --frozen-lockfile --ignore-scripts
 
       # Minted last, so it has not aged when the script exchanges it. The audience is the one the
       # federation rule expects.
