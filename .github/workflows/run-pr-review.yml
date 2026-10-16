@@ -5,16 +5,17 @@
 # The NEMAR Worker receives every pull_request event for a dataset repository (forks included,
 # once the NEMAR GitHub App is subscribed to Pull request events), decides whether to spend a
 # review on it, and dispatches this workflow with the review's coordinates. This job CLAIMS the
-# review, reads the change as git data, asks Claude Haiku 5.5 (high effort) three questions about
-# it, and posts a closed-vocabulary report back to the Worker, which derives the verdict and
-# publishes the check-run and the pull-request comment.
+# review, reads the change as git data, runs the review script from nemarOrg/nemar-cli (main for a
+# production dispatch, dev for a dev one), and posts the script's closed-vocabulary report back to
+# the Worker, which derives the verdict and publishes the check-run and the pull-request comment.
+# The script, not this file, sets the model, its effort and its questions.
 #
 # THE CLAIM COMES FIRST. The dispatch carries a one-shot token the Worker signed for this review.
 # Once the token is masked and the fields are checked, the first real step presents it to the
 # Worker, which accepts it once. A dispatch that cannot (it was forged by someone holding a dataset
 # repository's workflow credentials, it was already claimed, or a newer Worker-recorded delivery
 # exists) stops there, before anything is installed, minted or sent to a model. That is what makes
-# the Worker's spend caps binding. A claim that could not be decided (the Worker was unreachable or
+# the Worker's decision binding. A claim that could not be decided (the Worker was unreachable or
 # answered with an error) fails the job loudly instead: it is neither forged nor known stale, and
 # nobody would otherwise learn that the review never started. The later review script checks the
 # fetched pull ref and current API head against the dispatched SHA before calling the model.
@@ -39,7 +40,9 @@
 # NOTHING FROM THE PULL REQUEST IS EXECUTED. The repository is fetched with init and fetch, never
 # checkout, so it has no working tree and no hook, filter or script in the pull request can run; a
 # fork's commits are read through the pull ref on the BASE repository exactly like a branch's. The
-# only code that runs is checked out of nemarOrg/nemar-cli main into ./tool.
+# only code that runs is checked out of nemarOrg/nemar-cli into ./tool: main for a production
+# dispatch, dev for a dev one. That step comes after the claim, so dev's code runs only for a
+# dispatch the dev Worker signed.
 #
 # THE DISPATCH PAYLOAD IS UNTRUSTED. The shims in the dataset repositories hold the credentials to
 # send any dispatch, so every field is validated here, reaches the shell only through env, and is
@@ -77,7 +80,9 @@ jobs:
   review:
     name: Review
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Ends before the Worker's own deadline for a review (PR_REVIEW_DEADLINE_MINUTES in the
+    # backend); a test keeps the two in order.
+    timeout-minutes: 28
     permissions:
       contents: read
       id-token: write
@@ -182,12 +187,15 @@ jobs:
               ;;
           esac
 
+      # dev for a dev dispatch, main for a production one, so a change to the review script can be
+      # tried on staging before a release. The expression can only yield those two branch names,
+      # and the environment was checked above to be exactly dev or production.
       - name: Check out the review script
         if: steps.claim.outputs.claimed == 'true'
         uses: actions/checkout@v4
         with:
           repository: nemarOrg/nemar-cli
-          ref: main
+          ref: ${{ github.event.client_payload.environment == 'dev' && 'dev' || 'main' }}
           path: tool
           persist-credentials: false
 
