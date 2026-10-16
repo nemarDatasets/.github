@@ -5,10 +5,11 @@
 # The NEMAR Worker receives every pull_request event for a dataset repository (forks included,
 # once the NEMAR GitHub App is subscribed to Pull request events), decides whether to spend a
 # review on it, and dispatches this workflow with the review's coordinates. This job CLAIMS the
-# review, reads the change as git data, runs the review script from nemarOrg/nemar-cli (main for a
-# production dispatch, dev for a dev one), and posts the script's closed-vocabulary report back to
-# the Worker, which derives the verdict and publishes the check-run and the pull-request comment.
-# The script, not this file, sets the model, its effort and its questions.
+# review, reads the change as git data, runs the review script from nemarOrg/nemar-cli (main when
+# the production Worker dispatched the review, dev when the dev Worker did), and posts the script's
+# closed-vocabulary report back to the Worker, which derives the verdict and publishes the
+# check-run and the pull-request comment. The script, not this file, sets the model, its effort and
+# its questions.
 #
 # THE CLAIM COMES FIRST. The dispatch carries a one-shot token the Worker signed for this review.
 # Once the token is masked and the fields are checked, the first real step presents it to the
@@ -40,9 +41,10 @@
 # NOTHING FROM THE PULL REQUEST IS EXECUTED. The repository is fetched with init and fetch, never
 # checkout, so it has no working tree and no hook, filter or script in the pull request can run; a
 # fork's commits are read through the pull ref on the BASE repository exactly like a branch's. The
-# only code that runs is checked out of nemarOrg/nemar-cli into ./tool: main for a production
-# dispatch, dev for a dev one. That step comes after the claim, so dev's code runs only for a
-# dispatch the dev Worker signed.
+# only code that runs is checked out of nemarOrg/nemar-cli into ./tool: main when the production
+# Worker dispatched the review, dev when the dev Worker did. That step comes after the claim, so
+# the dev branch's script runs only for a dispatch the dev Worker signed. (The publication review,
+# run-publication-review.yml, takes main for every dispatch.)
 #
 # THE DISPATCH PAYLOAD IS UNTRUSTED. The shims in the dataset repositories hold the credentials to
 # send any dispatch, so every field is validated here, reaches the shell only through env, and is
@@ -80,8 +82,10 @@ jobs:
   review:
     name: Review
     runs-on: ubuntu-latest
-    # Ends before the Worker's own deadline for a review (PR_REVIEW_DEADLINE_MINUTES in the
-    # backend); a test keeps the two in order.
+    # Below the Worker's deadline for a review (PR_REVIEW_DEADLINE_MINUTES in the backend), so the
+    # job is normally over before the watchdog gives up on it. The deadline runs from when the
+    # review was recorded and this limit from the job's start, so queue time eats the margin; a
+    # report that arrives after the deadline is still accepted. A test keeps the two in order.
     timeout-minutes: 28
     permissions:
       contents: read
@@ -187,9 +191,10 @@ jobs:
               ;;
           esac
 
-      # dev for a dev dispatch, main for a production one, so a change to the review script can be
-      # tried on staging before a release. The expression can only yield those two branch names,
-      # and the environment was checked above to be exactly dev or production.
+      # The dev branch when the dev Worker dispatched the review, main when the production Worker
+      # did, so a change to the review script can run against the dev Worker before a release. The
+      # expression can only yield those two branch names, and the environment was checked above to
+      # be exactly production or dev.
       - name: Check out the review script
         if: steps.claim.outputs.claimed == 'true'
         uses: actions/checkout@v4
