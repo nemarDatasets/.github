@@ -505,6 +505,9 @@ jobs:
             for (var i = 0; i < entries.length; i++) {
               var entry = entries[i];
               if (entry.name === ".git" || entry.name === ".github" || entry.name === "node_modules") continue;
+              // The shared workflow repo is checked out beside the dataset for cleanup scripts.
+              // Keep that helper checkout out of the published dataset archive.
+              if (base === "" && entry.name === "nemar-dotgithub") continue;
               var rel = base ? base + "/" + entry.name : entry.name;
               var full = path.join(dir, entry.name);
               if (entry.isDirectory()) {
