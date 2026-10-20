@@ -92,7 +92,7 @@ jobs:
     # job is normally over before the watchdog gives up on it. The deadline runs from when the
     # review was recorded and this limit from the job's start, so queue time eats the margin; a
     # report that arrives after the deadline is still accepted. A test keeps the two in order.
-    timeout-minutes: 28
+    timeout-minutes: 50
     permissions:
       contents: read
       id-token: write
