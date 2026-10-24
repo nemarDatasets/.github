@@ -140,6 +140,9 @@ jobs:
           repository: nemarDatasets/${{ env.DATASET_ID }}
           ref: ${{ env.HEAD_SHA }}
           token: ${{ steps.app-token.outputs.token }}
+          # The token is used for this fetch only; nothing later runs git, so it is
+          # not left in the checkout's git config for the steps that read the dataset.
+          persist-credentials: false
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
