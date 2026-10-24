@@ -323,6 +323,9 @@ jobs:
           repository: nemarDatasets/${{ env.DATASET_ID }}
           ref: v${{ env.VERSION }}
           token: ${{ steps.app-token.outputs.token }}
+          # The token is used for this fetch only; nothing later runs git, so it is
+          # not left in the checkout's git config for the steps that read the dataset.
+          persist-credentials: false
 
       # Runs AFTER the dataset checkout above, and into its own `path:`,
       # deliberately: that checkout targets the default workspace root with
