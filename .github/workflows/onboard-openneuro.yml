@@ -18,6 +18,13 @@
 # correctness per dataset.
 #
 # Trigger manually with a comma-separated list of OpenNeuro dataset IDs.
+#
+# Pinned to an upstream snapshot tag (nemarOrg/nemar-cli#1909, ADR 0111 decision
+# 10): `openneuro_tag` names one for a single dataset, the auto-import sends the
+# tag its discovery found, and with none the CLI's prepare asks OpenNeuro for the
+# latest tag. Never the mirror's default HEAD. A CLI older than `--tag` is run as
+# before, with a warning: prepare passes the tag only when the installed CLI's
+# help lists it.
 
 name: Onboard OpenNeuro Dataset
 
@@ -28,8 +35,14 @@ on:
         description: "Comma-separated OpenNeuro dataset IDs (e.g., ds007262,ds007263)"
         required: true
         type: string
+      openneuro_tag:
+        description: "Upstream snapshot tag to import (e.g., 1.0.1); one dataset only. Empty: OpenNeuro's latest."
+        required: false
+        type: string
+        default: ""
   # Automatic dispatch from api.nemar.org's auto-import tick (nemarOrg/nemar-cli
-  # #775). client_payload.openneuro_ids carries the (already D1-deduped) id(s).
+  # #775). client_payload.openneuro_ids carries the (already D1-deduped) id(s),
+  # and client_payload.openneuro_tag, when present, the tag discovery found.
   repository_dispatch:
     types: [onboard-openneuro]
 
@@ -47,6 +60,7 @@ jobs:
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
       shards: ${{ steps.parse.outputs.shards }}
+      tag: ${{ steps.parse.outputs.tag }}
     steps:
       - name: Parse and validate dataset IDs
         id: parse
@@ -62,6 +76,8 @@ jobs:
           # quarantined -- noise, not damage. Delete the on###### repo first to
           # re-import (the proper update flow is nemarOrg/nemar-cli#448).
           INPUT_IDS: ${{ github.event.client_payload.openneuro_ids || inputs.openneuro_ids }}
+          # Read through env, never interpolated into the script, like the ids.
+          INPUT_TAG: ${{ github.event.client_payload.openneuro_tag || inputs.openneuro_tag }}
         run: |
           if [ -z "$INPUT_IDS" ]; then
             echo "::error::No openneuro_ids provided (inputs.openneuro_ids / client_payload.openneuro_ids empty)"
@@ -83,6 +99,23 @@ jobs:
             exit 1
           fi
 
+          # The upstream tag (ADR 0111 decision 10): the shape shared/openneuro-tag.ts allows
+          # (letters, digits, `.`, `_`, `-`; a letter or digit first; no `..`), and one dataset
+          # only, because a tag names one dataset's snapshot. Refused rather than dropped: an
+          # import at a tag nobody asked for is the thing the pin exists to prevent.
+          if [ -n "$INPUT_TAG" ]; then
+            tag_re='^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$'
+            if [[ ! "$INPUT_TAG" =~ $tag_re ]] || [[ "$INPUT_TAG" == *..* ]]; then
+              echo "::error::Invalid openneuro_tag. Expected an OpenNeuro snapshot tag such as 1.0.1."
+              exit 1
+            fi
+            if [ ${#kept[@]} -ne 1 ]; then
+              echo "::error::openneuro_tag applies to a single dataset; got ${#kept[@]} ids."
+              exit 1
+            fi
+          fi
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
           JSON=$(printf '%s\n' "${kept[@]}" | jq -R . | jq -s -c .)
           echo "matrix={\"dataset_id\":$JSON}" >> "$GITHUB_OUTPUT"
 
@@ -91,7 +124,7 @@ jobs:
           SHARD_JSON=$(seq 0 $((SHARDS - 1)) | jq -R 'tonumber' | jq -s -c .)
           echo "shards=$SHARD_JSON" >> "$GITHUB_OUTPUT"
 
-          echo "Will import (${#kept[@]}): ${kept[*]} across ${SHARDS} copy shards"
+          echo "Will import (${#kept[@]}): ${kept[*]}${INPUT_TAG:+ at upstream tag $INPUT_TAG} across ${SHARDS} copy shards"
 
   prepare:
     needs: parse-ids
@@ -123,14 +156,32 @@ jobs:
       - name: Prepare import
         env:
           DATASET_ID: ${{ matrix.dataset_id }}
+          OPENNEURO_TAG: ${{ needs.parse-ids.outputs.tag }}
           GH_TOKEN: ${{ secrets.NEMAR_GITHUB_PAT }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         # Tee the output so the failure step below can classify the cause.
         # pipefail keeps the step's exit code the CLI's (not tee's).
+        #
+        # `--tag` only when a tag was given AND the installed CLI understands it: the CLI
+        # is installed unpinned (npm latest) at run time, so this file can meet one older
+        # than the flag, and an unknown option would fail the import outright. Such a CLI
+        # imports as it always did, without a tag. The help text grepped is the one
+        # test/import-openneuro-tag-option.unit.test.ts pins in the CLI.
         run: |
           set -o pipefail
-          nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream 2>&1 \
+          tag_args=()
+          if [ -n "$OPENNEURO_TAG" ]; then
+            # Captured, then matched in bash: `--help | grep -q` under pipefail can fail on the
+            # SIGPIPE grep's early exit sends the CLI, and read as "no --tag".
+            cli_help="$(nemar admin import-openneuro --help 2>/dev/null || true)"
+            if [[ "$cli_help" == *"--tag <tag>"* ]]; then
+              tag_args=(--tag "$OPENNEURO_TAG")
+            else
+              echo "::warning::The installed nemar CLI has no --tag; importing $DATASET_ID without the requested upstream tag $OPENNEURO_TAG"
+            fi
+          fi
+          nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream "${tag_args[@]}" 2>&1 \
             | tee "/tmp/prepare-${DATASET_ID}.log"
       # Report the REAL reason prepare failed (nemarOrg/nemar-cli#1309, ADR 0051).
       #
