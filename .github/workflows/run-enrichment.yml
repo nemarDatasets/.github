@@ -217,8 +217,8 @@ jobs:
 
           rm -f "$BODY_FILE"
 
-          git config user.name "nemar-publish-bot"
-          git config user.email "nemar-publish-bot@users.noreply.github.com"
+          git config user.name "nemar-bot"
+          git config user.email "nemar-bot@users.noreply.github.com"
           # -f overrides .gitignore: dataset repos often list `.nemar/` in
           # their .gitignore so local development doesn't show the managed
           # metadata folder in `git status`, but the workflow IS the
