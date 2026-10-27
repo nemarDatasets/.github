@@ -2,11 +2,12 @@
 #
 # Deploy to: nemarDatasets/.github/workflows/run-upstream-repull.yml
 #
-# DEPLOYED ONLY WITH THE EPIC RELEASE. This file is authored in nemarOrg/nemar-cli, beside the CLI it
-# runs, and deployed by copying it whole into nemarDatasets/.github in a pull request of its own,
-# which is held until epic #1046 ships (test/repull-workflow.test.ts compares the two byte for
-# byte once both exist). Until then the Worker's dispatches reach no workflow, and GitHub answers
-# them 204 all the same; the Worker's watchdog ends each one `unreported`.
+# This file is authored in nemarOrg/nemar-cli, beside the CLI it runs, and the copy here must match
+# that one byte for byte (test/repull-workflow.test.ts compares the two). The Worker dispatches it on
+# the automatic re-pull path, which is off unless AUTO_REPULL_ENABLED is "1" in production. It also
+# dispatches the finish of a re-pull that is already merged, in production whatever the switch says.
+# A dispatch that GitHub accepts with 204 but that never reports is ended by the Worker's watchdog
+# as `unreported`.
 #
 # WHAT IT RUNS. The production Worker claims a dispatch and sends `run-upstream-repull` here with
 # nine keys: the mode, the dataset and its upstream `ds`, both tags, the dispatch's id and token,
