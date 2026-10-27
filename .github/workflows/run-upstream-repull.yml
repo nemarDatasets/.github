@@ -3,8 +3,9 @@
 # Deploy to: nemarDatasets/.github/workflows/run-upstream-repull.yml
 #
 # This file is authored in nemarOrg/nemar-cli, beside the CLI it runs, and the copy here must match
-# that one byte for byte (test/repull-workflow.test.ts compares the two). The Worker dispatches it
-# only on the automatic re-pull path, which is off unless AUTO_REPULL_ENABLED is "1" in production.
+# that one byte for byte (test/repull-workflow.test.ts compares the two). The Worker dispatches it on
+# the automatic re-pull path, which is off unless AUTO_REPULL_ENABLED is "1" in production. It also
+# dispatches the finish of a re-pull that is already merged, in production whatever the switch says.
 # A dispatch that GitHub accepts with 204 but that never reports is ended by the Worker's watchdog
 # as `unreported`.
 #
