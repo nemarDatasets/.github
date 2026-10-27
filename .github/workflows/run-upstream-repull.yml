@@ -19,7 +19,7 @@
 #   finish  `nemar admin repull resume`, which takes a merged automatic re-pull through its
 #           release and its lock to `complete`, and reports `finished`.
 # The CLI reports to the Worker itself (POST /webhooks/repull-state). The last step reports a run
-# that never did (it failed early, crashed, was cancelled or timed out), so the dispatch ends now
+# that never did (it failed early, crashed, was canceled or timed out), so the dispatch ends now
 # rather than at the Worker's eight-hour watchdog.
 #
 # THE LOG IS PUBLIC. This repository's Actions logs are readable by anyone, and a path can itself
@@ -31,8 +31,9 @@
 # THE DISPATCH TOKEN IS MASKED BEFORE ANYTHING CAN PRINT IT, AND IS IN NO ENVIRONMENT. It comes from
 # the dispatch payload, which Actions does not treat as a secret, and the runner prints a step's
 # `env:` in its header before the step runs. So it is never in `env:` at any level: the first step
-# reads it from the event file and masks it, and the CLI and the last step read it from the event
-# file too. A token that leaked would let anyone end a live dispatch as failed.
+# reads it from the event file and masks it, the second reads it there to check its shape, and the
+# CLI and the last step read it from the event file too. A token that leaked would let anyone end
+# a live dispatch as failed.
 #
 # THE DISPATCH PAYLOAD IS UNTRUSTED. Every field is checked by the second step (exactly the nine keys
 # the Worker sends, each a string of the shape it sends) and reaches the shell only through `env:`;
@@ -105,14 +106,14 @@ jobs:
       NO_COLOR: "1"
     steps:
       # This step must be the first to run and must carry no `env:` of its own: the token is read
-      # from the event file, and each of its lines is registered as a secret, so no line of it can
-      # become a workflow command.
+      # from the event file, and each of its lines, split at carriage returns as well as line feeds,
+      # is registered as a secret, so no line of it can become a workflow command.
       - name: Mask the dispatch token
         run: |
           set -euo pipefail
           token="$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")"
           if [ -n "$token" ]; then
-            printf '%s\n' "$token" | while IFS= read -r part; do
+            printf '%s\n' "$token" | tr '\r' '\n' | while IFS= read -r part; do
               if [ -n "$part" ]; then printf '::add-mask::%s\n' "$part"; fi
             done
           fi
@@ -120,9 +121,9 @@ jobs:
       - name: Validate the dispatch
         run: |
           set -euo pipefail
-          # A rejected value is never echoed, so a crafted payload cannot write workflow commands
-          # or a value into the public log. Patterns live in variables: an unquoted regex in a
-          # [[ ]] is parsed as shell syntax.
+          # This script never echoes a rejected value, so a crafted payload cannot make it write a
+          # value or a workflow command into the public log. The runner's own step header, which
+          # prints the job's `env:`, is not the script's to control.
           refuse() {
             echo "repull-auto: result phase=failed code=dispatch-invalid" >> "$RUNNER_TEMP/repull-auto.log"
             echo "::error::$1"
@@ -131,18 +132,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME:-}" != "repository_dispatch" ]; then
             refuse "only a repository dispatch runs a re-pull"
           fi
-          # Exactly the nine keys the Worker's buildUpstreamRepullPayload writes, repull_id the one
-          # that may be absent, each a string.
-          allowed='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","repull_id","to_tag","upstream_ds"]'
-          required='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","to_tag","upstream_ds"]'
-          if ! jq -e --argjson allowed "$allowed" --argjson required "$required" '
-              (.client_payload | type) == "object"
-              and (((.client_payload | keys) - $allowed) | length) == 0
-              and (($required - (.client_payload | keys)) | length) == 0
-              and (.client_payload | [.[] | type == "string"] | all)
-            ' "$GITHUB_EVENT_PATH" > /dev/null; then
-            refuse "the dispatch is not the nine keys the Worker sends"
-          fi
+          # Patterns live in variables: an unquoted regex in a [[ ]] is parsed as shell syntax.
           mode_re='^(open|finish)$'
           dataset_re='^on[0-9]{6}$'
           ds_re='^ds[0-9]{6}$'
@@ -150,6 +140,26 @@ jobs:
           id_re='^[1-9][0-9]{0,14}$'
           version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
           token_re='^[0-9a-f]{64}$'
+          # Exactly the nine keys the Worker's buildUpstreamRepullPayload writes, repull_id the one
+          # that may be absent, each a string. The token and the re-pull id are checked here too, on
+          # the event file itself, because a shell variable cannot show what `$(...)` strips (a
+          # trailing newline on the token) or tell an empty repull_id from an absent one. jq's `$`
+          # also matches before a final newline, hence `whole`.
+          allowed='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","repull_id","to_tag","upstream_ds"]'
+          required='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","to_tag","upstream_ds"]'
+          if ! jq -e --argjson allowed "$allowed" --argjson required "$required" \
+              --arg token_re "$token_re" --arg id_re "$id_re" '
+              def whole($re): test($re) and (endswith("\n") | not);
+              (.client_payload | type) == "object"
+              and (((.client_payload | keys) - $allowed) | length) == 0
+              and (($required - (.client_payload | keys)) | length) == 0
+              and (.client_payload | [.[] | type == "string"] | all)
+              and (.client_payload.dispatch_token | whole($token_re))
+              and ((.client_payload | has("repull_id") | not)
+                or (.client_payload.repull_id | whole($id_re)))
+            ' "$GITHUB_EVENT_PATH" > /dev/null 2>&1; then
+            refuse "the dispatch is not the nine keys the Worker sends, in the shapes it sends them"
+          fi
           if [[ ! "$MODE" =~ $mode_re ]]; then refuse "mode is malformed"; fi
           if [[ ! "$DATASET_ID" =~ $dataset_re ]]; then refuse "dataset_id is malformed"; fi
           if [[ ! "$UPSTREAM_DS" =~ $ds_re ]]; then refuse "upstream_ds is malformed"; fi
@@ -165,11 +175,8 @@ jobs:
           bare() { if [[ "$1" =~ $v_re ]]; then printf '%s' "${1#v}"; else printf '%s' "$1"; fi; }
           if [ "$(bare "$FROM_TAG")" = "$(bare "$TO_TAG")" ]; then refuse "the tags name one snapshot"; fi
           if [[ ! "$DISPATCH_ID" =~ $id_re ]]; then refuse "dispatch_id is malformed"; fi
-          if [ -n "$REPULL_ID" ] && [[ ! "$REPULL_ID" =~ $id_re ]]; then refuse "repull_id is malformed"; fi
           if [ "$MODE" = "finish" ] && [ -z "$REPULL_ID" ]; then refuse "a finish names its re-pull"; fi
           if [[ ! "$CLI_VERSION" =~ $version_re ]]; then refuse "cli_version is not a release"; fi
-          token="$(jq -r '.client_payload.dispatch_token' "$GITHUB_EVENT_PATH")"
-          if [[ ! "$token" =~ $token_re ]]; then refuse "dispatch_token is malformed"; fi
           mkdir -p "$RUNNER_TEMP/nemar"
           echo "NEMAR_CONFIG_DIR=$RUNNER_TEMP/nemar" >> "$GITHUB_ENV"
           echo "Dispatch OK: mode=$MODE dataset_id=$DATASET_ID dispatch_id=$DISPATCH_ID"
@@ -287,7 +294,7 @@ jobs:
 
       # The run did not report how it ended: a step failed before the CLI could (validation, the
       # disk, the install), the CLI's own report did not reach the Worker, or the job crashed, was
-      # cancelled or timed out. The CLI leaves $RUNNER_TEMP/repull-reported once the Worker stored
+      # canceled or timed out. The CLI leaves $RUNNER_TEMP/repull-reported once the Worker stored
       # its last report, and then this step does nothing. Otherwise it reports the phase and code
       # of the run's last result line (`failed runner-failed` when there is none), with the token
       # from the event file, to the production API's literal address; the answer's body is
