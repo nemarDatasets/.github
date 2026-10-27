@@ -1,0 +1,336 @@
+# Unattended upstream re-pull (nemarOrg/nemar-cli ADR 0111, decision 6; epic #1046 phase 7)
+#
+# Deploy to: nemarDatasets/.github/workflows/run-upstream-repull.yml
+#
+# DEPLOYED ONLY WITH THE EPIC RELEASE. This file is authored in nemarOrg/nemar-cli, beside the CLI it
+# runs, and deployed by copying it whole into nemarDatasets/.github in a pull request of its own,
+# which is held until epic #1046 ships (test/repull-workflow.test.ts compares the two byte for
+# byte once both exist). Until then the Worker's dispatches reach no workflow, and GitHub answers
+# them 204 all the same; the Worker's watchdog ends each one `unreported`.
+#
+# WHAT IT RUNS. The production Worker claims a dispatch and sends `run-upstream-repull` here with
+# nine keys: the mode, the dataset and its upstream `ds`, both tags, the dispatch's id and token,
+# the CLI version to install and, for a resume or a finish, the re-pull's id. This job installs
+# that release of nemar-cli and runs it unattended (`--automatic-dispatch`):
+#   open    `nemar admin repull plan`, then `nemar admin repull execute`, which records the re-pull
+#           as the automatic path's, copies, registers, pushes the release branch and opens its
+#           pull request with an App token minted for that one dataset repository, settles the
+#           release head, and reports `opened`. It never merges.
+#   finish  `nemar admin repull resume`, which takes a merged automatic re-pull through its
+#           release and its lock to `complete`, and reports `finished`.
+# The CLI reports to the Worker itself (POST /webhooks/repull-state). The last step reports a run
+# that never did (it failed early, crashed, was cancelled or timed out), so the dispatch ends now
+# rather than at the Worker's eight-hour watchdog.
+#
+# THE LOG IS PUBLIC. This repository's Actions logs are readable by anyone, and a path can itself
+# be an identifier, so nothing here, and nothing the CLI prints, may be a value: no path, key, file
+# name, subject label, message or token. The CLI in this mode prints only `repull-auto:` lines of
+# counts and fixed words, and the plan file and the work clones never leave the runner (no
+# artifact is uploaded). The Worker keeps the details, on the re-pull's record, for administrators.
+#
+# THE DISPATCH TOKEN IS MASKED BEFORE ANYTHING CAN PRINT IT, AND IS IN NO ENVIRONMENT. It comes from
+# the dispatch payload, which Actions does not treat as a secret, and the runner prints a step's
+# `env:` in its header before the step runs. So it is never in `env:` at any level: the first step
+# reads it from the event file and masks it, and the CLI and the last step read it from the event
+# file too. A token that leaked would let anyone end a live dispatch as failed.
+#
+# THE DISPATCH PAYLOAD IS UNTRUSTED. Every field is checked by the second step (exactly the nine keys
+# the Worker sends, each a string of the shape it sends) and reaches the shell only through `env:`;
+# no `run:` script here interpolates an expression. The CLI reads the same payload and checks it
+# again, and the Worker verifies the token at the automatic create and at every report.
+#
+# PRODUCTION ONLY. The run installs exactly the release the dispatch names and refuses anything that
+# is not a release (`X.Y.Z`): a development build never runs here. The App token is minted for the
+# dispatch's dataset repository alone. The Worker that dispatches is the production one, and it
+# refuses an automatic record outside production on its own.
+#
+# THE APP TOKEN LASTS AN HOUR. It is minted before anything is installed, so no code installed
+# later runs before the App's private key is used, and the step before the mint notes the time
+# (NEMAR_REPULL_TOKEN_SINCE), from which the CLI keeps everything it does with the token inside
+# fifty-five minutes: it refuses a plan whose copy would take more than twenty minutes by its
+# estimate (auto-copy-too-long), refuses before its record, the copy and each push when what is
+# left would not fit (auto-token-hour), and ends the settle of the release head at the end of
+# those minutes. A run that failed with the token expired anyway is reported token-expired; once
+# it wrote its record, an administrator takes the record on.
+#
+# Required secrets on nemarDatasets/.github, each already used by another workflow there:
+#   NEMAR_APP_ID, NEMAR_APP_PRIVATE_KEY      the per-repository App token (contents and pull
+#                                            requests: write) that pushes and opens the pull
+#                                            request; run-pr-review.yml and run-publication-review.yml
+#                                            mint theirs with the same pair
+#   NEMAR_ADMIN_API_KEY                      the CLI's NEMAR account, as onboard-openneuro.yml uses it
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY the import's pair, as onboard-openneuro.yml uses it;
+#                                            exchanged here for a six-hour session, because the copy
+#                                            takes short-lived credentials only
+
+name: Run Upstream Re-pull
+
+on:
+  repository_dispatch:
+    types: [run-upstream-repull]
+
+# Zero default GITHUB_TOKEN scope: the dataset repository is reached with the per-repository App
+# token, the CLI comes from the npm registry, and the reports are token-authenticated.
+permissions: {}
+
+# Each run its own group. GitHub replaces a pending run in a group, and the group must never be
+# taken from the untrusted payload, or a forged event could replace a dispatched run before it
+# starts. The Worker keeps one live dispatch per dataset, so two runs never work one dataset at
+# once.
+concurrency:
+  group: run-upstream-repull-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  repull:
+    name: Run upstream re-pull
+    runs-on: ubuntu-latest
+    # The Worker's watchdog ends a dispatch eight hours after it was sent: this bound, plus an hour
+    # of queueing, is inside it (test/repull-workflow.test.ts).
+    timeout-minutes: 330
+    permissions: {}
+    env:
+      # The dispatch token is deliberately NOT here (see the header).
+      # UNTRUSTED input from the dispatch payload, validated by the second step, and read only from
+      # the environment, never interpolated into a script.
+      MODE: ${{ github.event.client_payload.mode }}
+      DATASET_ID: ${{ github.event.client_payload.dataset_id }}
+      UPSTREAM_DS: ${{ github.event.client_payload.upstream_ds }}
+      FROM_TAG: ${{ github.event.client_payload.from_tag }}
+      TO_TAG: ${{ github.event.client_payload.to_tag }}
+      DISPATCH_ID: ${{ github.event.client_payload.dispatch_id }}
+      REPULL_ID: ${{ github.event.client_payload.repull_id }}
+      CLI_VERSION: ${{ github.event.client_payload.cli_version }}
+      NEMAR_NO_UPDATE_CHECK: "1"
+      NO_COLOR: "1"
+    steps:
+      # This step must be the first to run and must carry no `env:` of its own: the token is read
+      # from the event file, and each of its lines is registered as a secret, so no line of it can
+      # become a workflow command.
+      - name: Mask the dispatch token
+        run: |
+          set -euo pipefail
+          token="$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")"
+          if [ -n "$token" ]; then
+            printf '%s\n' "$token" | while IFS= read -r part; do
+              if [ -n "$part" ]; then printf '::add-mask::%s\n' "$part"; fi
+            done
+          fi
+
+      - name: Validate the dispatch
+        run: |
+          set -euo pipefail
+          # A rejected value is never echoed, so a crafted payload cannot write workflow commands
+          # or a value into the public log. Patterns live in variables: an unquoted regex in a
+          # [[ ]] is parsed as shell syntax.
+          refuse() {
+            echo "repull-auto: result phase=failed code=dispatch-invalid" >> "$RUNNER_TEMP/repull-auto.log"
+            echo "::error::$1"
+            exit 1
+          }
+          if [ "${GITHUB_EVENT_NAME:-}" != "repository_dispatch" ]; then
+            refuse "only a repository dispatch runs a re-pull"
+          fi
+          # Exactly the nine keys the Worker's buildUpstreamRepullPayload writes, repull_id the one
+          # that may be absent, each a string.
+          allowed='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","repull_id","to_tag","upstream_ds"]'
+          required='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","to_tag","upstream_ds"]'
+          if ! jq -e --argjson allowed "$allowed" --argjson required "$required" '
+              (.client_payload | type) == "object"
+              and (((.client_payload | keys) - $allowed) | length) == 0
+              and (($required - (.client_payload | keys)) | length) == 0
+              and (.client_payload | [.[] | type == "string"] | all)
+            ' "$GITHUB_EVENT_PATH" > /dev/null; then
+            refuse "the dispatch is not the nine keys the Worker sends"
+          fi
+          mode_re='^(open|finish)$'
+          dataset_re='^on[0-9]{6}$'
+          ds_re='^ds[0-9]{6}$'
+          tag_re='^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$'
+          id_re='^[1-9][0-9]{0,14}$'
+          version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+          token_re='^[0-9a-f]{64}$'
+          if [[ ! "$MODE" =~ $mode_re ]]; then refuse "mode is malformed"; fi
+          if [[ ! "$DATASET_ID" =~ $dataset_re ]]; then refuse "dataset_id is malformed"; fi
+          if [[ ! "$UPSTREAM_DS" =~ $ds_re ]]; then refuse "upstream_ds is malformed"; fi
+          # A mirror is named after its upstream dataset: on<digits> mirrors ds<digits>.
+          if [ "${DATASET_ID#on}" != "${UPSTREAM_DS#ds}" ]; then
+            refuse "dataset_id does not mirror upstream_ds"
+          fi
+          for tag in "$FROM_TAG" "$TO_TAG"; do
+            if [[ ! "$tag" =~ $tag_re ]] || [[ "$tag" == *..* ]]; then refuse "a tag is malformed"; fi
+          done
+          # `v1.0.0` names the snapshot `1.0.0` does (shared/openneuro-tag.ts, normalizeUpstreamTag).
+          v_re='^v[0-9]'
+          bare() { if [[ "$1" =~ $v_re ]]; then printf '%s' "${1#v}"; else printf '%s' "$1"; fi; }
+          if [ "$(bare "$FROM_TAG")" = "$(bare "$TO_TAG")" ]; then refuse "the tags name one snapshot"; fi
+          if [[ ! "$DISPATCH_ID" =~ $id_re ]]; then refuse "dispatch_id is malformed"; fi
+          if [ -n "$REPULL_ID" ] && [[ ! "$REPULL_ID" =~ $id_re ]]; then refuse "repull_id is malformed"; fi
+          if [ "$MODE" = "finish" ] && [ -z "$REPULL_ID" ]; then refuse "a finish names its re-pull"; fi
+          if [[ ! "$CLI_VERSION" =~ $version_re ]]; then refuse "cli_version is not a release"; fi
+          token="$(jq -r '.client_payload.dispatch_token' "$GITHUB_EVENT_PATH")"
+          if [[ ! "$token" =~ $token_re ]]; then refuse "dispatch_token is malformed"; fi
+          mkdir -p "$RUNNER_TEMP/nemar"
+          echo "NEMAR_CONFIG_DIR=$RUNNER_TEMP/nemar" >> "$GITHUB_ENV"
+          echo "Dispatch OK: mode=$MODE dataset_id=$DATASET_ID dispatch_id=$DISPATCH_ID"
+
+      # A re-pull clones the dataset and its upstream and writes the scrubbed recordings it uploads;
+      # a runner short of disk would fail half way through a copy.
+      - name: Check the runner's free disk
+        run: |
+          set -euo pipefail
+          free_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          if [ -z "$free_kb" ] || [ "$free_kb" -lt 10485760 ]; then
+            echo "repull-auto: result phase=failed code=runner-disk" >> "$RUNNER_TEMP/repull-auto.log"
+            echo "::error::Under 10 GB free on the runner"
+            exit 1
+          fi
+
+      # Just before the mint, so the hour the CLI counts starts no later than the token's own.
+      - name: Note when the App token is minted
+        run: echo "NEMAR_REPULL_TOKEN_SINCE=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Mint the App token for the dataset's repository
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.NEMAR_APP_ID }}
+          private-key: ${{ secrets.NEMAR_APP_PRIVATE_KEY }}
+          owner: nemarDatasets
+          repositories: ${{ env.DATASET_ID }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Install git-annex
+        run: sudo apt-get update && sudo apt-get install -y git-annex
+
+      - name: Configure git
+        run: |
+          git config --global user.email "noreply@nemar.org"
+          git config --global user.name "NEMAR re-pull"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+
+      # Exactly the release the dispatch names, and only a release: a development build's version
+      # (0.10.24-dev11) is refused here, before it can run.
+      - name: Install the nemar CLI the dispatch names
+        run: |
+          set -euo pipefail
+          bun install -g "nemar-cli@${CLI_VERSION}"
+          installed="$(nemar --version)"
+          release_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ ! "$installed" =~ $release_re ]] || [ "$installed" != "$CLI_VERSION" ]; then
+            echo "repull-auto: result phase=failed code=auto-cli-version" >> "$RUNNER_TEMP/repull-auto.log"
+            echo "::error::The installed nemar CLI is not the release the dispatch names"
+            exit 1
+          fi
+
+      # The login's own output names the account, on either stream; none of it is printed.
+      - name: Sign in the nemar CLI
+        env:
+          NEMAR_API_KEY: ${{ secrets.NEMAR_ADMIN_API_KEY }}
+        run: nemar auth login --yes > /dev/null 2>&1
+
+      # The copy takes short-lived credentials only (an ASIA key with a session token), as it does
+      # on an administrator's machine: the import's pair is exchanged for a six-hour session inside
+      # this step, and the session is never written out.
+      - name: Plan and open the re-pull pull request
+        if: env.MODE == 'open'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/repull-auto.log"
+          # Its error is not printed: an explicit deny names the IAM user and the account.
+          if ! session="$(aws sts get-session-token --region us-east-1 --duration-seconds 21600 --query Credentials --output json 2> /dev/null)"; then
+            echo "repull-auto: result phase=failed code=runner-credentials" >> "$log"
+            exit 1
+          fi
+          AWS_ACCESS_KEY_ID="$(jq -r '.AccessKeyId' <<< "$session")"
+          AWS_SECRET_ACCESS_KEY="$(jq -r '.SecretAccessKey' <<< "$session")"
+          AWS_SESSION_TOKEN="$(jq -r '.SessionToken' <<< "$session")"
+          unset session
+          printf '::add-mask::%s\n' "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN"
+          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          nemar admin repull plan "$DATASET_ID" --to-tag "$TO_TAG" --bucket-listing \
+            --out "$RUNNER_TEMP/plan.json" --automatic-dispatch "$DISPATCH_ID" 2>&1 | tee -a "$log"
+          nemar admin repull execute "$RUNNER_TEMP/plan.json" --automatic-dispatch "$DISPATCH_ID" \
+            --settle-minutes 30 --yes 2>&1 | tee -a "$log"
+
+      - name: Finish a merged re-pull
+        if: env.MODE == 'finish'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/repull-auto.log"
+          # Its error is not printed: an explicit deny names the IAM user and the account.
+          if ! session="$(aws sts get-session-token --region us-east-1 --duration-seconds 21600 --query Credentials --output json 2> /dev/null)"; then
+            echo "repull-auto: result phase=failed code=runner-credentials" >> "$log"
+            exit 1
+          fi
+          AWS_ACCESS_KEY_ID="$(jq -r '.AccessKeyId' <<< "$session")"
+          AWS_SECRET_ACCESS_KEY="$(jq -r '.SecretAccessKey' <<< "$session")"
+          AWS_SESSION_TOKEN="$(jq -r '.SessionToken' <<< "$session")"
+          unset session
+          printf '::add-mask::%s\n' "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN"
+          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          nemar admin repull resume "$DATASET_ID" --automatic-dispatch "$DISPATCH_ID" \
+            --wait-minutes 30 --yes 2>&1 | tee -a "$log"
+
+      # The run did not report how it ended: a step failed before the CLI could (validation, the
+      # disk, the install), the CLI's own report did not reach the Worker, or the job crashed, was
+      # cancelled or timed out. The CLI leaves $RUNNER_TEMP/repull-reported once the Worker stored
+      # its last report, and then this step does nothing. Otherwise it reports the phase and code
+      # of the run's last result line (`failed runner-failed` when there is none), with the token
+      # from the event file, to the production API's literal address; the answer's body is
+      # discarded, so only its status reaches the log. Best effort: the Worker's watchdog ends a
+      # dispatch nobody reported.
+      - name: Report a run that did not report
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f "$RUNNER_TEMP/repull-reported" ]; then
+            echo "repull-auto: backstop not-needed"
+            exit 0
+          fi
+          id_re='^[1-9][0-9]{0,14}$'
+          dataset_re='^on[0-9]{6}$'
+          token_re='^[0-9a-f]{64}$'
+          token="$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH" 2> /dev/null || true)"
+          if [[ ! "${DISPATCH_ID:-}" =~ $id_re ]] || [[ ! "${DATASET_ID:-}" =~ $dataset_re ]] \
+            || [[ ! "$token" =~ $token_re ]]; then
+            echo "repull-auto: backstop not-reportable"
+            exit 0
+          fi
+          phase="failed"
+          code="runner-failed"
+          result_re='^repull-auto: result phase=(refused|failed) code=([a-z0-9-]{1,64})$'
+          last="$(grep -E '^repull-auto: result phase=' "$RUNNER_TEMP/repull-auto.log" 2> /dev/null | tail -n 1 || true)"
+          if [[ "$last" =~ $result_re ]]; then
+            phase="${BASH_REMATCH[1]}"
+            code="${BASH_REMATCH[2]}"
+          fi
+          run_re='^[0-9]{1,20}$'
+          run_url=""
+          if [[ "${GITHUB_RUN_ID:-}" =~ $run_re ]]; then
+            run_url="https://github.com/nemarDatasets/.github/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          body="$(jq -nc --argjson id "$DISPATCH_ID" --arg d "$DATASET_ID" --arg p "$phase" \
+            --arg c "$code" --arg u "$run_url" \
+            '{dispatch_id: $id, dataset_id: $d, phase: $p, code: $c}
+              + (if $u == "" then {} else {workflow_run_url: $u} end)')" || exit 0
+          # The token goes to curl on its standard input, in a header of its configuration, so it is
+          # on no command line.
+          printf 'header = "X-Repull-Token: %s"\n' "$token" \
+            | curl -sS -K - -o /dev/null -w 'repull-auto: backstop http=%{http_code}\n' \
+                --connect-timeout 10 --max-time 30 \
+                -X POST "https://api.nemar.org/webhooks/repull-state" \
+                -H "Content-Type: application/json" -d "$body" || true
