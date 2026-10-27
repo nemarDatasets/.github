@@ -141,22 +141,24 @@ jobs:
           version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
           token_re='^[0-9a-f]{64}$'
           # Exactly the nine keys the Worker's buildUpstreamRepullPayload writes, repull_id the one
-          # that may be absent, each a string. The token and the re-pull id are checked here too, on
-          # the event file itself, because a shell variable cannot show what `$(...)` strips (a
-          # trailing newline on the token) or tell an empty repull_id from an absent one. jq's `$`
-          # also matches before a final newline, hence `whole`.
+          # that may be absent, each a string with no control character in it. The token and the
+          # re-pull id are checked here too. All of it is read from the event file, because a shell
+          # variable cannot show what the file holds: `$(...)` strips a final newline from the
+          # token, an empty repull_id looks like an absent one, and an environment variable ends at
+          # a NUL, so the checks below would see only what precedes it. The control-character test
+          # also covers the final newline that a regex `$` lets through.
           allowed='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","repull_id","to_tag","upstream_ds"]'
           required='["cli_version","dataset_id","dispatch_id","dispatch_token","from_tag","mode","to_tag","upstream_ds"]'
           if ! jq -e --argjson allowed "$allowed" --argjson required "$required" \
               --arg token_re "$token_re" --arg id_re "$id_re" '
-              def whole($re): test($re) and (endswith("\n") | not);
               (.client_payload | type) == "object"
               and (((.client_payload | keys) - $allowed) | length) == 0
               and (($required - (.client_payload | keys)) | length) == 0
               and (.client_payload | [.[] | type == "string"] | all)
-              and (.client_payload.dispatch_token | whole($token_re))
+              and (.client_payload | [.[] | test("[\u0000-\u001f\u007f]")] | any | not)
+              and (.client_payload.dispatch_token | test($token_re))
               and ((.client_payload | has("repull_id") | not)
-                or (.client_payload.repull_id | whole($id_re)))
+                or (.client_payload.repull_id | test($id_re)))
             ' "$GITHUB_EVENT_PATH" > /dev/null 2>&1; then
             refuse "the dispatch is not the nine keys the Worker sends, in the shapes it sends them"
           fi
