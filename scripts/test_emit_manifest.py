@@ -1014,6 +1014,158 @@ class BytesUrlForUnitTests(unittest.TestCase):
         )
 
 
+COR_DIGEST = "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+BRAIN_DIGEST = "a61f15d4bcaf7ceafd6f07da5192495bfdeec4492a415e8d46577405caeb7897"
+MD5_DIGEST = "fcd6bcb56c1689fcef28b57c22475bad"
+VECTORS_PATH = HERE / "fixtures" / "annex_key_vectors.json"
+
+
+class AnnexDigestLengthUnitTests(unittest.TestCase):
+    """The digest is cut to its backend's length (nemarOrg/nemar-cli#2118).
+
+    The vectors file is shared with nemar-cli's manifest.ts so the two
+    generators answer the same for every key.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import emit_manifest  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+        cls.em = emit_manifest
+        cls.vectors = json.loads(VECTORS_PATH.read_text())["vectors"]
+
+    def test_every_shared_vector(self):
+        for v in self.vectors:
+            with self.subTest(key=v["key"], why=v["why"]):
+                self.assertEqual(self.em.extract_algo_from_key(v["key"]), v["algorithm"])
+                self.assertEqual(self.em.extract_checksum_from_key(v["key"]), v["digest"])
+
+    def test_on003104_keys(self):
+        self.assertEqual(
+            self.em.extract_checksum_from_key(f"SHA256E-s65536--{COR_DIGEST}COR-001"),
+            COR_DIGEST,
+        )
+        self.assertEqual(
+            self.em.extract_checksum_from_key(
+                f"SHA256E-s369273--{BRAIN_DIGEST}01_brain_surface"
+            ),
+            BRAIN_DIGEST,
+        )
+
+    def test_hex_starting_dotless_tail_in_every_backend(self):
+        for name, length in self.em.ANNEX_DIGEST_HEX_LENGTH.items():
+            digest = ("0123456789abcdef" * 8)[:length]
+            for suffix in ("E", ""):
+                key = f"{name.upper()}{suffix}-s1--{digest}0abc_def"
+                with self.subTest(key=key):
+                    self.assertEqual(self.em.extract_algo_from_key(key), name)
+                    self.assertEqual(self.em.extract_checksum_from_key(key), digest)
+
+    def test_unknown_backends_are_never_cut(self):
+        for key in ("WORM-s1-m2--abcdef", "URL--abcdef", f"FOO-s1--{'a' * 100}"):
+            with self.subTest(key=key):
+                self.assertIsNone(self.em.identify_annex_backend(key))
+
+    def test_the_vectors_cover_every_backend_length(self):
+        self.assertEqual(
+            sorted(set(self.em.ANNEX_DIGEST_HEX_LENGTH.values())),
+            [32, 40, 56, 64, 96, 128],
+        )
+
+
+def write_unlocked_pointer(repo: Path, rel: str, key: str) -> None:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"/annex/objects/{key}\n")
+
+
+class DotlessAnnexNameTests(unittest.TestCase):
+    """A real git tree with the key shapes of on003104@v1.0.0 (#2118).
+
+    Locked symlinks and unlocked pointer blobs, dotless names that start with
+    hex characters, next to an ordinary extension: every checksum is the
+    digest of its backend's length, and the key itself is stored unchanged.
+    """
+
+    COR_KEY = f"SHA256E-s65536--{COR_DIGEST}COR-001"
+    BRAIN_KEY = f"SHA256E-s369273--{BRAIN_DIGEST}01_brain_surface"
+    MD5_POINTER_KEY = f"MD5E-s65536--{MD5_DIGEST}abc_surface"
+    EDF_KEY = f"SHA256E-s65536--{COR_DIGEST}.edf"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="emit-manifest-dotless-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = cls.tmp / "repo"
+        cls.out = cls.tmp / "out"
+        setup_repo(cls.repo)
+
+        ws = cls.repo / "derivatives" / "freesurfer" / "bem" / "watershed"
+        (ws / "ws").mkdir(parents=True)
+        for rel, key in (
+            ("ws/COR-001", cls.COR_KEY),
+            ("01_brain_surface", cls.BRAIN_KEY),
+            ("sub-01_eeg.edf", cls.EDF_KEY),
+        ):
+            depth = len(Path("derivatives/freesurfer/bem/watershed", rel).parts) - 1
+            target = "../" * depth + f".git/annex/objects/aa/bb/{key}/{key}"
+            os.symlink(target, ws / rel)
+        write_unlocked_pointer(
+            cls.repo, "derivatives/freesurfer/bem/abc_surface", cls.MD5_POINTER_KEY
+        )
+
+        git(cls.repo, "add", "-A")
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z"
+        env["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        subprocess.check_call(
+            ["git", "-C", str(cls.repo), "commit", "-q", "-m", "Dotless annex names"],
+            env=env,
+        )
+        git(cls.repo, "tag", "-f", "v0.0.0")
+        cls.proc = run_emit(cls.repo, cls.out)
+        cls.files = json.loads((cls.out / "manifest.json").read_text())["files"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def entry(self, rel: str) -> dict:
+        meta = self.files.get(rel)
+        self.assertIsNotNone(meta, f"{rel} missing from manifest")
+        return meta
+
+    def test_cor_001_symlink(self):
+        meta = self.entry("derivatives/freesurfer/bem/watershed/ws/COR-001")
+        self.assertEqual(meta["key"], self.COR_KEY)
+        self.assertEqual(meta["size"], 65536)
+        self.assertEqual(meta["checksum"], f"sha256:{COR_DIGEST}")
+
+    def test_01_brain_surface_symlink(self):
+        meta = self.entry("derivatives/freesurfer/bem/watershed/01_brain_surface")
+        self.assertEqual(meta["key"], self.BRAIN_KEY)
+        self.assertEqual(meta["checksum"], f"sha256:{BRAIN_DIGEST}")
+
+    def test_unlocked_md5e_pointer_with_dotless_name(self):
+        meta = self.entry("derivatives/freesurfer/bem/abc_surface")
+        self.assertEqual(meta["key"], self.MD5_POINTER_KEY)
+        self.assertEqual(meta["checksum"], f"md5:{MD5_DIGEST}")
+
+    def test_ordinary_extension_unchanged(self):
+        meta = self.entry("derivatives/freesurfer/bem/watershed/sub-01_eeg.edf")
+        self.assertEqual(meta["checksum"], f"sha256:{COR_DIGEST}")
+
+    def test_every_annex_digest_has_its_backend_length(self):
+        lengths = {"sha256": 64, "md5": 32}
+        for rel, meta in self.files.items():
+            if meta["key"].startswith("git:") or rel == ANNEX_REL_PATH:
+                continue  # ANNEX_REL_PATH carries setup_repo's short synthetic digest
+            algo, _, digest = meta["checksum"].partition(":")
+            with self.subTest(path=rel):
+                self.assertEqual(len(digest), lengths[algo])
+
+
 class NonAsciiPathAndBinaryBlobTests(unittest.TestCase):
     """Regression tests for two failures that aborted or corrupted a release.
 

@@ -1,0 +1,161 @@
+{
+  "_comment": "Annex key -> (checksum algorithm, digest) vectors shared by emit_manifest.py and nemar-cli backend/src/services/manifest.ts (nemarOrg/nemar-cli#2118). Keep identical in both repositories.",
+  "vectors": [
+    {
+      "key": "SHA256E-s65536--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31COR-001",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "on003104: dotless name, leading C is hex"
+    },
+    {
+      "key": "SHA256E-s369273--a61f15d4bcaf7ceafd6f07da5192495bfdeec4492a415e8d46577405caeb789701_brain_surface",
+      "algorithm": "sha256",
+      "digest": "a61f15d4bcaf7ceafd6f07da5192495bfdeec4492a415e8d46577405caeb7897",
+      "why": "on003104: dotless name, leading 01 is hex"
+    },
+    {
+      "key": "SHA256E-s65536--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31.edf",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "ordinary extension"
+    },
+    {
+      "key": "SHA256E-s65536--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31.tar.gz",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "double extension"
+    },
+    {
+      "key": "SHA256E-s65536--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "E backend, no extension (what git-annex writes for COR-001)"
+    },
+    {
+      "key": "SHA256-s65536--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "non-E backend"
+    },
+    {
+      "key": "SHA256E-s1--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31ABC",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "lowercase digest, uppercase hex tail"
+    },
+    {
+      "key": "SHA256E-s1--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31.a--b",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "-- inside the name"
+    },
+    {
+      "key": "SHA256E-s100-S10-C3--de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31.edf",
+      "algorithm": "sha256",
+      "digest": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+      "why": "chunked key"
+    },
+    {
+      "key": "MD5E-s65536--fcd6bcb56c1689fcef28b57c22475bad",
+      "algorithm": "md5",
+      "digest": "fcd6bcb56c1689fcef28b57c22475bad",
+      "why": "MD5E, no extension"
+    },
+    {
+      "key": "MD5E-s65536--fcd6bcb56c1689fcef28b57c22475bad.edf",
+      "algorithm": "md5",
+      "digest": "fcd6bcb56c1689fcef28b57c22475bad",
+      "why": "MD5E, ordinary extension"
+    },
+    {
+      "key": "MD5E-s65536--fcd6bcb56c1689fcef28b57c22475badabc_def",
+      "algorithm": "md5",
+      "digest": "fcd6bcb56c1689fcef28b57c22475bad",
+      "why": "MD5E, dotless hex-starting name"
+    },
+    {
+      "key": "MD5E--fcd6bcb56c1689fcef28b57c22475bad.edf",
+      "algorithm": "md5",
+      "digest": "fcd6bcb56c1689fcef28b57c22475bad",
+      "why": "size-less key (old label: sha256)"
+    },
+    {
+      "key": "SHA1-s5--0123456789abcdef0123456789abcdef01234567deadbeef",
+      "algorithm": "sha1",
+      "digest": "0123456789abcdef0123456789abcdef01234567",
+      "why": "SHA1 with hex tail"
+    },
+    {
+      "key": "SHA512E-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefab",
+      "algorithm": "sha512",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "SHA512E with hex tail"
+    },
+    {
+      "key": "SHA3_512E-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.nii",
+      "algorithm": "sha3_512",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "underscore backend (old label: sha256)"
+    },
+    {
+      "key": "SHA3_256E-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0a",
+      "algorithm": "sha3_256",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "SHA3_256E with hex tail"
+    },
+    {
+      "key": "BLAKE2B256E-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.x",
+      "algorithm": "blake2b256",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "BLAKE2 family"
+    },
+    {
+      "key": "SKEIN512-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "algorithm": "skein512",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "SKEIN family"
+    },
+    {
+      "key": "WORM-s100-m1700000000--abc.edf",
+      "algorithm": "worm",
+      "digest": "abc",
+      "why": "WORM: not a digest, historic greedy match kept"
+    },
+    {
+      "key": "WORM-s100-m1700000000--sub-01_eeg.edf",
+      "algorithm": "worm",
+      "digest": "",
+      "why": "WORM: no hex after --, historic empty digest kept"
+    },
+    {
+      "key": "URL-s1234--https&c%%example.org%a.edf",
+      "algorithm": "url",
+      "digest": "",
+      "why": "URL: historic answer kept"
+    },
+    {
+      "key": "XYZ123E-s5--0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefabcdef",
+      "algorithm": "xyz123",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefabcdef",
+      "why": "unknown backend: historic greedy match kept"
+    },
+    {
+      "key": "SHA256E-s12345--abcdef0123456789.edf",
+      "algorithm": "sha256",
+      "digest": "abcdef0123456789",
+      "why": "identified backend, digest too short: carried as found"
+    },
+    {
+      "key": "CONSTRUCTOR-s1--abc.edf",
+      "algorithm": "constructor",
+      "digest": "abc",
+      "why": "backend named like an Object.prototype property: unknown, historic answer kept"
+    },
+    {
+      "key": "__PROTO__-s1--abc.edf",
+      "algorithm": "sha256",
+      "digest": "abc",
+      "why": "backend named __proto__: unknown, historic default label kept"
+    }
+  ]
+}
