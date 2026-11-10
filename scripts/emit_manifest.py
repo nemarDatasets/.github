@@ -228,6 +228,38 @@ def identify_annex_backend(key: str) -> tuple[str, int] | None:
     return name, length
 
 
+# A short digest is carried as found, never refused. Its warning is bounded so
+# a dataset full of them cannot flood the run log: the first
+# SHORT_DIGEST_WARNING_LIMIT are printed, every one is counted, and main()
+# prints one summary line at the end of the run.
+SHORT_DIGEST_WARNING_LIMIT = 20
+short_digest_count = 0
+
+
+def _note_short_digest(key: str, found: int, expected: int) -> None:
+    global short_digest_count
+    short_digest_count += 1
+    if short_digest_count <= SHORT_DIGEST_WARNING_LIMIT:
+        print(
+            f"[emit_manifest] warning: annex key {key!r} has a {found}-character "
+            f"digest, its backend's is {expected}; carried as found",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def report_short_digests() -> None:
+    """One summary line on stderr when any short digest was carried as found."""
+    if short_digest_count:
+        print(
+            f"[emit_manifest] warning: {short_digest_count} annex keys had a digest "
+            f"shorter than their backend's; first "
+            f"{min(short_digest_count, SHORT_DIGEST_WARNING_LIMIT)} shown",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def extract_checksum_from_key(key: str) -> str:
     """The hex run after `--`, cut to the backend's digest length.
 
@@ -253,12 +285,7 @@ def extract_checksum_from_key(key: str) -> str:
         if len(digest) > length:
             return digest[:length]
         if len(digest) < length:
-            print(
-                f"[emit_manifest] warning: annex key {key!r} has a {len(digest)}-character "
-                f"digest, its backend's is {length}; carried as found",
-                file=sys.stderr,
-                flush=True,
-            )
+            _note_short_digest(key, len(digest), length)
     return digest
 
 
@@ -736,6 +763,8 @@ def main(argv: list[str] | None = None) -> int:
         concept_doi=args.concept_doi or None,
         repo_dir=str(repo_dir),
     )
+
+    report_short_digests()
 
     if args.verify_canary:
         verify_canaries(
