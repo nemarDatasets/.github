@@ -1,0 +1,50 @@
+name: Test archive streamer
+
+# Unit tests + drift guard for the archive streamer's decision functions
+# (nemarOrg/nemar-cli#1045). Mirrors the test-emit-manifest / test-patch-duration
+# convention: a checked-in script with a sibling test, path-filtered so it only
+# fires when the relevant files change.
+#
+# Why this exists: run-generate-archive.yml is dispatched by all ~785 dataset
+# repos, and its logic lives as inline JS in a YAML heredoc, so until now it had
+# no tests and no CI at all -- a bad edit reached every dataset at once and was
+# caught only by review or a live production dispatch. Every defect in
+# nemarOrg/nemar-cli#1038 came through that gap.
+#
+# No Python here, unlike the sibling test workflows: the streamer is Node, and
+# node is preinstalled on ubuntu-latest, so this needs no setup step at all.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/stream-archive-helpers.js"
+      - "scripts/test_stream_archive_helpers.js"
+      - "scripts/check_helper_drift.js"
+      - ".github/workflows/run-generate-archive.yml"
+      - ".github/workflows/test-generate-archive.yml"
+  pull_request:
+    paths:
+      - "scripts/stream-archive-helpers.js"
+      - "scripts/test_stream_archive_helpers.js"
+      - "scripts/check_helper_drift.js"
+      - ".github/workflows/run-generate-archive.yml"
+      - ".github/workflows/test-generate-archive.yml"
+  workflow_dispatch:
+
+jobs:
+  archive-helpers:
+    name: archive streamer helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: node scripts/test_stream_archive_helpers.js
+
+      # The workflow inlines its own copy of these functions (the runner checks
+      # out the dataset repo, not this one, so the heredoc cannot require the
+      # file). The inlined copy is what actually ships; this asserts the tested
+      # copy still matches it byte for byte.
+      - name: Drift guard -- workflow copy matches the tested copy
+        run: node scripts/check_helper_drift.js
