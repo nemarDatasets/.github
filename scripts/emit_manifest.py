@@ -60,6 +60,48 @@ KEY_SIZE_RE = re.compile(r"-s(\d+)--")
 KEY_CHECKSUM_RE = re.compile(r"--([a-fA-F0-9]+)")
 KEY_ALGO_RE = re.compile(r"^([A-Z0-9]+?)E?-s")
 
+# Digest length in hex characters of every git-annex hash backend, keyed by the
+# lowercase backend name without its E (extension) suffix. Mirrors
+# ANNEX_DIGEST_HEX_LENGTH in nemarOrg/nemar-cli backend/src/services/manifest.ts
+# (nemarOrg/nemar-cli#2118); each length was read from `git annex calckey`.
+# WORM, URL, VURL and the other non-hash backends are deliberately absent.
+#
+# Why the length matters: an E backend writes the extension straight after the
+# digest, and some keys carry a whole dotless file name there, e.g.
+# SHA256E-s65536--<64 hex>COR-001 for a file named COR-001. The leading C of
+# COR-001 is a hex digit, so a greedy hex match reads 65 characters. Only the
+# backend's length tells digest and name apart.
+ANNEX_DIGEST_HEX_LENGTH = {
+    "md5": 32,
+    "sha1": 40,
+    "sha224": 56,
+    "sha256": 64,
+    "sha384": 96,
+    "sha512": 128,
+    "sha3_224": 56,
+    "sha3_256": 64,
+    "sha3_384": 96,
+    "sha3_512": 128,
+    "skein256": 64,
+    "skein512": 128,
+    "blake2b160": 40,
+    "blake2b224": 56,
+    "blake2b256": 64,
+    "blake2b384": 96,
+    "blake2b512": 128,
+    "blake2bp512": 128,
+    "blake2s160": 40,
+    "blake2s224": 56,
+    "blake2s256": 64,
+    "blake2sp224": 56,
+    "blake2sp256": 64,
+}
+# The backend token before an optional -s<size>, optional chunk fields
+# (-S<n>-C<n>) and the `--` that opens the digest. Mirrors identifyAnnexBackend
+# in manifest.ts. [0-9], not \d: Python's \d also matches non-ASCII digits,
+# JavaScript's does not, and the two generators must agree on every key.
+KEY_BACKEND_RE = re.compile(r"^([A-Z0-9_]+?)(E?)(?:-s[0-9]+)?(?:-[A-Za-z][0-9]+)*--")
+
 # Datatype directories that count as BIDS modalities. Matches the set used
 # by the Worker's metadata enrichment pipeline. Detected by scanning each
 # manifested path for "/<datatype>/" substrings.
@@ -169,7 +211,64 @@ def extract_size_from_key(key: str) -> int:
     return int(m.group(1))
 
 
+def identify_annex_backend(key: str) -> tuple[str, int] | None:
+    """Return (lowercase backend name without E, digest hex length), or None.
+
+    Only a backend in ANNEX_DIGEST_HEX_LENGTH counts: WORM, URL, an unknown
+    backend and a string that is not a key return None, and no length is ever
+    applied to them. Mirrors identifyAnnexBackend in manifest.ts.
+    """
+    m = KEY_BACKEND_RE.match(key)
+    if not m:
+        return None
+    name = m.group(1).lower()
+    length = ANNEX_DIGEST_HEX_LENGTH.get(name)
+    if length is None:
+        return None
+    return name, length
+
+
+# A short digest is carried as found, never refused. Its warning is bounded so
+# a dataset full of them cannot flood the run log: the first
+# SHORT_DIGEST_WARNING_LIMIT are printed, every one is counted, and main()
+# prints one summary line at the end of the run.
+SHORT_DIGEST_WARNING_LIMIT = 20
+short_digest_count = 0
+
+
+def _note_short_digest(key: str, found: int, expected: int) -> None:
+    global short_digest_count
+    short_digest_count += 1
+    if short_digest_count <= SHORT_DIGEST_WARNING_LIMIT:
+        print(
+            f"[emit_manifest] warning: annex key {key!r} has a {found}-character "
+            f"digest, its backend's is {expected}; carried as found",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def report_short_digests() -> None:
+    """One summary line on stderr when any short digest was carried as found."""
+    if short_digest_count:
+        print(
+            f"[emit_manifest] warning: {short_digest_count} annex keys had a digest "
+            f"shorter than their backend's; first "
+            f"{min(short_digest_count, SHORT_DIGEST_WARNING_LIMIT)} shown",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def extract_checksum_from_key(key: str) -> str:
+    """The hex run after `--`, cut to the backend's digest length.
+
+    The cut applies ONLY to an identified backend, so a dotless name that
+    starts with hex characters (COR-001, 01_brain_surface) is not read as part
+    of the digest. A run shorter than the length is returned as found. Any
+    other key keeps the historic greedy match. Mirrors extractChecksumFromKey
+    in manifest.ts.
+    """
     m = KEY_CHECKSUM_RE.search(key)
     if not m:
         print(
@@ -179,15 +278,28 @@ def extract_checksum_from_key(key: str) -> str:
             flush=True,
         )
         return ""
-    return m.group(1)
+    digest = m.group(1)
+    identified = identify_annex_backend(key)
+    if identified is not None:
+        _, length = identified
+        if len(digest) > length:
+            return digest[:length]
+        if len(digest) < length:
+            _note_short_digest(key, len(digest), length)
+    return digest
 
 
 def extract_algo_from_key(key: str) -> str:
     """Annex key formats: SHA256E-sNN--HEX.ext, MD5E-sNN--HEX.ext, etc.
 
     The trailing E (when present) marks "Extension" backends; the algorithm
-    name is the prefix before it.
+    name is the prefix before it. An identified backend is named from
+    identify_annex_backend (so SHA3_512E is sha3_512, and a size-less key is
+    identified too); anything else keeps the historic answer.
     """
+    identified = identify_annex_backend(key)
+    if identified is not None:
+        return identified[0]
     m = KEY_ALGO_RE.match(key)
     if not m:
         print(
@@ -651,6 +763,8 @@ def main(argv: list[str] | None = None) -> int:
         concept_doi=args.concept_doi or None,
         repo_dir=str(repo_dir),
     )
+
+    report_short_digests()
 
     if args.verify_canary:
         verify_canaries(
