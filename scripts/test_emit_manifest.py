@@ -15,8 +15,11 @@ Run with either:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1066,6 +1069,87 @@ class AnnexDigestLengthUnitTests(unittest.TestCase):
         for key in ("WORM-s1-m2--abcdef", "URL--abcdef", f"FOO-s1--{'a' * 100}"):
             with self.subTest(key=key):
                 self.assertIsNone(self.em.identify_annex_backend(key))
+
+    def test_the_table_is_the_literal_list_of_backend_lengths(self):
+        # Written out on purpose: a table edit must change this test.
+        self.assertEqual(
+            self.em.ANNEX_DIGEST_HEX_LENGTH,
+            {
+                "md5": 32,
+                "sha1": 40,
+                "sha224": 56,
+                "sha256": 64,
+                "sha384": 96,
+                "sha512": 128,
+                "sha3_224": 56,
+                "sha3_256": 64,
+                "sha3_384": 96,
+                "sha3_512": 128,
+                "skein256": 64,
+                "skein512": 128,
+                "blake2b160": 40,
+                "blake2b224": 56,
+                "blake2b256": 64,
+                "blake2b384": 96,
+                "blake2b512": 128,
+                "blake2bp512": 128,
+                "blake2s160": 40,
+                "blake2s224": 56,
+                "blake2s256": 64,
+                "blake2sp224": 56,
+                "blake2sp256": 64,
+            },
+        )
+
+    @unittest.skipUnless(shutil.which("git-annex"), "git-annex is not installed")
+    def test_table_matches_git_annex_calckey(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            git(repo, "init", "-q")
+            git(repo, "annex", "init", "-q", "test")
+            f = repo / "f.bin"
+            f.write_bytes(b"annex digest length\n")
+            for name, length in self.em.ANNEX_DIGEST_HEX_LENGTH.items():
+                for suffix in ("", "E"):
+                    backend = name.upper() + suffix
+                    with self.subTest(backend=backend):
+                        res = subprocess.run(
+                            ["git", "annex", "calckey", f"--backend={backend}", "f.bin"],
+                            cwd=repo,
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(res.returncode, 0, res.stderr)
+                        key = res.stdout.strip()
+                        digest = key.split("--", 1)[1].split(".", 1)[0]
+                        self.assertEqual(len(digest), length, key)
+                        self.assertEqual(self.em.extract_checksum_from_key(key), digest)
+
+    def _capture_short(self, keys):
+        self.em.short_digest_count = 0
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            digests = [self.em.extract_checksum_from_key(k) for k in keys]
+            self.em.report_short_digests()
+        self.em.short_digest_count = 0
+        return digests, err.getvalue().splitlines()
+
+    def test_one_short_digest_warns_and_is_carried_as_found(self):
+        digests, lines = self._capture_short([ANNEX_KEY])
+        self.assertEqual(digests, ["abcdef0123456789"])
+        self.assertTrue(any("carried as found" in ln for ln in lines), lines)
+
+    def test_short_digest_warnings_are_bounded_with_one_summary(self):
+        keys = [f"SHA256E-s1--{i:08x}.dat" for i in range(50)]
+        digests, lines = self._capture_short(keys)
+        self.assertEqual(digests, [f"{i:08x}" for i in range(50)])
+        self.assertEqual(sum("carried as found" in ln for ln in lines), 20, lines)
+        summary = [ln for ln in lines if "had a digest shorter" in ln]
+        self.assertEqual(len(summary), 1, lines)
+        self.assertIn("50 annex keys", summary[0])
+        self.assertIn("first 20 shown", summary[0])
+        self.assertEqual(len(lines), 21)
 
     def test_the_vectors_cover_every_backend_length(self):
         self.assertEqual(
