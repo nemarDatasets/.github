@@ -433,9 +433,11 @@ jobs:
         continue-on-error: true
         # Step outcomes are fixed words (success, failure, cancelled, skipped),
         # passed through env like every other value here, never interpolated
-        # into the script.
+        # into the script. Whether the run was cancelled comes from job.status:
+        # the cancelled() function is only allowed in an `if`, and calling it in
+        # an env value makes GitHub reject the whole file before any job runs.
         env:
-          RUN_CANCELLED: ${{ cancelled() }}
+          RUN_JOB_STATUS: ${{ job.status }}
           OUTCOME_BUN: ${{ steps.bun.outcome }}
           OUTCOME_INSTALL: ${{ steps.install.outcome }}
           OUTCOME_CREDENTIALS_PRODUCTION: ${{ steps.credentials_production.outcome }}
@@ -447,7 +449,7 @@ jobs:
           # first step), never from the job environment.
           NEMAR_APPROVAL_DISPATCH_TOKEN=$(jq -r '.client_payload.dispatch_token // empty' "$GITHUB_EVENT_PATH")
           if [ -z "$NEMAR_APPROVAL_DISPATCH_TOKEN" ]; then echo "No dispatch token; nothing to release."; exit 0; fi
-          if [ "$RUN_CANCELLED" = "true" ]; then
+          if [ "$RUN_JOB_STATUS" = "cancelled" ]; then
             reason=workflow_cancelled
           elif [ "$OUTCOME_BUN" = "failure" ] || [ "$OUTCOME_INSTALL" = "failure" ]; then
             reason=install_failed
