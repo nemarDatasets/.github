@@ -18,7 +18,8 @@ name: Run Pre-screen
 # The pre-screen is ADVISORY (nemarOrg/nemar-cli#756): it does NOT block
 # publication and no longer opens a GitHub issue on the dataset repo (that red
 # flag masked real BIDS/CI failures and admins overrode the block anyway). The
-# concern + reasons surface in `nemar dataset/admin publish status`.
+# concern + reasons surface in `nemar dataset publish status` and
+# `nemar admin repo publish list` (`nemar admin publish list` before CLI 0.10.34).
 #
 # Lives on nemarDatasets/.github so its Actions minutes bill against the
 # dataset org's Team allowance (same accounting as the enrichment/manifest
@@ -217,8 +218,9 @@ jobs:
       # "Block:" issue on the dataset repo (that red flag masked real BIDS/CI
       # failures and the block was overridden anyway). The reasons flow to the
       # Worker in the callback below and are recorded as a non-blocking advisory
-      # (prescreen_status='concern'), surfaced in `nemar dataset/admin publish
-      # status`. This also drops the NEMAR_GITHUB_PAT issue-write usage here.
+      # (prescreen_status='concern'), surfaced in `nemar dataset publish status`
+      # and `nemar admin repo publish list`. This also drops the NEMAR_GITHUB_PAT
+      # issue-write usage here.
 
       - name: Post verdict callback
         if: always() && steps.screen.outputs.verdict != ''

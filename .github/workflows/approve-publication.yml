@@ -25,7 +25,8 @@ name: Approve Publication
 #
 # What it does: validate the inputs, pick credentials for the environment,
 # check the key is an admin key before anything irreversible, run
-# `nemar admin publish approve`, then read the request's final state back from
+# `nemar admin repo publish approve` (`nemar admin publish approve` before CLI
+# 0.10.34), then read the request's final state back from
 # the API and fail unless it is `published`.
 #
 # Why the final state is read back: the CLI exits 0 when an approval fails
@@ -239,7 +240,7 @@ jobs:
       #    goes through curl's config on stdin so the key is not on the command
       #    line.
       # 2. The request this run was dispatched for is still the request the
-      #    approval will act on. `nemar admin publish approve` picks the NEWEST
+      #    approval will act on. `nemar admin repo publish approve` picks the NEWEST
       #    active request for the dataset (requested, approving or blocked) when
       #    it runs, not the one that was clicked. A run that waited in a queue
       #    while an admin denied that request and the owner asked again would
@@ -333,7 +334,24 @@ jobs:
           # prints "Cancelled" and exits 0. --skip-ci-check is never passed: an
           # admin override of BIDS validation is not something a button click
           # should carry.
-          args=(admin publish approve "$DATASET_ID" --yes)
+          #
+          # nemar-cli 0.10.34 moved the publication group under `admin repo`
+          # (`nemar admin repo publish approve`); the old `admin publish` path
+          # exits 1 there without running anything. Ask the installed CLI which
+          # one it has, so this works across the release whichever version npm
+          # serves. Captured, then matched in bash: `--help | grep -q` under
+          # pipefail can fail on the SIGPIPE that grep's early exit sends the CLI.
+          # The match is the `publish` command line itself (indented, whole word),
+          # not any mention of the word, so `unpublish` or a description cannot
+          # select a path the CLI does not have. Color codes are stripped first.
+          repo_help="$(nemar admin repo --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          if [[ "$repo_help" =~ (^|$'\n')[[:space:]]+publish[[:space:]] ]]; then
+            approve_cmd=(admin repo publish approve)
+          else
+            approve_cmd=(admin publish approve)
+          fi
+          echo "Using: nemar ${approve_cmd[*]}"
+          args=("${approve_cmd[@]}" "$DATASET_ID" --yes)
           if [ "$RESUME" = "true" ]; then args+=(--resume); fi
 
           # The dispatch token reaches the CLI here, in this step's own shell and
@@ -404,7 +422,7 @@ jobs:
             # What to do depends on where the request stands, and "run it again"
             # is wrong for a request that needs a person.
             case "$final" in
-              approving) hint="It stopped partway. Run this workflow again with resume, or run: nemar admin publish approve ${DATASET_ID} --resume" ;;
+              approving) hint="It stopped partway. Run this workflow again with resume, or run: nemar admin repo publish approve ${DATASET_ID} --resume (before CLI 0.10.34: nemar admin publish approve)" ;;
               blocked) hint="The request is blocked: the owner has to fix it first (the reason is on the admin page)." ;;
               denied) hint="The request was denied; there is nothing to approve." ;;
               *) hint="The approval did not start. Read the approve step above, then dispatch it again from the admin page." ;;
