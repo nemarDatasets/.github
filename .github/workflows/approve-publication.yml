@@ -340,9 +340,12 @@ jobs:
           # exits 1 there without running anything. Ask the installed CLI which
           # one it has, so this works across the release whichever version npm
           # serves. Captured, then matched in bash: `--help | grep -q` under
-          # pipefail can fail on the SIGPIPE grep's early exit sends the CLI.
-          repo_help="$(nemar admin repo --help 2>/dev/null || true)"
-          if [[ "$repo_help" == *"publish"* ]]; then
+          # pipefail can fail on the SIGPIPE that grep's early exit sends the CLI.
+          # The match is the `publish` command line itself (indented, whole word),
+          # not any mention of the word, so `unpublish` or a description cannot
+          # select a path the CLI does not have. Color codes are stripped first.
+          repo_help="$(nemar admin repo --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          if [[ "$repo_help" =~ (^|$'\n')[[:space:]]+publish[[:space:]] ]]; then
             approve_cmd=(admin repo publish approve)
           else
             approve_cmd=(admin publish approve)
