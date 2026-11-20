@@ -1,0 +1,33 @@
+name: Test BIDS annex filter
+
+# Runs scripts/test_bids_annex_filter.py: the real "Check validation result"
+# step of run-bids-validation.yml against validator output from real datasets
+# (no mocks), plus actionlint on that workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/run-bids-validation.yml"
+      - ".github/workflows/test-bids-annex-filter.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/run-bids-validation.yml"
+      - ".github/workflows/test-bids-annex-filter.yml"
+  workflow_dispatch:
+
+jobs:
+  fixture-test:
+    name: Annex filter fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+      - name: Run fixture test
+        run: python scripts/test_bids_annex_filter.py

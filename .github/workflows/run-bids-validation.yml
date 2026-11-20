@@ -149,6 +149,29 @@ jobs:
         with:
           deno-version: v2.x
 
+      - name: Fetch git-annex branch for annexed content
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # With the git-annex branch present, bids-validator reads annexed
+          # symlink content over a remote that has a publicurl (OpenNeuro's
+          # s3-PUBLIC, a public nemar-s3), so rules see real files. Private
+          # datasets have no publicurl: content stays unreadable and the
+          # filter in "Check validation result" is the fallback. Best-effort.
+          ANNEX_DIR="${ANNEX_DIR:-/tmp}"
+          echo none > "$ANNEX_DIR/annex-content-mode"
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          if git -c "http.extraheader=$AUTH" fetch --quiet --depth 1 \
+               "https://github.com/nemarDatasets/${DATASET_ID}.git" git-annex:git-annex; then
+            if git show git-annex:remote.log 2>/dev/null | grep -q 'publicurl='; then
+              echo fetched > "$ANNEX_DIR/annex-content-mode"
+            fi
+          else
+            echo "No git-annex branch fetched; annexed content stays unreadable"
+          fi
+          echo "annex content mode: $(cat "$ANNEX_DIR/annex-content-mode")"
+
       - name: Run BIDS validator
         id: validator
         run: |
@@ -166,18 +189,34 @@ jobs:
       - name: Collect git-annex pointer files
         run: |
           set -euo pipefail
-          find . -type l -not -path './.git/*' -printf '/%P\n' > /tmp/annex-files.txt 2>/dev/null || true
-          find . -type f -not -path './.git/*' -size -1024c -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' >> /tmp/annex-files.txt || true
-          sort -u /tmp/annex-files.txt -o /tmp/annex-files.txt
-          ANNEX_COUNT=$(wc -l < /tmp/annex-files.txt | tr -d ' ')
+          # ANNEX_DIR is overridable only so scripts/test_bids_annex_filter.sh can
+          # drive the "Check validation result" step against fixtures.
+          ANNEX_DIR="${ANNEX_DIR:-/tmp}"
+          # All annex pointers: symlinks, plus small files holding an annex path.
+          find . -type l -not -path './.git/*' -printf '/%P\n' > "$ANNEX_DIR/annex-links.txt" 2>/dev/null || true
+          find . -type f -not -path './.git/*' -size -1024c -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' > "$ANNEX_DIR/annex-pointer-files.txt" || true
+          cat "$ANNEX_DIR/annex-links.txt" "$ANNEX_DIR/annex-pointer-files.txt" | sort -u > "$ANNEX_DIR/annex-files.txt"
+          # Pointers whose content the validator could NOT read. The validator only
+          # resolves annex SYMLINKS (through the git-annex branch fetched above,
+          # over a remote with a publicurl); pointer FILES are never resolved, and
+          # nothing resolves when the fetch step did not find a public remote.
+          if [ "$(cat "$ANNEX_DIR/annex-content-mode" 2>/dev/null || echo none)" = fetched ]; then
+            sort -u "$ANNEX_DIR/annex-pointer-files.txt" > "$ANNEX_DIR/annex-unresolved.txt"
+          else
+            cp "$ANNEX_DIR/annex-files.txt" "$ANNEX_DIR/annex-unresolved.txt"
+          fi
+          ANNEX_COUNT=$(wc -l < "$ANNEX_DIR/annex-files.txt" | tr -d ' ')
+          UNRESOLVED_COUNT=$(wc -l < "$ANNEX_DIR/annex-unresolved.txt" | tr -d ' ')
           if [ "$ANNEX_COUNT" -gt 0 ]; then
-            echo "Found $ANNEX_COUNT git-annex pointer file(s) (content-read errors located on these will be filtered)"
+            echo "Found $ANNEX_COUNT git-annex pointer file(s), $UNRESOLVED_COUNT without readable content (annex content mode: $(cat "$ANNEX_DIR/annex-content-mode" 2>/dev/null || echo none))"
           fi
 
       - name: Check validation result
         id: result
         run: |
+          # shellcheck disable=SC2016
           set -euo pipefail
+          ANNEX_DIR="${ANNEX_DIR:-/tmp}"
           # Markdown error detail surfaced on the dataset-repo check-run
           # (output[text]) so PR authors can read failures in their own repo's
           # Checks tab without opening the central run logs. Stays empty unless
@@ -191,20 +230,40 @@ jobs:
             exit 0
           fi
 
-          if [ -s /tmp/annex-files.txt ]; then
-            jq -R -s 'split("\n") | map(select(length > 0))' /tmp/annex-files.txt > /tmp/annex-files.json
-          else
-            echo '[]' > /tmp/annex-files.json
-          fi
+          for f in annex-files annex-unresolved; do
+            if [ -s "$ANNEX_DIR/$f.txt" ]; then
+              jq -R -s 'split("\n") | map(select(length > 0))' "$ANNEX_DIR/$f.txt" > "$ANNEX_DIR/$f.json"
+            else
+              echo '[]' > "$ANNEX_DIR/$f.json"
+            fi
+          done
 
-          # ANNEX_CONTENT_READ_CODES: validator issue codes that exist only
-          # because the checkout has no annexed content, so they are noise when
-          # located on an annex pointer. Rule: a code is listed ONLY if
-          # bids-validator raises it from reading a file's bytes or header
-          # (jsr:@bids/validator@3.0.2, src/):
+          # WHAT IS FILTERED, AND WHY.
+          # The checkout has no annexed content. The validator reads annex files
+          # through the git-annex branch and a public remote when it can; where it
+          # cannot, a pointer is an EMPTY file to it (bids-validator 3.0.2
+          # NullFileOpener), so rules that look inside it fire on nothing.
+          # Every error is classified, in order:
+          #   real        not located on an annex file: kept.
+          #   skipped     located on an annex file AND one of:
+          #                 (a) FILE_READ (the validator could not read the content);
+          #                 (b) the file's content is unreadable AND its code is in
+          #                     ANNEX_CONTENT_READ_CODES;
+          #                 (c) the file is an unreadable .json/.tsv/.tsv.gz/.bval/.bvec
+          #                     (they are rule INPUTS: empty means every column or key
+          #                     looks missing) and the code is not path-only
+          #                     (ANNEX_PATH_ONLY_CODES, which stay real);
+          #                 (d) a SIDECAR_KEY_* error whose sidecar could be an
+          #                     unreadable .json (same or ancestor directory, same
+          #                     suffix), since the keys it would supply are unknown.
+          #   annex_real  located on an annex file but none of the above: kept, and
+          #               counted separately ("located on annex files").
+          # Content is "unreadable" for the paths in annex-unresolved.txt only.
+          #
+          # ANNEX_CONTENT_READ_CODES: codes bids-validator raises only from reading
+          # a file's bytes or header (jsr:@bids/validator@3.0.2, src/):
           #   NIFTI_HEADER_UNREADABLE   files/nifti.ts loadHeader (readBytes 1024)
           #   AMBIGUOUS_AFFINE          schema/context.ts loadNiftiHeader (parsed header)
-          #   FILE_READ                 files/access.ts IOErrorToIssue (open/read failure)
           #   INVALID_GZIP              files/tsv.ts loadHeaderlessTSV (gunzip of .tsv.gz)
           #   INVALID_FILE_ENCODING     files/streams.ts (UTF-8 decode of content)
           #   INVALID_JSON_ENCODING     files/json.ts loadJSON (UTF-8 decode)
@@ -213,45 +272,62 @@ jobs:
           #   TSV_EMPTY_LINE            files/tsv.ts loadColumns (row scan of content)
           #   TSV_EQUAL_ROWS            files/tsv.ts loadColumns (row scan of content)
           #   TSV_COLUMN_HEADER_DUPLICATE  files/tsv.ts (header row of content)
-          # Everything else is a real error even when it is merely REPORTED at an
-          # annexed data file (e.g. SIDECAR_KEY_REQUIRED, IEEG_ELECTRODES_REQUIRED,
-          # schema rules, filename rules, TSV table rules, SYMLINK_*, and
-          # EMPTY_FILE, which uses the size from the annex key, not file bytes).
+          # (FILE_READ, files/access.ts, is rule (a).) EMPTY_FILE is path-only: the
+          # validator takes an annexed file's size from the annex key, not bytes.
           # Do not add a code here unless it needs the file's content.
-          ANNEX_CONTENT_READ_CODES='["NIFTI_HEADER_UNREADABLE","AMBIGUOUS_AFFINE","FILE_READ","INVALID_GZIP","INVALID_FILE_ENCODING","INVALID_JSON_ENCODING","JSON_INVALID","JSON_NOT_AN_OBJECT","TSV_EMPTY_LINE","TSV_EQUAL_ROWS","TSV_COLUMN_HEADER_DUPLICATE"]'
-          # jq prelude: on_annex = located on a pointer; skipped = on_annex AND content-read code.
-          # shellcheck disable=SC2016
-          JQ_DEFS='def on_annex: (.location as $loc | ($annexed[0] | index($loc)) != null); def skipped: on_annex and (.code as $c | ($codes | index($c)) != null);'
+          ANNEX_CONTENT_READ_CODES='["NIFTI_HEADER_UNREADABLE","AMBIGUOUS_AFFINE","INVALID_GZIP","INVALID_FILE_ENCODING","INVALID_JSON_ENCODING","JSON_INVALID","JSON_NOT_AN_OBJECT","TSV_EMPTY_LINE","TSV_EQUAL_ROWS","TSV_COLUMN_HEADER_DUPLICATE"]'
+          # ANNEX_PATH_ONLY_CODES: judged from the file path alone, so a missing
+          # content cannot cause them; they stay real even on unreadable files.
+          ANNEX_PATH_ONLY_CODES='["NOT_INCLUDED","INVALID_LOCATION","FILENAME_MISMATCH","ENTITY_NOT_IN_RULE","ENTITY_WITH_NO_LABEL","MISSING_REQUIRED_ENTITY","DATATYPE_MISMATCH","EXTENSION_MISMATCH","ALL_FILENAME_RULES_HAVE_ISSUES","INVALID_ENTITY_LABEL","CASE_COLLISION","SIDECAR_WITHOUT_DATAFILE","SYMLINK_BROKEN","SYMLINK_CYCLE","SYMLINK_OUT_OF_TREE","SYMLINK_IN_SUBMODULE","EMPTY_FILE"]'
 
-          REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
-            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped | not)] | length' \
-            .nemar/validation.json)
-          ANNEX_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
-            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped)] | length' \
-            .nemar/validation.json)
-          # Real errors (kept in REAL_ERRORS) that are located on an annexed file.
-          ANNEX_REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
-            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(on_annex and (skipped | not))] | length' \
-            .nemar/validation.json)
+          # shellcheck disable=SC2016
+          jq --slurpfile annexed "$ANNEX_DIR/annex-files.json" \
+             --slurpfile unresolved "$ANNEX_DIR/annex-unresolved.json" \
+             --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+             --argjson pathonly "$ANNEX_PATH_ONLY_CODES" '
+            def idx: map({key: ., value: true}) | from_entries;
+            def dirname: sub("/[^/]*$"; "");
+            def suffix: split("/") | last | split(".")[0] | split("_") | last;
+            ($annexed[0] | idx) as $A
+            | ($unresolved[0] | idx) as $U
+            | ($unresolved[0] | map(select(test("\\.(json|tsv|tsv\\.gz|bval|bvec)$")))) as $AT
+            | ($AT | idx) as $ATI
+            | ($AT | map(select(endswith(".json")))) as $ATJ
+            | def has_sidecar($l):
+                ($l | suffix) as $s | (($l | dirname) + "/") as $d
+                | any($ATJ[]; . as $j | endswith("_" + $s + ".json") and ($d | startswith(($j | dirname) + "/")));
+              def classify:
+                (.location // "") as $l | .code as $c
+                | if ($A[$l] // false) | not then "real"
+                  elif $c == "FILE_READ" then "skipped"
+                  elif ($U[$l] // false) | not then "annex_real"
+                  elif ($codes | index($c)) != null then "skipped"
+                  elif ($ATI[$l] // false) and (($pathonly | index($c)) == null) then "skipped"
+                  elif ($c | startswith("SIDECAR_KEY_")) and has_sidecar($l) then "skipped"
+                  else "annex_real" end;
+              [.issues.issues[] | select(.severity == "error") | . + {annexClass: classify}]
+          ' .nemar/validation.json > "$ANNEX_DIR/errors-classified.json"
+
+          REAL_ERRORS=$(jq '[.[] | select(.annexClass != "skipped")] | length' "$ANNEX_DIR/errors-classified.json")
+          ANNEX_ERRORS=$(jq '[.[] | select(.annexClass == "skipped")] | length' "$ANNEX_DIR/errors-classified.json")
+          ANNEX_LOCATED=$(jq '[.[] | select(.annexClass == "annex_real")] | length' "$ANNEX_DIR/errors-classified.json")
           WARNINGS=$(jq '[.issues.issues[] | select(.severity == "warning")] | length' .nemar/validation.json)
+          STATS="skipped $ANNEX_ERRORS annex-pointer error(s) that need file content; $ANNEX_LOCATED of the reported error(s) are located on annex files"
 
           echo "real_errors=$REAL_ERRORS" >> "$GITHUB_OUTPUT"
           echo "annex_errors=$ANNEX_ERRORS" >> "$GITHUB_OUTPUT"
-          echo "annex_real_errors=$ANNEX_REAL_ERRORS" >> "$GITHUB_OUTPUT"
+          echo "annex_located_errors=$ANNEX_LOCATED" >> "$GITHUB_OUTPUT"
           echo "warnings=$WARNINGS" >> "$GITHUB_OUTPUT"
 
           if [ "$REAL_ERRORS" -gt 0 ]; then
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
-            echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) (skipped $ANNEX_ERRORS annex-pointer error(s); $ANNEX_REAL_ERRORS real error(s) located on annex files)." >> "$GITHUB_OUTPUT"
-            echo "::error::BIDS validation found $REAL_ERRORS error(s)"
+            echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) ($STATS)." >> "$GITHUB_OUTPUT"
+            echo "::error::BIDS validation found $REAL_ERRORS error(s) ($STATS)"
             # Build the human-readable error detail (grouped-by-code summary +
             # capped detail table) for the check-run output[text]. Capped to
             # stay well under GitHub's 64KB output limit; never fails the step.
-            jq -r --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
-              "$JQ_DEFS"'
-              [.issues.issues[]
-               | select(.severity == "error")
-               | select(skipped | not)] as $errs
+            jq -r '
+              [.[] | select(.annexClass != "skipped")] as $errs
               | ($errs | length) as $n
               | ([$errs[].code] | group_by(.) | map({code: .[0], count: length}) | sort_by(-.count)) as $bycode
               | "### BIDS validation errors\n\n"
@@ -265,16 +341,14 @@ jobs:
                   ) | join("\n"))
                 + "\n\n</details>"
                 + (if $n > 50 then "\n\n_...and \($n - 50) more error(s) not shown; full report in the linked central run._" else "" end)
-            ' .nemar/validation.json > /tmp/error-details.md || true
-            # Also echo the raw error objects to the central run log (unchanged).
-            jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
-              "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped | not)][]' \
-              .nemar/validation.json
+            ' "$ANNEX_DIR/errors-classified.json" > /tmp/error-details.md || true
+            # Also echo the raw error objects to the central run log.
+            jq '[.[] | select(.annexClass != "skipped")][]' "$ANNEX_DIR/errors-classified.json"
             exit 0
           fi
           echo "outcome=success" >> "$GITHUB_OUTPUT"
-          echo "summary=BIDS validation passed: $WARNINGS warning(s), $ANNEX_ERRORS annex-pointer content-read error(s) intentionally skipped." >> "$GITHUB_OUTPUT"
-          echo "BIDS validation passed ($WARNINGS warning(s), $ANNEX_ERRORS annex pointer error(s) skipped)"
+          echo "summary=BIDS validation passed: $WARNINGS warning(s) ($STATS)." >> "$GITHUB_OUTPUT"
+          echo "BIDS validation passed ($WARNINGS warning(s); $STATS)"
 
       - name: Finalize check-run on the dataset repo
         if: always() && steps.check.outputs.check_id != ''
