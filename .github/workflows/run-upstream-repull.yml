@@ -238,6 +238,52 @@ jobs:
             exit 1
           fi
 
+      # The iEEG geometry pipeline (nemarOrg/nemar-cli ADR 0111, the amendment of 2026-11-19) makes
+      # N.0.1 regenerate its files by running the Python package that ships in nemar-cli's own
+      # repository, which the npm package does not carry. The package is cloned at exactly the
+      # release the dispatch names (a public repository, so with no credential, and by git rather
+      # than a checkout action, since nothing here checks a repository out), and `uv`, pinned to one
+      # release and its published checksum, installs the package's locked environment before the CLI
+      # runs, because N.0.1 is made by `resume`, in either mode. The CLI finds the package through
+      # NEMAR_IEEG_GEOMETRY_DIR and refuses a pipeline of another version. A release that predates
+      # the package skips the step whole (it never calls the pipeline).
+      - name: Install the iEEG geometry pipeline at the release
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "v${CLI_VERSION}" \
+            https://github.com/nemarOrg/nemar-cli.git "$RUNNER_TEMP/nemar-cli"
+          project="$RUNNER_TEMP/nemar-cli/scripts/ieeg_geometry"
+          pinned=""
+          if [ -f "$RUNNER_TEMP/nemar-cli/src/lib/repull/pipeline-owned.ts" ]; then
+            pinned="$(grep -oE 'IEEG_GEOMETRY_PIPELINE_VERSION = "[^"]+"' \
+              "$RUNNER_TEMP/nemar-cli/src/lib/repull/pipeline-owned.ts" | cut -d'"' -f2 || true)"
+          fi
+          # A release that predates the package never calls the pipeline: nothing is installed and
+          # NEMAR_IEEG_GEOMETRY_DIR stays unset, so this workflow is safe to deploy before the release.
+          if [ ! -d "$project" ] && [ -z "$pinned" ]; then
+            echo "ieeg-geometry: not in this CLI release"
+            exit 0
+          fi
+          # The package is the version this release of the CLI pins (IEEG_GEOMETRY_PIPELINE_VERSION),
+          # or the run refuses before anything is installed.
+          cloned="$(sed -nE 's/^version = "([^"]+)"$/\1/p' "$project/pyproject.toml" 2> /dev/null | head -n 1 || true)"
+          if [ -z "$pinned" ] || [ "$pinned" != "$cloned" ]; then
+            echo "repull-auto: result phase=failed code=auto-cli-version" >> "$RUNNER_TEMP/repull-auto.log"
+            echo "::error::The pipeline package is not the version this release pins"
+            exit 1
+          fi
+          uv_version="0.13.9"
+          uv_sha256="a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5"
+          archive="$RUNNER_TEMP/uv.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/astral-sh/uv/releases/download/${uv_version}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${uv_sha256}  ${archive}" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/uv-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/uv-bin" --strip-components=1
+          echo "$RUNNER_TEMP/uv-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/uv-bin/uv" sync --frozen --no-dev --project "$project" > /dev/null
+          echo "NEMAR_IEEG_GEOMETRY_DIR=$project" >> "$GITHUB_ENV"
+
       # The login's own output names the account, on either stream; none of it is printed.
       - name: Sign in the nemar CLI
         env:
