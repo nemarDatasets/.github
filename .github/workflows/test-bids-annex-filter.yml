@@ -1,0 +1,40 @@
+name: Test BIDS annex filter
+
+# Runs scripts/test_bids_annex_filter.py: the real "Collect git-annex pointer
+# files" and "Check validation result" steps of run-bids-validation.yml against
+# validator output from real datasets and a real temporary git repo (no mocks),
+# plus actionlint on the two workflows.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/run-bids-validation.yml"
+      - ".github/workflows/test-bids-annex-filter.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/run-bids-validation.yml"
+      - ".github/workflows/test-bids-annex-filter.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture-test:
+    name: Annex filter fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Run fixture test
+        run: uv run --with pyyaml python scripts/test_bids_annex_filter.py
+      - name: actionlint
+        # SC2129 is a style note already present in run-bids-validation.yml.
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -ignore 'SC2129:style' \
+            .github/workflows/run-bids-validation.yml \
+            .github/workflows/test-bids-annex-filter.yml

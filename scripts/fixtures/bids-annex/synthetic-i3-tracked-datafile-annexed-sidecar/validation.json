@@ -1,0 +1,1 @@
+{"issues": {"issues": [{"severity": "error", "code": "SIDECAR_KEY_REQUIRED", "location": "/sub-1/func/sub-1_task-x_bold.nii.gz"}, {"severity": "error", "code": "SIDECAR_KEY_RECOMMENDED", "location": "/sub-1/func/sub-1_task-x_bold.nii"}, {"severity": "error", "code": "SIDECAR_KEY_REQUIRED", "location": "/sub-1/anat/sub-1_T1w.nii.gz"}]}}

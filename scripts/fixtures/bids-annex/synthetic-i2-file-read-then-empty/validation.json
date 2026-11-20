@@ -1,0 +1,1 @@
+{"issues": {"issues": [{"severity": "error", "code": "FILE_READ", "location": "/sub-1/func/sub-1_task-x_events.tsv"}, {"severity": "error", "code": "TSV_COLUMN_MISSING", "location": "/sub-1/func/sub-1_task-x_events.tsv"}, {"severity": "error", "code": "SIDECAR_KEY_REQUIRED", "location": "/sub-1/func/sub-1_task-x_bold.nii.gz"}]}}

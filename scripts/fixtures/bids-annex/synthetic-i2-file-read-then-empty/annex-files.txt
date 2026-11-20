@@ -1,0 +1,2 @@
+/sub-1/func/sub-1_task-x_events.tsv
+/task-x_bold.json
