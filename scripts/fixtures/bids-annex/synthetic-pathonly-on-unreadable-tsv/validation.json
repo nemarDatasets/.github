@@ -1,0 +1,1 @@
+{"issues": {"issues": [{"severity": "error", "code": "FILENAME_MISMATCH", "location": "/sub-1/func/sub-1_task-x_events.tsv"}, {"severity": "error", "code": "TSV_COLUMN_MISSING", "location": "/sub-1/func/sub-1_task-x_events.tsv"}, {"severity": "error", "code": "SIDECAR_WITHOUT_DATAFILE", "location": "/sub-1/func/sub-1_task-x_events.tsv"}]}}

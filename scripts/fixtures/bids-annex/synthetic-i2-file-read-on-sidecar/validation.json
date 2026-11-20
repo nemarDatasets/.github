@@ -1,0 +1,1 @@
+{"issues": {"issues": [{"severity": "error", "code": "FILE_READ", "location": "/task-x_bold.json"}, {"severity": "error", "code": "SIDECAR_KEY_REQUIRED", "location": "/sub-1/func/sub-1_task-x_bold.nii.gz"}, {"severity": "error", "code": "JSON_KEY_REQUIRED", "location": "/task-x_bold.json"}]}}

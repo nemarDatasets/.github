@@ -140,8 +140,8 @@ jobs:
           repository: nemarDatasets/${{ env.DATASET_ID }}
           ref: ${{ env.HEAD_SHA }}
           token: ${{ steps.app-token.outputs.token }}
-          # The token is used for this fetch only; nothing later runs git, so it is
-          # not left in the checkout's git config for the steps that read the dataset.
+          # The token is used for this fetch only and is not left in the checkout's
+          # git config; the git-annex fetch below passes it per command instead.
           persist-credentials: false
 
       - name: Setup Deno
@@ -154,23 +154,21 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          # With the git-annex branch present, bids-validator reads annexed
-          # symlink content over a remote that has a publicurl (OpenNeuro's
-          # s3-PUBLIC, a public nemar-s3), so rules see real files. Private
-          # datasets have no publicurl: content stays unreadable and the
-          # filter in "Check validation result" is the fallback. Best-effort.
-          ANNEX_DIR="${ANNEX_DIR:-/tmp}"
-          echo none > "$ANNEX_DIR/annex-content-mode"
+          # With the git-annex branch present, bids-validator 3.0.2 resolves an
+          # annexed SYMLINK per key: when the branch holds `<hashdir>/<key>.log.rmet`
+          # it reads the content over that special remote's public URL, so rules see
+          # a real file. Any other symlink, and every pointer FILE, stays empty to
+          # the validator; "Collect git-annex pointer files" works out which, and
+          # the filter in "Check validation result" covers them. Best-effort.
+          # The token goes in through git's env config, not argv.
           AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
-          if git -c "http.extraheader=$AUTH" fetch --quiet --depth 1 \
+          if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="$AUTH" \
+               git fetch --quiet --depth 1 \
                "https://github.com/nemarDatasets/${DATASET_ID}.git" git-annex:git-annex; then
-            if git show git-annex:remote.log 2>/dev/null | grep -q 'publicurl='; then
-              echo fetched > "$ANNEX_DIR/annex-content-mode"
-            fi
+            echo "Fetched the git-annex branch"
           else
             echo "No git-annex branch fetched; annexed content stays unreadable"
           fi
-          echo "annex content mode: $(cat "$ANNEX_DIR/annex-content-mode")"
 
       - name: Run BIDS validator
         id: validator
@@ -189,26 +187,32 @@ jobs:
       - name: Collect git-annex pointer files
         run: |
           set -euo pipefail
-          # ANNEX_DIR is overridable only so scripts/test_bids_annex_filter.sh can
-          # drive the "Check validation result" step against fixtures.
+          # ANNEX_DIR is overridable only so scripts/test_bids_annex_filter.py can
+          # drive this step and the next against fixtures.
           ANNEX_DIR="${ANNEX_DIR:-/tmp}"
-          # All annex pointers: symlinks, plus small files holding an annex path.
-          find . -type l -not -path './.git/*' -printf '/%P\n' > "$ANNEX_DIR/annex-links.txt" 2>/dev/null || true
-          find . -type f -not -path './.git/*' -size -1024c -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' > "$ANNEX_DIR/annex-pointer-files.txt" || true
-          cat "$ANNEX_DIR/annex-links.txt" "$ANNEX_DIR/annex-pointer-files.txt" | sort -u > "$ANNEX_DIR/annex-files.txt"
-          # Pointers whose content the validator could NOT read. The validator only
-          # resolves annex SYMLINKS (through the git-annex branch fetched above,
-          # over a remote with a publicurl); pointer FILES are never resolved, and
-          # nothing resolves when the fetch step did not find a public remote.
-          if [ "$(cat "$ANNEX_DIR/annex-content-mode" 2>/dev/null || echo none)" = fetched ]; then
-            sort -u "$ANNEX_DIR/annex-pointer-files.txt" > "$ANNEX_DIR/annex-unresolved.txt"
-          else
-            cp "$ANNEX_DIR/annex-files.txt" "$ANNEX_DIR/annex-unresolved.txt"
+          FIND=$(command -v gfind || echo find)
+          # All annex pointers: symlinks (path<TAB>target), plus small files
+          # holding an annex path.
+          "$FIND" . -type l -not -path './.git/*' -printf '/%P\t%l\n' > "$ANNEX_DIR/annex-links.tsv" 2>/dev/null || true
+          "$FIND" . -type f -not -path './.git/*' -size -1024c -exec grep -l '^/annex/objects/' {} + 2>/dev/null | sed 's|^\./|/|' > "$ANNEX_DIR/annex-pointer-files.txt" || true
+          { cut -f1 "$ANNEX_DIR/annex-links.tsv"; cat "$ANNEX_DIR/annex-pointer-files.txt"; } | sort -u > "$ANNEX_DIR/annex-files.txt"
+          # Pointers whose content the validator could NOT read: every pointer
+          # FILE (3.0.2 only resolves symlinks), and every symlink whose key has no
+          # `<hashdir>/<key>.log.rmet` on the fetched git-annex branch (the
+          # validator then falls back to an empty file without any error).
+          : > "$ANNEX_DIR/annex-rmet-keys.txt"
+          if git rev-parse --verify -q refs/heads/git-annex > /dev/null; then
+            git ls-tree -r --name-only git-annex | awk -F/ '/\.log\.rmet$/ { sub(/\.log\.rmet$/, "", $NF); print $NF }' | sort -u > "$ANNEX_DIR/annex-rmet-keys.txt"
           fi
+          {
+            cat "$ANNEX_DIR/annex-pointer-files.txt"
+            awk -F'\t' 'FILENAME == ARGV[1] { have[$0] = 1; next } { n = split($2, a, "/"); if (!(a[n] in have)) print $1 }' \
+              "$ANNEX_DIR/annex-rmet-keys.txt" "$ANNEX_DIR/annex-links.tsv"
+          } | sort -u > "$ANNEX_DIR/annex-unresolved.txt"
           ANNEX_COUNT=$(wc -l < "$ANNEX_DIR/annex-files.txt" | tr -d ' ')
           UNRESOLVED_COUNT=$(wc -l < "$ANNEX_DIR/annex-unresolved.txt" | tr -d ' ')
           if [ "$ANNEX_COUNT" -gt 0 ]; then
-            echo "Found $ANNEX_COUNT git-annex pointer file(s), $UNRESOLVED_COUNT without readable content (annex content mode: $(cat "$ANNEX_DIR/annex-content-mode" 2>/dev/null || echo none))"
+            echo "Found $ANNEX_COUNT git-annex pointer file(s), $UNRESOLVED_COUNT without readable content (filtered by rule below)"
           fi
 
       - name: Check validation result
@@ -239,26 +243,28 @@ jobs:
           done
 
           # WHAT IS FILTERED, AND WHY.
-          # The checkout has no annexed content. The validator reads annex files
-          # through the git-annex branch and a public remote when it can; where it
-          # cannot, a pointer is an EMPTY file to it (bids-validator 3.0.2
-          # NullFileOpener), so rules that look inside it fire on nothing.
-          # Every error is classified, in order:
-          #   real        not located on an annex file: kept.
-          #   skipped     located on an annex file AND one of:
-          #                 (a) FILE_READ (the validator could not read the content);
-          #                 (b) the file's content is unreadable AND its code is in
-          #                     ANNEX_CONTENT_READ_CODES;
-          #                 (c) the file is an unreadable .json/.tsv/.tsv.gz/.bval/.bvec
-          #                     (they are rule INPUTS: empty means every column or key
-          #                     looks missing) and the code is not path-only
-          #                     (ANNEX_PATH_ONLY_CODES, which stay real);
-          #                 (d) a SIDECAR_KEY_* error whose sidecar could be an
-          #                     unreadable .json (same or ancestor directory, same
-          #                     suffix), since the keys it would supply are unknown.
-          #   annex_real  located on an annex file but none of the above: kept, and
-          #               counted separately ("located on annex files").
-          # Content is "unreadable" for the paths in annex-unresolved.txt only.
+          # The checkout has no annexed content. Where the validator cannot read an
+          # annexed file (see annex-unresolved.txt, built by the collect step) it
+          # sees an EMPTY file (bids-validator 3.0.2 NullFileOpener), so rules that
+          # look inside it fire on nothing, and rules that INHERIT from an empty
+          # .json sidecar report its keys missing on the data files too.
+          # Every error is classified, in this order:
+          #   skipped     (d) a SIDECAR_KEY_* error, at ANY location, when an
+          #                   unreadable annexed .json could be the sidecar (same or
+          #                   ancestor directory, same suffix): the keys it would
+          #                   supply are unknown. Evaluated first because the data
+          #                   file itself may be git-tracked or readable.
+          #   real        not located on an annex file (and not rule d): kept.
+          #   skipped     (a) FILE_READ on an annex file: the content could not be
+          #                   read. The location is then also treated as unreadable
+          #                   below (the validator carries on with empty content).
+          #   annex_real  located on an annex file whose content WAS readable: kept.
+          #   skipped     (b) unreadable, and the code is in ANNEX_CONTENT_READ_CODES;
+          #               (c) unreadable .json/.tsv/.tsv.gz/.bval/.bvec (they are rule
+          #                   INPUTS, so empty means every column or key looks
+          #                   missing) and the code is not in ANNEX_PATH_ONLY_CODES.
+          #   annex_real  everything else on an annex file: kept, and counted
+          #               separately ("located on annex files").
           #
           # ANNEX_CONTENT_READ_CODES: codes bids-validator raises only from reading
           # a file's bytes or header (jsr:@bids/validator@3.0.2, src/):
@@ -288,9 +294,13 @@ jobs:
             def idx: map({key: ., value: true}) | from_entries;
             def dirname: sub("/[^/]*$"; "");
             def suffix: split("/") | last | split(".")[0] | split("_") | last;
+            def input_file: test("\\.(json|tsv|tsv\\.gz|bval|bvec)$");
             ($annexed[0] | idx) as $A
-            | ($unresolved[0] | idx) as $U
-            | ($unresolved[0] | map(select(test("\\.(json|tsv|tsv\\.gz|bval|bvec)$")))) as $AT
+            # FILE_READ on an annex file: the validator went on with empty content.
+            | ([.issues.issues[] | select(.severity == "error" and .code == "FILE_READ") | .location // empty | select($A[.] // false)]) as $failed
+            | (($unresolved[0] + $failed) | unique) as $unreadable
+            | ($unreadable | idx) as $U
+            | ($unreadable | map(select(input_file))) as $AT
             | ($AT | idx) as $ATI
             | ($AT | map(select(endswith(".json")))) as $ATJ
             | def has_sidecar($l):
@@ -298,12 +308,12 @@ jobs:
                 | any($ATJ[]; . as $j | endswith("_" + $s + ".json") and ($d | startswith(($j | dirname) + "/")));
               def classify:
                 (.location // "") as $l | .code as $c
-                | if ($A[$l] // false) | not then "real"
+                | if ($c | startswith("SIDECAR_KEY_")) and has_sidecar($l) then "skipped"
+                  elif ($A[$l] // false) | not then "real"
                   elif $c == "FILE_READ" then "skipped"
                   elif ($U[$l] // false) | not then "annex_real"
                   elif ($codes | index($c)) != null then "skipped"
                   elif ($ATI[$l] // false) and (($pathonly | index($c)) == null) then "skipped"
-                  elif ($c | startswith("SIDECAR_KEY_")) and has_sidecar($l) then "skipped"
                   else "annex_real" end;
               [.issues.issues[] | select(.severity == "error") | . + {annexClass: classify}]
           ' .nemar/validation.json > "$ANNEX_DIR/errors-classified.json"
