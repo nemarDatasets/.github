@@ -171,7 +171,7 @@ jobs:
           sort -u /tmp/annex-files.txt -o /tmp/annex-files.txt
           ANNEX_COUNT=$(wc -l < /tmp/annex-files.txt | tr -d ' ')
           if [ "$ANNEX_COUNT" -gt 0 ]; then
-            echo "Found $ANNEX_COUNT git-annex pointer file(s) (errors from these will be filtered)"
+            echo "Found $ANNEX_COUNT git-annex pointer file(s) (content-read errors located on these will be filtered)"
           fi
 
       - name: Check validation result
@@ -197,29 +197,61 @@ jobs:
             echo '[]' > /tmp/annex-files.json
           fi
 
-          REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json \
-            '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | not)] | length' \
+          # ANNEX_CONTENT_READ_CODES: validator issue codes that exist only
+          # because the checkout has no annexed content, so they are noise when
+          # located on an annex pointer. Rule: a code is listed ONLY if
+          # bids-validator raises it from reading a file's bytes or header
+          # (jsr:@bids/validator@3.0.2, src/):
+          #   NIFTI_HEADER_UNREADABLE   files/nifti.ts loadHeader (readBytes 1024)
+          #   AMBIGUOUS_AFFINE          schema/context.ts loadNiftiHeader (parsed header)
+          #   FILE_READ                 files/access.ts IOErrorToIssue (open/read failure)
+          #   INVALID_GZIP              files/tsv.ts loadHeaderlessTSV (gunzip of .tsv.gz)
+          #   INVALID_FILE_ENCODING     files/streams.ts (UTF-8 decode of content)
+          #   INVALID_JSON_ENCODING     files/json.ts loadJSON (UTF-8 decode)
+          #   JSON_INVALID              files/json.ts loadJSON (JSON.parse of content)
+          #   JSON_NOT_AN_OBJECT        files/json.ts loadJSON (parsed content)
+          #   TSV_EMPTY_LINE            files/tsv.ts loadColumns (row scan of content)
+          #   TSV_EQUAL_ROWS            files/tsv.ts loadColumns (row scan of content)
+          #   TSV_COLUMN_HEADER_DUPLICATE  files/tsv.ts (header row of content)
+          # Everything else is a real error even when it is merely REPORTED at an
+          # annexed data file (e.g. SIDECAR_KEY_REQUIRED, IEEG_ELECTRODES_REQUIRED,
+          # schema rules, filename rules, TSV table rules, SYMLINK_*, and
+          # EMPTY_FILE, which uses the size from the annex key, not file bytes).
+          # Do not add a code here unless it needs the file's content.
+          ANNEX_CONTENT_READ_CODES='["NIFTI_HEADER_UNREADABLE","AMBIGUOUS_AFFINE","FILE_READ","INVALID_GZIP","INVALID_FILE_ENCODING","INVALID_JSON_ENCODING","JSON_INVALID","JSON_NOT_AN_OBJECT","TSV_EMPTY_LINE","TSV_EQUAL_ROWS","TSV_COLUMN_HEADER_DUPLICATE"]'
+          # jq prelude: on_annex = located on a pointer; skipped = on_annex AND content-read code.
+          # shellcheck disable=SC2016
+          JQ_DEFS='def on_annex: (.location as $loc | ($annexed[0] | index($loc)) != null); def skipped: on_annex and (.code as $c | ($codes | index($c)) != null);'
+
+          REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped | not)] | length' \
             .nemar/validation.json)
-          ANNEX_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json \
-            '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | . != null)] | length' \
+          ANNEX_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped)] | length' \
+            .nemar/validation.json)
+          # Real errors (kept in REAL_ERRORS) that are located on an annexed file.
+          ANNEX_REAL_ERRORS=$(jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+            "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(on_annex and (skipped | not))] | length' \
             .nemar/validation.json)
           WARNINGS=$(jq '[.issues.issues[] | select(.severity == "warning")] | length' .nemar/validation.json)
 
           echo "real_errors=$REAL_ERRORS" >> "$GITHUB_OUTPUT"
           echo "annex_errors=$ANNEX_ERRORS" >> "$GITHUB_OUTPUT"
+          echo "annex_real_errors=$ANNEX_REAL_ERRORS" >> "$GITHUB_OUTPUT"
           echo "warnings=$WARNINGS" >> "$GITHUB_OUTPUT"
 
           if [ "$REAL_ERRORS" -gt 0 ]; then
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
-            echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) (skipped $ANNEX_ERRORS annex-pointer error(s))." >> "$GITHUB_OUTPUT"
+            echo "summary=BIDS validation found $REAL_ERRORS error(s), $WARNINGS warning(s) (skipped $ANNEX_ERRORS annex-pointer error(s); $ANNEX_REAL_ERRORS real error(s) located on annex files)." >> "$GITHUB_OUTPUT"
             echo "::error::BIDS validation found $REAL_ERRORS error(s)"
             # Build the human-readable error detail (grouped-by-code summary +
             # capped detail table) for the check-run output[text]. Capped to
             # stay well under GitHub's 64KB output limit; never fails the step.
-            jq -r --slurpfile annexed /tmp/annex-files.json '
+            jq -r --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+              "$JQ_DEFS"'
               [.issues.issues[]
                | select(.severity == "error")
-               | select(.location as $loc | ($annexed[0] | index($loc)) | not)] as $errs
+               | select(skipped | not)] as $errs
               | ($errs | length) as $n
               | ([$errs[].code] | group_by(.) | map({code: .[0], count: length}) | sort_by(-.count)) as $bycode
               | "### BIDS validation errors\n\n"
@@ -235,13 +267,13 @@ jobs:
                 + (if $n > 50 then "\n\n_...and \($n - 50) more error(s) not shown; full report in the linked central run._" else "" end)
             ' .nemar/validation.json > /tmp/error-details.md || true
             # Also echo the raw error objects to the central run log (unchanged).
-            jq --slurpfile annexed /tmp/annex-files.json \
-              '[.issues.issues[] | select(.severity == "error") | select(.location as $loc | ($annexed[0] | index($loc)) | not)][]' \
+            jq --slurpfile annexed /tmp/annex-files.json --argjson codes "$ANNEX_CONTENT_READ_CODES" \
+              "$JQ_DEFS"' [.issues.issues[] | select(.severity == "error") | select(skipped | not)][]' \
               .nemar/validation.json
             exit 0
           fi
           echo "outcome=success" >> "$GITHUB_OUTPUT"
-          echo "summary=BIDS validation passed: $WARNINGS warning(s), $ANNEX_ERRORS annex-pointer error(s) intentionally skipped." >> "$GITHUB_OUTPUT"
+          echo "summary=BIDS validation passed: $WARNINGS warning(s), $ANNEX_ERRORS annex-pointer content-read error(s) intentionally skipped." >> "$GITHUB_OUTPUT"
           echo "BIDS validation passed ($WARNINGS warning(s), $ANNEX_ERRORS annex pointer error(s) skipped)"
 
       - name: Finalize check-run on the dataset repo
