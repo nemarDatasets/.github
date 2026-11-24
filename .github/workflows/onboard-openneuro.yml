@@ -170,18 +170,28 @@ jobs:
         # test/import-openneuro-tag-option.unit.test.ts pins in the CLI.
         run: |
           set -o pipefail
+          # nemar-cli moved `admin import-openneuro` to `admin import openneuro` (its ADR 0135); the old
+          # path on a CLI that has the new one is a stub that exits 1 without importing. The CLI is
+          # installed unpinned, so ask it which path it has: the new path's own help names it on
+          # its usage line, while an older CLI answers `import openneuro --help` with the `import`
+          # group's help (exit 0), so the exit code cannot tell. Color codes are stripped first.
+          import_cmd=(admin import openneuro)
+          cli_help="$(nemar admin import openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          if [[ "$cli_help" != *"Usage: nemar admin import openneuro "* ]]; then
+            import_cmd=(admin import-openneuro)
+            cli_help="$(nemar admin import-openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          fi
           tag_args=()
           if [ -n "$OPENNEURO_TAG" ]; then
-            # Captured, then matched in bash: `--help | grep -q` under pipefail can fail on the
-            # SIGPIPE grep's early exit sends the CLI, and read as "no --tag".
-            cli_help="$(nemar admin import-openneuro --help 2>/dev/null || true)"
+            # Matched in bash on the help captured above: `--help | grep -q` under pipefail can
+            # fail on the SIGPIPE grep's early exit sends the CLI, and read as "no --tag".
             if [[ "$cli_help" == *"--tag <tag>"* ]]; then
               tag_args=(--tag "$OPENNEURO_TAG")
             else
               echo "::warning::The installed nemar CLI has no --tag; importing $DATASET_ID without the requested upstream tag $OPENNEURO_TAG"
             fi
           fi
-          nemar admin import-openneuro "$DATASET_ID" --phase prepare --trust-upstream "${tag_args[@]}" 2>&1 \
+          nemar "${import_cmd[@]}" "$DATASET_ID" --phase prepare --trust-upstream "${tag_args[@]}" 2>&1 \
             | tee "/tmp/prepare-${DATASET_ID}.log"
       # Report the REAL reason prepare failed (nemarOrg/nemar-cli#1309, ADR 0051).
       #
@@ -327,7 +337,18 @@ jobs:
         # different filesystem.
         run: |
           set -o pipefail
-          nemar admin import-openneuro "$DATASET_ID" --phase copy --shard "${{ matrix.shard }}/${{ env.SHARDS }}" --trust-upstream 2>&1 \
+          # nemar-cli moved `admin import-openneuro` to `admin import openneuro` (its ADR 0135); the old
+          # path on a CLI that has the new one is a stub that exits 1 without importing. The CLI is
+          # installed unpinned, so ask it which path it has: the new path's own help names it on
+          # its usage line, while an older CLI answers `import openneuro --help` with the `import`
+          # group's help (exit 0), so the exit code cannot tell. Color codes are stripped first.
+          import_cmd=(admin import openneuro)
+          cli_help="$(nemar admin import openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          if [[ "$cli_help" != *"Usage: nemar admin import openneuro "* ]]; then
+            import_cmd=(admin import-openneuro)
+            cli_help="$(nemar admin import-openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          fi
+          nemar "${import_cmd[@]}" "$DATASET_ID" --phase copy --shard "${{ matrix.shard }}/${{ env.SHARDS }}" --trust-upstream 2>&1 \
             | tee "/tmp/copy-${DATASET_ID}-${{ matrix.shard }}.log"
       # Same shape as prepare's reporter above, and deliberately repeated rather
       # than factored out: this file is deployed by copying it whole into
@@ -421,7 +442,18 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set -o pipefail
-          nemar admin import-openneuro "$DATASET_ID" --phase finalize --trust-upstream 2>&1 \
+          # nemar-cli moved `admin import-openneuro` to `admin import openneuro` (its ADR 0135); the old
+          # path on a CLI that has the new one is a stub that exits 1 without importing. The CLI is
+          # installed unpinned, so ask it which path it has: the new path's own help names it on
+          # its usage line, while an older CLI answers `import openneuro --help` with the `import`
+          # group's help (exit 0), so the exit code cannot tell. Color codes are stripped first.
+          import_cmd=(admin import openneuro)
+          cli_help="$(nemar admin import openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          if [[ "$cli_help" != *"Usage: nemar admin import openneuro "* ]]; then
+            import_cmd=(admin import-openneuro)
+            cli_help="$(nemar admin import-openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
+          fi
+          nemar "${import_cmd[@]}" "$DATASET_ID" --phase finalize --trust-upstream 2>&1 \
             | tee "/tmp/finalize-${DATASET_ID}.log"
       # Same shape as prepare's reporter above, and deliberately repeated rather
       # than factored out: this file is deployed by copying it whole into
