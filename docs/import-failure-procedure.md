@@ -28,9 +28,9 @@ The `report` job records the terminal state two ways:
 | Class | Signal | Action |
 |---|---|---|
 | `git-divergence` | `prepare` fails with `git push` "origin/main has diverging commits / auto-rebase failed" on a re-import onto an already-published repo | Fix the re-import divergence (code), then re-run. Do not force-push over a published repo by hand. |
-| `upstream-403` | `copy` shard logs show specific `.nii.gz` objects return `403 Forbidden` from OpenNeuro S3 (HeadObject), curl fallback also blocked | **Unrecoverable** via copy. Leave `data_complete=0` (honest) if a few files, or withdraw (`nemar admin withdraw`) if badly blocked. |
-| `shard-gap` | `finalize` reports "N of M objects missing... a shard likely failed or was cancelled", but the objects ARE available upstream | Transient. Re-run `nemar admin recover <id>` (copy resumes, skipping already-present keys). |
-| `no-import-row` | `nemar admin import status <id>` returns "No import jobs match" | Imported before the `import_jobs` table (or the row was pruned). Dispatch `nemar admin import-openneuro ds######` (by-number source) to seed a row. May then hit `git-divergence`. |
+| `upstream-403` | `copy` shard logs show specific `.nii.gz` objects return `403 Forbidden` from OpenNeuro S3 (HeadObject), curl fallback also blocked | **Unrecoverable** via copy. Leave `data_complete=0` (honest) if a few files, or withdraw (`nemar admin dataset withdraw <id> --apply`) if badly blocked. |
+| `shard-gap` | `finalize` reports "N of M objects missing... a shard likely failed or was cancelled", but the objects ARE available upstream | Transient. Re-run `nemar admin rework recover <id> --apply` (copy resumes, skipping already-present keys; add `--force` for an id that is not on nemar-cli's checked-in recover list). |
+| `no-import-row` | `nemar admin import status <id>` returns "No import jobs match" | Imported before the `import_jobs` table (or the row was pruned). Dispatch `nemar admin import openneuro ds######` (by-number source) to seed a row. May then hit `git-divergence`. |
 | `matrix-cap` | A whole batch fails with 0 `copy` jobs instantiated | The `copy` matrix is `datasets x 8 shards`; GitHub caps a matrix at 256 jobs. Keep batches **<= 30 datasets** (240 jobs). Re-dispatch smaller. |
 
 ## Triage steps
