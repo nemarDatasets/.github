@@ -87,12 +87,13 @@
 # is called, and the report echoes the commit and the release kind so the Worker can refuse one
 # that is about anything else.
 #
-# ORG VARIABLES (nemarDatasets, visible to this repository). The publication review has a
-# federation rule and a service account of its own, named by its own variables; the organization
-# and workspace identifiers are shared with the other reviews:
+# ORG VARIABLES (nemarDatasets, visible to this repository). The publication review signs in to an
+# Anthropic organization of its own, apart from the pull-request review's, with a federation rule, a
+# service account, an organization and a workspace named by its own variables:
 #   ANTHROPIC_PUBLICATION_REVIEW_FEDERATION_RULE_ID
 #   ANTHROPIC_PUBLICATION_REVIEW_SERVICE_ACCOUNT_ID
-#   ANTHROPIC_ORGANIZATION_ID  ANTHROPIC_WORKSPACE_ID
+#   ANTHROPIC_PUBLICATION_REVIEW_ORGANIZATION_ID
+#   ANTHROPIC_PUBLICATION_REVIEW_WORKSPACE_ID
 # The rule should accept only this repository's default branch and this workflow file
 # (subject repo:nemarDatasets/.github:ref:refs/heads/main, job_workflow_ref
 # nemarDatasets/.github/.github/workflows/run-publication-review.yml@refs/heads/main).
@@ -237,9 +238,9 @@ jobs:
         env:
           PUBLICATION_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
           RULE: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_FEDERATION_RULE_ID }}
-          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ORG: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_ORGANIZATION_ID }}
           ACCOUNT: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_SERVICE_ACCOUNT_ID }}
-          WORKSPACE: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          WORKSPACE: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_WORKSPACE_ID }}
           # The pull-request review's identity, read only to refuse it: each review signs in with a rule and a
           # service account of its own (ADR 0102), so a copied value is a configuration error.
           OTHER_RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
@@ -415,9 +416,9 @@ jobs:
           PUBLICATION_REVIEW_CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
           FETCHED_SHA: ${{ steps.fetch.outputs.fetched }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_FEDERATION_RULE_ID }}
-          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_ORGANIZATION_ID }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_SERVICE_ACCOUNT_ID }}
-          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_WORKSPACE_ID }}
           ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/anthropic-oidc.jwt
         run: |
           bun run scripts/ci/publication-review.ts review \
