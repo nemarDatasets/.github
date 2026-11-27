@@ -64,6 +64,9 @@
 # The rule should accept only this repository's default branch and this workflow file
 # (subject repo:nemarDatasets/.github:ref:refs/heads/main, job_workflow_ref
 # nemarDatasets/.github/.github/workflows/run-pr-review.yml@refs/heads/main).
+# The federation check also reads the publication review's two variables
+# (ANTHROPIC_PUBLICATION_REVIEW_FEDERATION_RULE_ID, ANTHROPIC_PUBLICATION_REVIEW_SERVICE_ACCOUNT_ID),
+# only to refuse a rule or an account that is the same as this review's; no step signs in with them.
 #
 # THIS LOG IS PUBLIC. Nothing here prints a dataset's content, a pull request's text, or the
 # model's output; the script prints a review id, fixed words, class names and HTTP statuses.
