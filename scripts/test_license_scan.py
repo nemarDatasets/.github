@@ -193,6 +193,10 @@ def main() -> int:
         status = (SCAN / "status").read_text().strip() if (SCAN / "status").exists() else None
         if status != "ok":
             report(False, f"{case.name}: scan", f"status={status} {proc.stdout}")
+            # The fixtures are public texts, so the scan's own messages may be shown here.
+            script = STEPS["Scan LICENSE in a sandbox"]["run"].replace("> /dev/null 2>&1; then", "; then")
+            proc, _, _ = run_step("Scan LICENSE in a sandbox", {}, script=script, timeout=200)
+            print(proc.stdout[-3000:], proc.stderr[-3000:], flush=True)
             continue
         dest = results / case.name
         dest.mkdir(exist_ok=True)
