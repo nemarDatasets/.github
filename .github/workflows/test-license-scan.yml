@@ -34,9 +34,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The nemar-cli ref a pull_request run tests: the epic branch that carries
-  # scripts/ci/license-file-fact.ts until it ships; main at deploy 3.
-  DEFAULT_NEMAR_CLI_REF: feature/issue-2449-epic-decision-card
+  # The nemar-cli ref a pull_request run tests: main, which carries
+  # scripts/ci/license-file-fact.ts and the hashed requirements file since 0.10.53.
+  DEFAULT_NEMAR_CLI_REF: main
 
 jobs:
   license-scan:
