@@ -50,6 +50,7 @@ MATCHER_ROOT = Path("/opt/license-scan")
 MATCHER_VERSION = "scancode-32.5.0+spdx-3.27"
 SCANCODE_CALL = '"$venv/bin/scancode"'
 REQUIREMENTS = "-r scripts/ci/scancode-requirements.txt"
+SCAN_TIMEOUT = "--timeout 120 --json"
 RUNNER_TEMP = Path(os.environ["RUNNER_TEMP"])
 REPO = RUNNER_TEMP / "repo"
 
@@ -194,7 +195,7 @@ def main() -> int:
         if status != "ok":
             report(False, f"{case.name}: scan", f"status={status} {proc.stdout}")
             # The fixtures are public texts, so the scan's own messages may be shown here.
-            script = STEPS["Scan LICENSE in a sandbox"]["run"].replace("> /dev/null 2>&1; then", "; then")
+            script = STEPS["Scan LICENSE in a sandbox"]["run"].replace("> /dev/null 2>&1 || true", "|| true")
             proc, _, _ = run_step("Scan LICENSE in a sandbox", {}, script=script, timeout=200)
             print(proc.stdout[-3000:], proc.stderr[-3000:], flush=True)
             continue
@@ -205,6 +206,36 @@ def main() -> int:
         ok = got == {"license_file": cfg["expected"], "matcher": MATCHER_VERSION}
         report(ok, case.name, json.dumps(got) + f" {elapsed:.1f}s")
     timings["scan_seconds"] = scan_times
+
+    # 2b. A scan that ScanCode reports as failed (here its own per-file timeout, made tiny) still
+    # writes result.json: the status is ok, and the fact is `unreadable` with the matcher's
+    # version, never the matcher `unavailable`.
+    make_repo((FIXTURES / "cc-by-4.0/LICENSE").read_bytes())
+    run_step("Prepare the license scan", {"MATCHER_STATUS": "ok"})
+    script = STEPS["Scan LICENSE in a sandbox"]["run"]
+    assert SCAN_TIMEOUT in script, "the scan's timeout option moved; update the scan-error check"
+    proc, _, _ = run_step("Scan LICENSE in a sandbox", {},
+                          script=script.replace(SCAN_TIMEOUT, "--timeout 0.000001"), timeout=200)
+    status = (SCAN / "status").read_text().strip() if (SCAN / "status").exists() else None
+    errors = None
+    if (SCAN / "out/result.json").exists():
+        files = json.loads((SCAN / "out/result.json").read_text())["files"]
+        errors = sum(len(f.get("scan_errors", [])) for f in files)
+    got = fact_of("CC-BY-4.0") if status == "ok" else None
+    report(status == "ok" and bool(errors) and got == {
+        "license_file": {"state": "unreadable", "spdx": None, "additions": False, "expression": None},
+        "matcher": MATCHER_VERSION,
+    }, "scan error: status ok, scan_errors reported, fact unreadable with the matcher's version",
+        f"status={status} errors={errors} {json.dumps(got)}")
+    # And a scan that wrote nothing is `failed`, which the review reads as the matcher unavailable.
+    run_step("Prepare the license scan", {"MATCHER_STATUS": "ok"})
+    run_step("Scan LICENSE in a sandbox", {},
+             script=script.replace(SCANCODE_CALL, "/usr/bin/false"), timeout=200)
+    status = (SCAN / "status").read_text().strip() if (SCAN / "status").exists() else None
+    got = fact_of("CC-BY-4.0")
+    report(status == "failed" and got["matcher"] == "unavailable"
+           and got["license_file"]["state"] == "unreadable",
+           "no result: status failed, matcher unavailable", f"status={status} {json.dumps(got)}")
 
     # 3. A symlink (an annexed link) and a missing LICENSE are never extracted.
     for label, kwargs in (("symlinked LICENSE", {"license_bytes": None, "symlink": True}),
