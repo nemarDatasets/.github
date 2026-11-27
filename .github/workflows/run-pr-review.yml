@@ -207,9 +207,18 @@ jobs:
           ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
           ACCOUNT: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           WORKSPACE: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          # The publication review's identity, read only to refuse it: each review signs in with a rule and a
+          # service account of its own (ADR 0102), so a copied value is a configuration error.
+          OTHER_RULE: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_FEDERATION_RULE_ID }}
+          OTHER_ACCOUNT: ${{ vars.ANTHROPIC_PUBLICATION_REVIEW_SERVICE_ACCOUNT_ID }}
         run: |
           if [[ -z "$RULE" || -z "$ORG" || -z "$ACCOUNT" || -z "$WORKSPACE" ]]; then
             echo "::error::the ANTHROPIC_* organization variables are not all set"
+            "$RUNNER_TEMP/report-error.sh" auth_failed
+            exit 1
+          fi
+          if [[ "$RULE" == "$OTHER_RULE" || "$ACCOUNT" == "$OTHER_ACCOUNT" ]]; then
+            echo "::error::this review's federation rule or service account is also the publication review's; each review has its own"
             "$RUNNER_TEMP/report-error.sh" auth_failed
             exit 1
           fi
