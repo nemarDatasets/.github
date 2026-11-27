@@ -34,9 +34,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The nemar-cli ref a pull_request run tests. It names the phase branch that adds the module
-  # until that ships; set it to main when nemar-cli main carries scripts/ci/license-file-fact.ts.
-  DEFAULT_NEMAR_CLI_REF: feature/issue-2451-phase1-scancode
+  # The nemar-cli ref a pull_request run tests: the epic branch that carries
+  # scripts/ci/license-file-fact.ts until it ships; main at deploy 3.
+  DEFAULT_NEMAR_CLI_REF: feature/issue-2449-epic-decision-card
 
 jobs:
   license-scan:
