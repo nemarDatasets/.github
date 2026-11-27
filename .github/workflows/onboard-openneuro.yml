@@ -167,7 +167,9 @@ jobs:
         # is installed unpinned (npm latest) at run time, so this file can meet one older
         # than the flag, and an unknown option would fail the import outright. Such a CLI
         # imports as it always did, without a tag. The help text grepped is the one
-        # test/import-openneuro-tag-option.unit.test.ts pins in the CLI.
+        # test/import-openneuro-tag-option.unit.test.ts pins in the CLI. A help capture
+        # that came back EMPTY says nothing about --tag (the CLI failed to run), so with a
+        # tag requested the step fails instead of importing at a tag nobody asked for.
         run: |
           set -o pipefail
           # The import lives at `admin import openneuro` (nemar-cli ADR 0135); the old
@@ -176,6 +178,13 @@ jobs:
           cli_help="$(nemar admin import openneuro --help 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)"
           tag_args=()
           if [ -n "$OPENNEURO_TAG" ]; then
+            if [ -z "$cli_help" ]; then
+              # Into the log too, as a CLI failure line, so the reporter below posts this reason.
+              echo "✖ nemar admin import openneuro --help printed nothing, so whether the installed CLI takes --tag is unknown; not importing $DATASET_ID without the requested upstream tag $OPENNEURO_TAG" \
+                | tee "/tmp/prepare-${DATASET_ID}.log"
+              echo "::error::The installed nemar CLI printed no help; refusing to import $DATASET_ID without the requested upstream tag $OPENNEURO_TAG"
+              exit 1
+            fi
             # Matched in bash on the help captured above: `--help | grep -q` under pipefail can
             # fail on the SIGPIPE grep's early exit sends the CLI, and read as "no --tag".
             if [[ "$cli_help" == *"--tag <tag>"* ]]; then
