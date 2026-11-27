@@ -94,8 +94,16 @@
 #     release, and parses it as data (scripts/ci/license-file-fact.ts). Nothing ScanCode wrote runs.
 #   - The steps that install, prepare and scan unset the OIDC request variables first, so neither
 #     uv nor the warm-up holds them either.
-#   - Not closed: a kernel escape from the sandbox, and the callback token in the event file
-#     (item (b) above), which the sandbox has no network to send.
+#   - Not closed: a kernel escape from the sandbox; the callback token in the event file
+#     (item (b) above), which the sandbox has no network to send; and the install and the warm-up
+#     themselves: uv and the pinned, hashed ScanCode code run as the runner user, with its
+#     passwordless sudo and the network, before the sandbox exists (the warm-up's scan of a fixed
+#     text runs ScanCode's code under env -i, but not sandboxed). They hold no token and no OIDC
+#     request variable, and they run after the mint and before the Review step, so they reach
+#     what item (c) says the Review step's dependency tree reaches; the hashes are what bind them.
+#   - The time budget: the job's 28 minutes are the 20 it had before plus the matcher steps' own
+#     limits (install 4, prepare 1, scan 3), and stay under the Worker's 30-minute watchdog; the
+#     review script's model call keeps its own 12-minute deadline inside them.
 #   test-license-scan.yml runs these very steps on a runner over public license texts, and proves
 #   the sandbox has no socket, cannot write _actions, _temp or /opt/license-scan, holds no OIDC
 #   request variable, and does not rebuild the index.
@@ -158,7 +166,7 @@ jobs:
   review:
     name: Review
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 28
     permissions:
       contents: read
       id-token: write
@@ -334,7 +342,7 @@ jobs:
       #
       # Accepted: the batch downloads every selected blob whole, whatever its size, because a blob
       # that is not in the clone cannot be sized before it is fetched. The reader's ceilings (4 MiB
-      # for a document, 1 MiB for a sidecar) apply after the download, and the job's 20-minute
+      # for a document, 1 MiB for a sidecar) apply after the download, and the job's 28-minute
       # timeout is the only bound on the download itself.
       - name: Fetch the dataset as git data
         if: steps.claim.outputs.claimed == 'true'
@@ -525,7 +533,9 @@ jobs:
 
       # ScanCode as uid 65534, with no network, no environment beyond its paths, and a PID
       # namespace that dies with it (see the header). Its output is discarded: this log is public.
-      # `status` is written only when the scan finished; a timeout leaves none.
+      # `status` is `ok` whenever ScanCode wrote result.json, whatever its exit code, so a scan error
+      # it reports there is read as LICENSE `unreadable` rather than the matcher `unavailable`; it
+      # is `failed` when there is no result, and a step that timed out writes none.
       - name: Scan LICENSE in a sandbox
         if: steps.claim.outputs.claimed == 'true' && steps.license-install.outputs.status == 'ok' && steps.license-prepare.outputs.scan == 'true'
         continue-on-error: true
@@ -539,18 +549,20 @@ jobs:
           # loads a library, and the workspace is not the scan user's to enter.
           cd "$scan"
           # The options are SCANCODE_ARGS in nemar-cli's shared/license-file.ts.
-          if sudo /usr/bin/unshare --net --pid --fork --kill-child -- \
+          # Its exit code is not the verdict: see `status` below.
+          sudo /usr/bin/unshare --net --pid --fork --kill-child -- \
             /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups -- \
             /usr/bin/env -i PATH="$venv/bin:/usr/bin:/bin" HOME="$scan/home" TMPDIR="$scan/tmp" \
             SCANCODE_CACHE="$scan/home" SCANCODE_TEMP="$scan/tmp" \
             "$venv/bin/scancode" --license --license-text --license-text-diagnostics --copyright \
             --processes 1 --timeout 120 --json "$scan/out/result.json" "$scan/in/LICENSE" \
-            > /dev/null 2>&1; then
+            > /dev/null 2>&1 || true
+          sudo chmod 0755 "$scan/out"
+          if [ -f "$scan/out/result.json" ] && [ ! -L "$scan/out/result.json" ]; then
             status=ok
           else
             status=failed
           fi
-          sudo chmod 0755 "$scan/out"
           echo "$status" > "$scan/status"
           echo "license scan: $status"
 
