@@ -75,7 +75,7 @@
 #     environment there, with --no-config --require-hashes --no-build: wheels only, so no package's
 #     build code runs, and unpacking a wheel runs none either. No Actions cache, because a cache is
 #     writable from other workflows of this repository. It refuses another interpreter, toolkit or
-#     SPDX list version, warms ScanCode's license index once under env -i, and then makes the whole
+#     SPDX list version, warms ScanCode's license index once under env -i with a scan of a fixed text, and then makes the whole
 #     tree root's and read-only to everyone else. A failed install never fails the job: the
 #     review records LICENSE as `unreadable` with the matcher `unavailable` and handles it as before.
 #   - The prepare step extracts LICENSE with git cat-file from the fetched data (a symlink, which is
@@ -468,8 +468,12 @@ jobs:
             version="$(run "$root/venv/bin/scancode" --version 2> /dev/null)"
             grep -qxF "ScanCode version: $SCANCODE_VERSION" <<< "$version"
             grep -qxF "SPDX License list version: $SCANCODE_SPDX" <<< "$version"
-            # Build the license index now, as this user, so the sandboxed scan only reads it.
-            run "$root/venv/bin/scancode" --reindex-licenses > /dev/null
+            # Build the license index now, as this user, with the first scan of a fixed text (which
+            # also checks that a scan works), so the sandboxed scan only reads it.
+            printf 'SPDX-License-Identifier: CC-BY-4.0\n' > "$work/warm-up.txt"
+            run "$root/venv/bin/scancode" --license --license-text --license-text-diagnostics \
+              --copyright --processes 1 --timeout 120 --json "$work/warm-up.json" "$work/warm-up.txt" > /dev/null
+            grep -qF '"license_expression_spdx": "CC-BY-4.0"' "$work/warm-up.json"
             sudo chown -R root:root "$root"
             sudo chmod -R go-w "$root"
             rm -rf "$work"
