@@ -375,7 +375,8 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: nemarOrg/nemar-cli
-          ref: main
+          # TEMPORARY (owner's model comparison, 2026-11-27): Haiku 5.5 at max effort. Revert to main.
+          ref: test/review-haiku-max
           path: tool
           persist-credentials: false
 
