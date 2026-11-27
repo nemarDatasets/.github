@@ -5,7 +5,7 @@
 # The NEMAR Worker starts a review when a publication request's identifier screen has reported
 # for a commit of `main` (never before, never in parallel with the screen), and dispatches this
 # workflow with the review's coordinates. This job CLAIMS the review, reads the dataset's root
-# documents and structure as git data, shows Claude Haiku 5.5 (high effort, no tools) only text the
+# documents and structure as git data, shows Claude Haiku 5.5 (max effort, no tools) only text the
 # shared mechanical rules examined immediately before it was sent, asks four questions about it, and
 # posts a closed-vocabulary report back to the Worker, which derives the verdict. Nothing is written
 # to GitHub: there is no check-run, comment, label or tag.
