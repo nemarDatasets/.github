@@ -474,8 +474,10 @@ jobs:
             run "$root/venv/bin/scancode" --license --license-text --license-text-diagnostics \
               --copyright --processes 1 --timeout 120 --json "$work/warm-up.json" "$work/warm-up.txt" > /dev/null
             grep -qF '"license_expression_spdx": "CC-BY-4.0"' "$work/warm-up.json"
+            # Root's, readable by all and writable by none else: some wheels ship a library only
+            # their owner may read (extractcode-libarchive's), which the scan user must load.
             sudo chown -R root:root "$root"
-            sudo chmod -R go-w "$root"
+            sudo chmod -R a+rX,go-w "$root"
             rm -rf "$work"
           )
           install_matcher
