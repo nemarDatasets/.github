@@ -535,6 +535,9 @@ jobs:
           unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
           scan=/tmp/license-scan
           venv=/opt/license-scan/venv
+          # From a directory the scan user can enter: ScanCode changes directory and back when it
+          # loads a library, and the workspace is not the scan user's to enter.
+          cd "$scan"
           # The options are SCANCODE_ARGS in nemar-cli's shared/license-file.ts.
           if sudo /usr/bin/unshare --net --pid --fork --kill-child -- \
             /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups -- \
