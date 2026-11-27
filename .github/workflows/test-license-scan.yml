@@ -1,0 +1,87 @@
+name: Test license scan
+
+# Runs scripts/test_license_scan.py: the real "Install the license matcher", "Prepare the license
+# scan" and "Scan LICENSE in a sandbox" steps of run-publication-review.yml on a GitHub-hosted
+# runner (nemar-cli ADR 0142), over public license texts, with nemar-cli's
+# scripts/ci/license-file-fact.ts at NEMAR_CLI_REF judging each real result. It proves the sandbox
+# (no socket, no write to _actions, _temp or /opt/license-scan, no OIDC request variable, no index
+# rebuild) and uploads the result.json files, which are nemar-cli's test fixtures, and the install
+# time. Nothing here reads a dataset or holds a secret.
+#
+# id-token: write is here only so the OIDC request variables are in the job's environment, which
+# the test needs in order to prove the sandbox does not receive them; no step requests a token.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/run-publication-review.yml"
+      - ".github/workflows/test-license-scan.yml"
+      - "scripts/test_license_scan.py"
+      - "scripts/fixtures/license-scan/**"
+  workflow_dispatch:
+    inputs:
+      nemar_cli_ref:
+        description: "nemar-cli ref whose scripts/ci/license-file-fact.ts and requirements file to test"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: test-license-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The nemar-cli ref a pull_request run tests: main, which carries
+  # scripts/ci/license-file-fact.ts and the hashed requirements file since 0.10.53.
+  DEFAULT_NEMAR_CLI_REF: main
+
+jobs:
+  license-scan:
+    name: License scan on a runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check out nemar-cli
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: nemarOrg/nemar-cli
+          ref: ${{ inputs.nemar_cli_ref || env.DEFAULT_NEMAR_CLI_REF }}
+          path: tool
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+
+      # The same pin as run-publication-review.yml's "Set up uv".
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
+          enable-cache: false
+          github-token: ""
+
+      - name: Run the runner proof
+        run: uv run --no-config --with pyyaml python scripts/test_license_scan.py "$RUNNER_TEMP/license-scan-results"
+
+      - name: Upload the scan results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: license-scan-results
+          path: ${{ runner.temp }}/license-scan-results
+          if-no-files-found: warn
+
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint .github/workflows/run-publication-review.yml .github/workflows/test-license-scan.yml

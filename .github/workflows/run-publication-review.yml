@@ -50,13 +50,13 @@
 # action to load, and code that runs between the mint and the end of the job could try to tamper
 # with the post step. Closed: (1) hooks planted before the mint, because nothing the repository's
 # dependency tree or a setup action brought runs before it (the claim, the mint and the dataset
-# fetch come first; the checkout, Bun and the install after them); (2) install-time code, because
+# fetch come first; the checkout, uv, the license matcher, Bun and the install after them); (2) install-time code, because
 # `bun install --frozen-lockfile --ignore-scripts` runs no lifecycle scripts at all, neither the
 # repository's own (`prepare`, `postinstall`) nor any dependency's, trusted by default or not
 # (`--production` is not used: the review script imports the Anthropic SDK, which this repository
 # lists as a development dependency); (3) the dataset token in a configuration file, because it is
-# in none. Not closed: (a) the pinned third-party actions' own code (the masking, checkout, Bun and
-# OIDC steps and the mint action itself) runs on the runner, which is why every action is pinned to
+# in none. Not closed: (a) the pinned third-party actions' own code (the masking, checkout, uv, Bun
+# and OIDC steps and the mint action itself) runs on the runner, setup-uv's post step included, which is why every action is pinned to
 # a full commit with its version in a trailing comment, and moving a pin is a reviewed change to
 # this file; (b) the callback token travels in the repository_dispatch payload, which is in the
 # event file that every step can read, exactly as in the pull-request review's workflow, and the
@@ -66,9 +66,51 @@
 # the clone over as an artifact was considered and rejected: this repository's logs and artifacts
 # are public, and the clone is private dataset text.
 #
+# THE LICENSE MATCHER RUNS IN A SANDBOX (ADR 0142). ScanCode toolkit identifies the root LICENSE.
+# It brings 80 packages of third-party code, so it does not run the way the review script does:
+#   - uv comes from setup-uv, pinned to a full commit, at an exact uv version with its archive's
+#     SHA-256, and no cache. The install step installs a uv-managed CPython at the exact patch the
+#     requirements file was compiled for (uv checks the interpreter archive's SHA-256) under
+#     /opt/license-scan, and ScanCode from nemar-cli's hashed requirements file into a fresh
+#     environment there, with --no-config --require-hashes --no-build: wheels only, so no package's
+#     build code runs, and unpacking a wheel runs none either. No Actions cache, because a cache is
+#     writable from other workflows of this repository. It refuses another interpreter, toolkit or
+#     SPDX list version, warms ScanCode's license index once under env -i with a scan of a fixed
+#     text, and then makes the whole tree root's and read-only to everyone else. A failed install never fails the job: the
+#     review records LICENSE as `unreadable` with the matcher `unavailable` and handles it as before.
+#   - The prepare step extracts LICENSE with git cat-file from the fetched data (a symlink, which is
+#     an annexed link, is never extracted, and nothing over 4 MiB is) into /tmp/license-scan/in, and
+#     makes out/, home/ and tmp/ there owned by uid 65534, mode 0700.
+#   - The scan runs as uid 65534 in a new network and PID namespace
+#     (sudo unshare --net --pid --fork --kill-child, then setpriv), with env -i and only its paths:
+#     it has no network, so it can send nothing anywhere; neither the OIDC request variables that
+#     `id-token: write` puts in every step nor any token reach it; and as another user it cannot
+#     write the runner user's files, so it cannot plant a hook for the mint action's post step, for
+#     a setup action's post step or for the Review step. It needs the runner's passwordless sudo
+#     (Ubuntu blocks an unprivileged `unshare --net` through AppArmor); without it the scan fails
+#     and the review records the matcher `unavailable`.
+#   - The Review step reads result.json only if it is a regular file owned by uid 65534, mode no
+#     wider than 0644, at most 4 MiB, for the LICENSE blob this commit holds, from the pinned
+#     release, and parses it as data (scripts/ci/license-file-fact.ts). Nothing ScanCode wrote runs.
+#   - The steps that install, prepare and scan unset the OIDC request variables first, so neither
+#     uv nor the warm-up holds them either.
+#   - Not closed: a kernel escape from the sandbox; the callback token in the event file
+#     (item (b) above), which the sandbox has no network to send; and the install and the warm-up
+#     themselves: uv and the pinned, hashed ScanCode code run as the runner user, with its
+#     passwordless sudo and the network, before the sandbox exists (the warm-up's scan of a fixed
+#     text runs ScanCode's code under env -i, but not sandboxed). They hold no token and no OIDC
+#     request variable, and they run after the mint and before the Review step, so they reach
+#     what item (c) says the Review step's dependency tree reaches; the hashes are what bind them.
+#   - The time budget: the job's 28 minutes are the 20 it had before plus the matcher steps' own
+#     limits (install 4, prepare 1, scan 3), and stay under the Worker's 30-minute watchdog; the
+#     review script's model call keeps its own 12-minute deadline inside them.
+#   test-license-scan.yml runs these very steps on a runner over public license texts, and proves
+#   the sandbox has no socket, cannot write _actions, _temp or /opt/license-scan, holds no OIDC
+#   request variable, and does not rebuild the index.
+#
 # THE HEAD CHECK AND ITS WINDOW. The fetch step records the commit it fetched as `main`, and the
 # review script checks it against the dispatched commit before it calls the model. The checkout,
-# Bun and the install now sit between the two, so the window in which `main` can move is wider than
+# the license matcher, Bun and the install now sit between the two, so the window in which `main` can move is wider than
 # it was. That is accepted: the cost is one wasted call, and the Worker's own head check at approval
 # still blocks an approval of a review that is about an older commit.
 #
@@ -124,7 +166,7 @@ jobs:
   review:
     name: Review
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 28
     permissions:
       contents: read
       id-token: write
@@ -300,7 +342,7 @@ jobs:
       #
       # Accepted: the batch downloads every selected blob whole, whatever its size, because a blob
       # that is not in the clone cannot be sized before it is fetched. The reader's ceilings (4 MiB
-      # for a document, 1 MiB for a sidecar) apply after the download, and the job's 20-minute
+      # for a document, 1 MiB for a sidecar) apply after the download, and the job's 28-minute
       # timeout is the only bound on the download itself.
       - name: Fetch the dataset as git data
         if: steps.claim.outputs.claimed == 'true'
@@ -379,6 +421,151 @@ jobs:
           path: tool
           persist-credentials: false
 
+      # ADR 0142: uv, for the license matcher only. Pinned to a full commit, an exact uv version and
+      # that version's archive checksum; no cache (a cache is writable from other workflows here).
+      - name: Set up uv
+        if: steps.claim.outputs.claimed == 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
+          enable-cache: false
+          github-token: ""
+
+      # ScanCode from nemar-cli's hashed requirements file, into a fresh environment outside the
+      # runner user's home, on a uv-managed CPython at the exact patch the file was compiled for
+      # (see the header). It never fails the job: its output `status` is `ok` or `failed`, and a
+      # step that timed out leaves none, which the next step records as `failed`.
+      - name: Install the license matcher
+        if: steps.claim.outputs.claimed == 'true'
+        id: license-install
+        continue-on-error: true
+        timeout-minutes: 4
+        working-directory: tool
+        env:
+          SCANCODE_PYTHON: "3.12.16"
+          SCANCODE_VERSION: "32.5.0"
+          SCANCODE_SPDX: "3.27"
+        run: |
+          # No errexit out here: a failure inside install_matcher (a subshell with its own errexit,
+          # called outside any condition so that errexit holds there) only sets the status.
+          set +e -uo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          status=failed
+          trap 'echo "status=$status" >> "$GITHUB_OUTPUT"; echo "license matcher: $status"' EXIT
+          # uv's and ScanCode's own messages stay on stderr: this step holds no dataset content.
+          install_matcher() (
+            set -euo pipefail
+            trap 'echo "license matcher: failed at line $LINENO"' ERR
+            root=/opt/license-scan
+            work="$RUNNER_TEMP/license-matcher"
+            sudo rm -rf "$root" "$work"
+            sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 "$root"
+            mkdir -p "$work/home" "$work/tmp"
+            export UV_NO_CONFIG=1 UV_CACHE_DIR="$work/cache" UV_PYTHON_INSTALL_DIR="$root/python"
+            uv python install --no-config --install-dir "$root/python" "$SCANCODE_PYTHON" > /dev/null
+            uv venv --no-config --managed-python --no-python-downloads --python "$SCANCODE_PYTHON" \
+              "$root/venv" > /dev/null
+            [ "$("$root/venv/bin/python" -I -c 'import sys; print(sys.version.split()[0])')" = "$SCANCODE_PYTHON" ]
+            uv pip install --no-config --python "$root/venv/bin/python" --require-hashes --no-build \
+              -r scripts/ci/scancode-requirements.txt > /dev/null
+            run() {
+              env -i PATH="$root/venv/bin:/usr/bin:/bin" HOME="$work/home" TMPDIR="$work/tmp" \
+                SCANCODE_CACHE="$work/home" SCANCODE_TEMP="$work/tmp" "$@"
+            }
+            version="$(run "$root/venv/bin/scancode" --version 2> /dev/null)"
+            grep -qxF "ScanCode version: $SCANCODE_VERSION" <<< "$version"
+            grep -qxF "SPDX License list version: $SCANCODE_SPDX" <<< "$version"
+            # Build the license index now, as this user, with the first scan of a fixed text (which
+            # also checks that a scan works), so the sandboxed scan only reads it.
+            printf 'SPDX-License-Identifier: CC-BY-4.0\n' > "$work/warm-up.txt"
+            run "$root/venv/bin/scancode" --license --license-text --license-text-diagnostics \
+              --copyright --processes 1 --timeout 120 --json "$work/warm-up.json" "$work/warm-up.txt" > /dev/null
+            grep -qF '"license_expression_spdx": "CC-BY-4.0"' "$work/warm-up.json"
+            # Root's, readable by all and writable by none else: some wheels ship a library only
+            # their owner may read (extractcode-libarchive's), which the scan user must load.
+            sudo chown -R root:root "$root"
+            sudo chmod -R a+rX,go-w "$root"
+            rm -rf "$work"
+          )
+          install_matcher
+          rc=$?
+          if [ "$rc" -eq 0 ]; then status=ok; fi
+
+      # LICENSE out of the fetched data, as git data: a symlink (an annexed link) is never extracted,
+      # nor anything over 4 MiB. The blob id goes beside it, so the review can check that the scan
+      # is of this commit's LICENSE. The scan's own directories belong to uid 65534.
+      - name: Prepare the license scan
+        if: steps.claim.outputs.claimed == 'true'
+        id: license-prepare
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          MATCHER_STATUS: ${{ steps.license-install.outputs.status }}
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          scan=/tmp/license-scan
+          sudo rm -rf "$scan"
+          mkdir -m 0755 "$scan" "$scan/in"
+          if [ "$MATCHER_STATUS" = "ok" ]; then echo ok > "$scan/matcher"; else echo failed > "$scan/matcher"; fi
+          chmod 0644 "$scan/matcher"
+          rgit() {
+            GIT_NO_LAZY_FETCH=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --literal-pathspecs \
+              -C "$RUNNER_TEMP/repo" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+          }
+          entry="$(rgit ls-tree --full-tree refs/remotes/origin/main -- LICENSE)"
+          if [ -z "$entry" ]; then echo "license scan: no LICENSE"; exit 0; fi
+          read -r mode type oid _ <<< "$entry"
+          if [ "$mode" = "120000" ] || [ "$type" != "blob" ]; then
+            echo "license scan: LICENSE is not text in git"; exit 0
+          fi
+          size="$(rgit cat-file -s "$oid" 2> /dev/null || echo missing)"
+          if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -gt 4194304 ]; then
+            echo "license scan: LICENSE cannot be read in full"; exit 0
+          fi
+          rgit cat-file blob "$oid" > "$scan/in/LICENSE"
+          chmod 0644 "$scan/in/LICENSE"
+          echo "$oid" > "$scan/oid"
+          chmod 0644 "$scan/oid"
+          sudo install -d -o 65534 -g 65534 -m 0700 "$scan/out" "$scan/home" "$scan/tmp"
+          echo "scan=true" >> "$GITHUB_OUTPUT"
+
+      # ScanCode as uid 65534, with no network, no environment beyond its paths, and a PID
+      # namespace that dies with it (see the header). Its output is discarded: this log is public.
+      # `status` is `ok` whenever ScanCode wrote result.json, whatever its exit code, so a scan error
+      # it reports there is read as LICENSE `unreadable` rather than the matcher `unavailable`; it
+      # is `failed` when there is no result, and a step that timed out writes none.
+      - name: Scan LICENSE in a sandbox
+        if: steps.claim.outputs.claimed == 'true' && steps.license-install.outputs.status == 'ok' && steps.license-prepare.outputs.scan == 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          scan=/tmp/license-scan
+          venv=/opt/license-scan/venv
+          # From a directory the scan user can enter: ScanCode changes directory and back when it
+          # loads a library, and the workspace is not the scan user's to enter.
+          cd "$scan"
+          # The options are SCANCODE_ARGS in nemar-cli's shared/license-file.ts.
+          # Its exit code is not the verdict: see `status` below.
+          sudo /usr/bin/unshare --net --pid --fork --kill-child -- \
+            /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups -- \
+            /usr/bin/env -i PATH="$venv/bin:/usr/bin:/bin" HOME="$scan/home" TMPDIR="$scan/tmp" \
+            SCANCODE_CACHE="$scan/home" SCANCODE_TEMP="$scan/tmp" \
+            "$venv/bin/scancode" --license --license-text --license-text-diagnostics --copyright \
+            --processes 1 --timeout 120 --json "$scan/out/result.json" "$scan/in/LICENSE" \
+            > /dev/null 2>&1 || true
+          sudo chmod 0755 "$scan/out"
+          if [ -f "$scan/out/result.json" ] && [ ! -L "$scan/out/result.json" ]; then
+            status=ok
+          else
+            status=failed
+          fi
+          echo "$status" > "$scan/status"
+          echo "license scan: $status"
+
       - name: Set up Bun
         if: steps.claim.outputs.claimed == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -431,7 +618,8 @@ jobs:
             --request-id "$REQUEST_ID" \
             --dataset "$DATASET_ID" \
             --anonymous "$ANONYMOUS" \
-            --environment "$ENVIRONMENT"
+            --environment "$ENVIRONMENT" \
+            --license-scan-dir /tmp/license-scan
 
       # If a claimed job failed or was cancelled before the script could report, say so. It needs
       # nothing the job may have failed to install. A report already delivered makes this a

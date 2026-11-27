@@ -1,0 +1,1 @@
+{"field": "MIT", "expected": {"state": "unrecognized", "spdx": "MIT", "additions": false, "expression": "(MIT OR Apache-2.0) AND MIT AND Apache-2.0"}}

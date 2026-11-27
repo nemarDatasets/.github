@@ -1,0 +1,1 @@
+{"field": "CC-BY-4.0", "expected": {"state": "unrecognized", "spdx": "CC-BY-4.0", "additions": false, "expression": "CC-BY-4.0 AND CC0-1.0"}}
