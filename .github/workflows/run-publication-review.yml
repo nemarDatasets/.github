@@ -445,20 +445,22 @@ jobs:
           unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
           status=failed
           trap 'echo "status=$status" >> "$GITHUB_OUTPUT"; echo "license matcher: $status"' EXIT
+          # uv's and ScanCode's own messages stay on stderr: this step holds no dataset content.
           install_matcher() (
             set -euo pipefail
+            trap 'echo "license matcher: failed at line $LINENO"' ERR
             root=/opt/license-scan
             work="$RUNNER_TEMP/license-matcher"
             sudo rm -rf "$root" "$work"
             sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 "$root"
             mkdir -p "$work/home" "$work/tmp"
             export UV_NO_CONFIG=1 UV_CACHE_DIR="$work/cache" UV_PYTHON_INSTALL_DIR="$root/python"
-            uv python install --no-config --install-dir "$root/python" "$SCANCODE_PYTHON" > /dev/null 2>&1
+            uv python install --no-config --install-dir "$root/python" "$SCANCODE_PYTHON" > /dev/null
             uv venv --no-config --managed-python --no-python-downloads --python "$SCANCODE_PYTHON" \
-              "$root/venv" > /dev/null 2>&1
+              "$root/venv" > /dev/null
             [ "$("$root/venv/bin/python" -I -c 'import sys; print(sys.version.split()[0])')" = "$SCANCODE_PYTHON" ]
             uv pip install --no-config --python "$root/venv/bin/python" --require-hashes --no-build \
-              -r scripts/ci/scancode-requirements.txt > /dev/null 2>&1
+              -r scripts/ci/scancode-requirements.txt > /dev/null
             run() {
               env -i PATH="$root/venv/bin:/usr/bin:/bin" HOME="$work/home" TMPDIR="$work/tmp" \
                 SCANCODE_CACHE="$work/home" SCANCODE_TEMP="$work/tmp" "$@"
@@ -467,7 +469,7 @@ jobs:
             grep -qxF "ScanCode version: $SCANCODE_VERSION" <<< "$version"
             grep -qxF "SPDX License list version: $SCANCODE_SPDX" <<< "$version"
             # Build the license index now, as this user, so the sandboxed scan only reads it.
-            run "$root/venv/bin/scancode" --reindex-licenses > /dev/null 2>&1
+            run "$root/venv/bin/scancode" --reindex-licenses > /dev/null
             sudo chown -R root:root "$root"
             sudo chmod -R go-w "$root"
             rm -rf "$work"
