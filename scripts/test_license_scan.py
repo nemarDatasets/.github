@@ -215,7 +215,7 @@ def main() -> int:
     script = STEPS["Scan LICENSE in a sandbox"]["run"]
     assert SCAN_TIMEOUT in script, "the scan's timeout option moved; update the scan-error check"
     proc, _, _ = run_step("Scan LICENSE in a sandbox", {},
-                          script=script.replace(SCAN_TIMEOUT, "--timeout 0.000001"), timeout=200)
+                          script=script.replace(SCAN_TIMEOUT, "--timeout 0.01 --json"), timeout=200)
     status = (SCAN / "status").read_text().strip() if (SCAN / "status").exists() else None
     errors = None
     if (SCAN / "out/result.json").exists():
